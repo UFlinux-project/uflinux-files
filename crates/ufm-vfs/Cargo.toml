@@ -1,0 +1,17 @@
+[package]
+name = "ufm-vfs"
+description = "Directory reading, caching and watching for UFLinux Files"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+ufm-core.workspace = true
+libc.workspace = true
+mime_guess.workspace = true
+
+[lints]
+workspace = true

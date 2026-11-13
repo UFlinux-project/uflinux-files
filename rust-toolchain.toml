@@ -1,0 +1,8 @@
+# The distribution builds with Alpine's packaged toolchain. Only the channel is
+# pinned here so a local `cargo test` and an `abuild` run agree on the language
+# version; the channel is a floor, not an exact pin, because abuild must keep
+# working with whatever `community` ships.
+[toolchain]
+channel = "1.88"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

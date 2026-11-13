@@ -1,0 +1,115 @@
+[workspace]
+resolver = "3"
+members = [
+	"crates/ufm-core",
+	"crates/ufm-vfs",
+	"crates/ufm-archive",
+	"crates/ufm-mount",
+	"crates/ufm-index",
+	"crates/ufm-search",
+	"crates/ufm-desktop-ipc",
+	"crates/uflinux-files",
+	"crates/uflinux-searchd",
+]
+
+# The two binaries link GTK4/GLib. Keeping them out of the default members means
+# `cargo test` only needs a C toolchain, so the pure-Rust core stays testable on
+# a host without gtk4.0-dev. Packaging builds `--workspace` inside the Alpine
+# chroot where the GTK4 development packages are installed.
+default-members = [
+	"crates/ufm-core",
+	"crates/ufm-vfs",
+	"crates/ufm-archive",
+	"crates/ufm-mount",
+	"crates/ufm-index",
+	"crates/ufm-search",
+	"crates/ufm-desktop-ipc",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+license = "GPL-3.0-only"
+repository = "https://github.com/UFlinux-project/uflinux3-filemanager"
+authors = ["UFLinux contributors <noreply@example.invalid>"]
+
+[workspace.dependencies]
+ufm-core = { path = "crates/ufm-core" }
+ufm-vfs = { path = "crates/ufm-vfs" }
+ufm-archive = { path = "crates/ufm-archive" }
+ufm-mount = { path = "crates/ufm-mount" }
+ufm-index = { path = "crates/ufm-index" }
+ufm-search = { path = "crates/ufm-search" }
+ufm-desktop-ipc = { path = "crates/ufm-desktop-ipc" }
+
+# gtk4 0.10 rather than 0.11: 0.11 bumps the MSRV to 1.92, which is above the
+# toolchain Alpine packages, and gtk4-layer-shell 0.7 is built against the same
+# gdk4 0.10 / glib 0.21 graph, so the two stay in one dependency set.
+# v4_12 is the API floor (GNOME 45), comfortably older than what the target
+# image ships.
+gtk = { package = "gtk4", version = "0.10", default-features = false, features = ["v4_12"] }
+gtk4-layer-shell = { version = "0.7", default-features = false }
+gio = { version = "0.21", default-features = false, features = ["v2_78"] }
+glib = { version = "0.21", default-features = false }
+gdk-pixbuf = { version = "0.21", default-features = false }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+percent-encoding = "2"
+bitflags = "2"
+libc = "0.2"
+mime_guess = { version = "2", default-features = false }
+walkdir = { version = "2", default-features = false }
+# `mmap` keeps the index resident instead of reading it through the page cache
+# twice, and lz4 is what the postings are compressed with. `stopwords` and
+# `stemmer` are deliberately off: the stop-word lists are English-only, which
+# would silently drop words for a Khmer or French user, and stemming "document"
+# to "document" hurts more than it helps when the field is a file name. Both
+# would also add the `frostem` dictionary tables to a daemon with a 24 MiB idle
+# budget. Note that tantivy's `stopwords` feature is not self-contained, it pulls
+# in `Language` from `stemmer`, so turning it on would force both.
+tantivy = { version = "0.27", default-features = false, features = ["mmap", "lz4-compression"] }
+# Only the codecs that stay in pure Rust. A zip using bzip2/xz/zstd is reported
+# as unsupported rather than pulling three more C libraries into the package;
+# those containers are rare in a home directory and `bsdtar` handles them.
+zip = { version = "9", default-features = false, features = ["deflate", "deflate64", "lzma", "time"] }
+# Not `sevenz-rust2`: its current release needs a newer rustc than the 1.88 floor,
+# and `sevenz-rust` is unmaintained with an open advisory (RUSTSEC-2026-0246), so
+# `.7z` is read through the `7z` CLI. See crates/ufm-archive/src/sevenz.rs.
+
+# Only used by tests that need a directory that cleans itself up.
+tempfile = "3"
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "warn"
+unused_lifetimes = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+# Positions and sizes are naturally unsigned and casts at the GTK boundary are
+# unavoidable; these two lints would only generate noise there.
+cast_possible_truncation = "allow"
+cast_sign_loss = "allow"
+cast_precision_loss = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+must_use_candidate = "allow"
+module_name_repetitions = "allow"
+needless_pass_by_value = "allow"
+similar_names = "allow"
+struct_excessive_bools = "allow"
+
+# Matches the distribution's chosen release settings, see
+# aports/uflinux-files/APKBUILD. Fat LTO and 8 codegen units keep the binary
+# small, which matters for the shared-library footprint on a 512 MiB target.
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 8
+panic = "abort"
+strip = "debuginfo"
+
+[profile.test]
+opt-level = 1

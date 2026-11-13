@@ -1,0 +1,27 @@
+[package]
+name = "ufm-archive"
+description = "Browse inside zip, tar and 7z containers"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+# No `sevenz` feature: `sevenz-rust2` needs a newer rustc than the workspace
+# floor of 1.88 and the older `sevenz-rust` is unmaintained with an open advisory
+# (RUSTSEC-2026-0246), so `.7z` is read through the `7z` CLI, which the package
+# depends on. A native reader can be added behind a feature once the crate's MSRV
+# drops to or below the floor.
+
+[dependencies]
+ufm-core.workspace = true
+ufm-vfs.workspace = true
+mime_guess.workspace = true
+zip.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

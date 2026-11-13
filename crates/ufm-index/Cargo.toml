@@ -1,0 +1,19 @@
+[package]
+name = "ufm-index"
+description = "Tantivy-backed content and filename index for UFLinux Files"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+ufm-core.workspace = true
+tantivy.workspace = true
+walkdir.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true

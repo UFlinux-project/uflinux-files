@@ -1,0 +1,17 @@
+[package]
+name = "ufm-desktop-ipc"
+description = "D-Bus types for the desktop icon provider protocol"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+ufm-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true

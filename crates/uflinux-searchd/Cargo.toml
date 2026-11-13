@@ -1,0 +1,25 @@
+[package]
+name = "uflinux-searchd"
+description = "UFLinux file and application indexer daemon"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[[bin]]
+name = "uflinux-searchd"
+path = "src/main.rs"
+
+[dependencies]
+ufm-core.workspace = true
+ufm-index.workspace = true
+ufm-search.workspace = true
+gio.workspace = true
+glib.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true

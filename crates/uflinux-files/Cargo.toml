@@ -1,0 +1,39 @@
+[package]
+name = "uflinux-files"
+description = "UFLinux file manager: GTK4 icon, list and Miller-column views"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[[bin]]
+name = "uflinux-files"
+path = "src/main.rs"
+
+[features]
+default = []
+# Render our own layer-shell desktop instead of talking to a renderer claimed by
+# uflinux-desktop. Off by default so the common package does not pull in
+# gtk4-layer-shell.
+desktop-icons = ["dep:gtk4-layer-shell"]
+
+[dependencies]
+ufm-core.workspace = true
+ufm-vfs.workspace = true
+ufm-archive.workspace = true
+ufm-mount.workspace = true
+ufm-search.workspace = true
+ufm-index.workspace = true
+ufm-desktop-ipc.workspace = true
+gtk.workspace = true
+gio.workspace = true
+glib.workspace = true
+gdk-pixbuf.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+gtk4-layer-shell = { workspace = true, optional = true }
+
+[lints]
+workspace = true
