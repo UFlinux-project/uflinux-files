@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC
+ "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+ "https://specifications.freedesktop.org/PolicyKit/1.0/policyconfig.dtd">
+
+<!--
+  One action covers mount and unmount, and the helper is the only program
+  polkit will accept for it: `org.freedesktop.policykit.exec.path` makes pkexec
+  run that exact binary rather than whatever the caller names, so the action
+  cannot be reused to run something else as root.
+
+  Deliberately no separate `…mount` and `…unmount` actions. Unmounting is the
+  less dangerous half of the same operation, and splitting them means a user who
+  is allowed to attach a share can be refused when they try to leave, which
+  strands a stale mountpoint under $XDG_RUNTIME_DIR until the next sweep.
+
+  `allow_active` is the interesting annotation and it is not a blanket yes: the
+  companion rules file narrows it to a local seat, so an ssh session does not
+  inherit the ability to mount a filesystem on someone else's desktop. See
+  docs/mounts.md for why SMB and NFS are the only protocols that need this at
+  all, and why udisks2 is not an option on UFLinux.
+-->
+<policyconfig>
+
+  <action id="org.uflinux.files.mount">
+    <description>Mount or unmount a network share</description>
+    <description xml:lang="fr">Monter ou démonter un partage réseau</description>
+    <description xml:lang="km">តំឡើង ឬដោះតំឡើងការចែករំលែកបណ្ដាញ</description>
+    <message>UFLinux Files needs administrator authorization to mount a network share.</message>
+    <message xml:lang="fr">Files a besoin d'une autorisation d'administrateur pour monter un partage réseau.</message>
+    <message xml:lang="km">កម្មវិធី Files ត្រូវការការអនុម័តពីអ្នកគ្រប់គ្រង ដើម្បីតំឡើងការចែករំលែកបណ្ដាញ។</message>
+    <icon_name>org.uflinux.Files</icon_name>
+    <defaults>
+      <!-- Consolekit is long gone; the annotation is still read by polkit and
+           the fallback matters when no rules file is installed. -->
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_self_keep</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/libexec/uflinux-files-mount</annotate>
+    <annotate key="org.freedesktop.policykit.exec.allow_gui">false</annotate>
+  </action>
+
+</policyconfig>

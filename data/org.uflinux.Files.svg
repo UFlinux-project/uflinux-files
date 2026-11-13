@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Original UFLinux artwork, GPL-3.0-only.
+
+  Drawn on the same 64-unit grid as the Settings icon so the two sit side by
+  side in a panel without one looking larger, and with the same flat fills:
+  no gradients and no filters, because this is rendered at 16 px in a taskbar
+  as often as it is at 128 px on a desktop, and a gradient turns to mud there.
+  The shape is a folder rather than a drawer or a cabinet, since the thing it
+  opens is a directory listing in every one of its three views.
+-->
+<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64">
+  <rect x="2" y="2" width="60" height="60" rx="12" fill="#1c71d8"/>
+  <path d="M12 20a3 3 0 0 1 3-3h11l5 5h18a3 3 0 0 1 3 3v6H12z" fill="#78aeff"/>
+  <path d="M12 28h40a2 2 0 0 1 2 2v14a3 3 0 0 1-3 3H13a3 3 0 0 1-3-3V30a2 2 0 0 1 2-2z" fill="#ffffff"/>
+  <g fill="none" stroke="#1c71d8" stroke-width="3" stroke-linecap="round">
+    <path d="M20 36h24M20 42h16"/>
+  </g>
+</svg>

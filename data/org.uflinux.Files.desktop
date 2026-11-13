@@ -1,0 +1,40 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Files
+Name[km]=ឯកសារ
+Name[fr]=Gestionnaire de fichiers
+GenericName=File Manager
+GenericName[km]=កម្មវិធីគ្រប់គ្រងឯកសារ
+GenericName[fr]=Gestionnaire de fichiers
+Comment=Browse files, archives and network shares
+Comment[km]=រកមើលឯកសារ ស្វ៊ីប និងការភ្ជាប់បណ្តាញ
+Comment[fr]=Parcourir fichiers, archives et partages réseau
+# %F rather than %U: a file manager opens locations, and a file that is not a
+# directory is opened by selecting its parent, which needs a path and not a
+# scheme. Remote locations are mounted first and arrive as paths for the same
+# reason — see docs/mounts.md.
+Exec=uflinux-files %F
+TryExec=uflinux-files
+Icon=org.uflinux.Files
+Terminal=false
+Categories=System;FileTools;FileManager;Core;
+Keywords=folder;manager;explore;disk;document;archive;
+Keywords[fr]=dossier;gestionnaire;explorer;disque;document;archive;
+Keywords[km]=ឯកសារ;ថត;រកមើល;ឌីស្ក;
+MimeType=inode/directory;
+StartupNotify=true
+StartupWMClass=uflinux-files
+Actions=new-window;computer;
+
+[Desktop Action new-window]
+Name=New Window
+Name[km]=បង្អួចថ្មី
+Name[fr]=Nouvelle fenêtre
+Exec=uflinux-files --new-window
+
+[Desktop Action computer]
+Name=My Computer
+Name[km]=កុំព្យូទ័ររបស់ខ្ញុំ
+Name[fr]=Ordinateur
+Exec=uflinux-files computer://

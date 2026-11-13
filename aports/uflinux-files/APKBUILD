@@ -1,0 +1,110 @@
+# Maintainer: UFLinux contributors <noreply@example.invalid>
+pkgname=uflinux-files
+pkgver=0.1.0
+pkgrel=0
+pkgdesc="UFLinux file manager: GTK4 browsing, archives, mounts and search"
+url="${UFLINUX_PROJECT_URL:-https://github.com}"
+arch="x86 x86_64 aarch64 armv7 ppc64le s390x riscv64"
+license="GPL-3.0-only"
+depends="uflinux-files-searchd=$pkgver-r$pkgrel desktop-file-utils hicolor-icon-theme"
+# Not `udisks2`: UFLinux has no udisks2, so SMB and NFS go through our own
+# polkit action and /usr/libexec/uflinux-files-mount. The session agent that
+# answers the pkexec prompt is the one uflinux-desktop already registers.
+makedepends="cargo cargo-auditable gtk4.0-dev gtk4-layer-shell-dev glib-dev
+	gdk-pixbuf-dev shared-mime-info pkgconf"
+subpackages="$pkgname-dbg $pkgname-doc $pkgname-searchd:searchd
+	$pkgname-desktop:desktop $pkgname-mount-helper:mount_helper"
+# Optional at runtime, and each one is named in the UI when it is missing:
+# `7z` comes from p7zip (Alpine's package provides `7z`, not `7zz`), the tar
+# codecs and `bsdtar` from libarchive-tools, and `xdg-open` for "Open With".
+# Recommends rather than depends, so a minimal install still browses a directory
+# and the package that is absent is a message rather than a broken feature.
+# One assignment only: this file is sourced by a shell, so a second `recommends=`
+# would silently replace the first.
+recommends="$pkgname-desktop=$pkgver-r$pkgrel $pkgname-mount-helper=$pkgver-r$pkgrel
+	p7zip libarchive-tools xdg-utils"
+options="net"
+# Generated from the repository by scripts/files-source.py, independently verified.
+source="$pkgname-$pkgver.tar"
+export CARGO_INCREMENTAL=0
+export CARGO_PROFILE_TEST_DEBUG=0
+# abuild exports release-profile overrides; enforce the distro's chosen settings,
+# which are the ones [profile.release] in Cargo.toml already asks for.
+export CARGO_PROFILE_RELEASE_OPT_LEVEL=3
+export CARGO_PROFILE_RELEASE_LTO=fat
+export CARGO_PROFILE_RELEASE_CODEGEN_UNITS=8
+export CARGO_PROFILE_RELEASE_PANIC=abort
+
+prepare() {
+	default_prepare
+	cargo fetch --locked --target="$CTARGET"
+	# Source bundles normalize timestamps. Never reuse stale workspace binaries.
+	cargo clean -p ufm-core -p ufm-vfs -p ufm-archive -p ufm-mount -p ufm-index \
+		-p ufm-search -p ufm-desktop-ipc -p uflinux-files -p uflinux-searchd
+	cargo clean --release -p ufm-core -p ufm-vfs -p ufm-archive -p ufm-mount \
+		-p ufm-index -p ufm-search -p ufm-desktop-ipc -p uflinux-files -p uflinux-searchd
+}
+build() {
+	# abuild enables Rust debug info when a -dbg subpackage exists, and the
+	# workspace profile strips debuginfo itself.
+	unset CARGO_PROFILE_RELEASE_DEBUG
+	RUSTFLAGS="$RUSTFLAGS --remap-path-prefix=$builddir=/usr/src/uflinux-files" \
+		cargo auditable build --workspace --release --frozen --features uflinux-files/desktop-icons
+}
+check() {
+	cargo test --workspace --frozen
+}
+package() {
+	local target="${CARGO_TARGET_DIR:-target}/release"
+	install -Dm755 "$target/uflinux-files" "$pkgdir/usr/bin/uflinux-files"
+	install -Dm755 "$target/uflinux-searchd" "$pkgdir/usr/libexec/uflinux-searchd"
+	install -Dm755 "$target/uflinux-files-mount" "$pkgdir/usr/libexec/uflinux-files-mount"
+	install -Dm644 data/org.uflinux.Files.desktop \
+		"$pkgdir/usr/share/applications/org.uflinux.Files.desktop"
+	install -Dm644 data/org.uflinux.Files.svg \
+		"$pkgdir/usr/share/icons/hicolor/scalable/apps/org.uflinux.Files.svg"
+	install -Dm644 data/org.uflinux.Files.service \
+		"$pkgdir/usr/share/dbus-1/services/org.uflinux.Files.service"
+	install -Dm644 data/org.uflinux.Search1.service \
+		"$pkgdir/usr/share/dbus-1/services/org.uflinux.Search1.service"
+	install -Dm644 data/org.uflinux.FileManager.Desktop1.service \
+		"$pkgdir/usr/share/dbus-1/services/org.uflinux.FileManager.Desktop1.service"
+	install -Dm644 data/org.uflinux.files.mount.policy \
+		"$pkgdir/usr/share/polkit-1/actions/org.uflinux.files.mount.policy"
+	install -Dm644 data/50-uflinux-files.rules \
+		"$pkgdir/usr/share/polkit-1/rules.d/50-uflinux-files.rules"
+	# Not /etc/davfs2/davfs2.conf.d: davfs2 reads two files and has no include
+	# directive, so this ships as the template Files copies to ~/.davfs2 once.
+	install -Dm644 data/davfs2.conf \
+		"$pkgdir/usr/share/uflinux-files/davfs2.conf"
+	install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+	install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
+}
+searchd() {
+	pkgdesc="Headless UFLinux file and application indexer"
+	# poppler-utils and unzip are the optional PDF/Office text extractors; the
+	# daemon indexes names and metadata without them. See docs/search-indexer.md.
+	depends="dbus"
+	recommends="poppler-utils unzip"
+	amove usr/libexec/uflinux-searchd \
+		usr/share/dbus-1/services/org.uflinux.Search1.service
+}
+desktop() {
+	pkgdesc="Desktop icon provider for uflinux-desktop"
+	# The provider is GLib/GIO only, no GTK, so it does not pull in the toolkit.
+	depends="dbus"
+	amove usr/share/dbus-1/services/org.uflinux.FileManager.Desktop1.service
+}
+mount_helper() {
+	pkgdesc="Privileged mount helper for UFLinux Files"
+	# cifs-utils/nfs-utils are the mount helpers the two kernel filesystems
+	# actually call; sshfs-fuse and davfs2 are the unprivileged paths and belong
+	# to the main package's recommends instead.
+	depends="polkit-elogind cifs-utils nfs-utils"
+	amove usr/libexec/uflinux-files-mount usr/share/polkit-1 usr/share/uflinux-files
+}
+# Filled in by scripts/files-source.py --update; empty here so the recipe still
+# parses as shell before a bundle has been generated.
+sha512sums="
+d427a373453193d1faf6575813219e5b8407bbfea519550ce92452ce4b73b10779734a501303ea4a2645a9e68ee45848b25957e1477a711fcebc605637997f46  uflinux-files-0.1.0.tar
+"

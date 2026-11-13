@@ -1,0 +1,11 @@
+# D-Bus activation for the file manager's own bus name.
+#
+# The name exists so another component — a panel button, a "Open Containing
+# Folder" from another app, a notification action — can ask for a window
+# without forking a process and guessing whether one is already open. The
+# binary answers the activation request and the existing instance, so a second
+# invocation asks the running one to focus rather than starting a second
+# window; see the single-instance handling in `crates/uflinux-files/src/main.rs`.
+[D-BUS Service]
+Name=org.uflinux.Files
+Exec=/usr/bin/uflinux-files --gapplication-service

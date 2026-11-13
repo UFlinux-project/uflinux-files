@@ -1,0 +1,30 @@
+// Narrow the mount action down to the person actually sitting at the machine.
+//
+// The action file alone would be almost enough: `allow_active` already means
+// "the session on the seat in front of the screen", so an ssh login falls to
+// auth_admin on its own. What the action file cannot express is the other
+// direction. Under greetd + cage there is exactly one seat and one session, and
+// whether polkit considers that session *active* depends on how logind came to
+// mark it — a session that is local but not flagged active gets an
+// authentication prompt the user cannot answer, because the agent belongs to the
+// very session being questioned. That failure looks like a broken file manager,
+// not like a polkit problem.
+//
+// So: the owner of a local seat is authorized outright, anything else is left
+// for the action file to decide, which means auth_admin for a remote session.
+// Returning YES here is safe for a specific reason — polkit will only ever run
+// /usr/libexec/uflinux-files-mount for this action (the exec.path annotation),
+// and that helper re-checks the source, the target and the option string itself
+// rather than trusting its caller. Mounting a network share is also something
+// the same user can already do unprivileged with sshfs or davfs2, so the action
+// grants no capability that FUSE does not already give away; it only lets the
+// two kernel filesystems, which need real root, be reached at all.
+polkit.addRule(function (action, subject) {
+    if (action.id === "org.uflinux.files.mount" && subject.local && subject.session) {
+        var session = polkit.lookupSession(subject.session);
+        if (session && session.seat && subject.uid === session.uid) {
+            return polkit.Result.YES;
+        }
+    }
+    return polkit.Result.NOT_HANDLED;
+});

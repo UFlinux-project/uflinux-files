@@ -1,0 +1,14 @@
+# D-Bus activation for the desktop-icons provider.
+#
+# The name is `…Desktop1` rather than `…FileManager`, matching `SESSION_NAME` in
+# `crates/ufm-desktop-ipc/src/wire.rs`: a typo here does not produce an error
+# message, it produces a desktop with no icons, because the provider is simply
+# never activated. The two strings are pinned against each other by a test.
+#
+# Activation covers the common case — `uflinux-desktop` asks for the model when
+# the session starts. The provider also watches the desktop directory, so a
+# session that starts it lazily still gets a `Changed` signal afterwards rather
+# than a stale grid.
+[D-BUS Service]
+Name=org.uflinux.FileManager.Desktop1
+Exec=/usr/bin/uflinux-files --provider

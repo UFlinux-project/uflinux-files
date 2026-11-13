@@ -1,0 +1,10 @@
+# D-Bus activation for the indexer.
+#
+# Activated by the first query, so an idle session pays nothing: the daemon
+# exits after `idle_exit_secs` (120 s by default, see `IndexConfig`) and the
+# bus starts it again on the next search. The cost of that restart is one
+# `mmap` of an existing index, which is why the index lives in
+# `$XDG_CACHE_HOME/uflinux-files/index` and survives.
+[D-BUS Service]
+Name=org.uflinux.Search1
+Exec=/usr/libexec/uflinux-searchd
