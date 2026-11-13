@@ -10,10 +10,21 @@ publish = false
 
 [dependencies]
 ufm-core.workspace = true
+# Only for `watch::Watcher::DEBOUNCE`: the indexer reuses the same coalescing,
+# debouncing inotify reader the views use, rather than opening a second set of
+# kernel watches and a second thread per indexed root. Keeping one constant means
+# one place where the debounce is tuned.
+ufm-vfs.workspace = true
 tantivy.workspace = true
 walkdir.workspace = true
+mime_guess.workspace = true
+# Only for `#[derive(Serialize, Deserialize)]` on the two types that are also
+# written to disk. Encoding a reply for D-Bus is `uflinux-searchd`'s job, so this
+# crate does not name a JSON library.
 serde.workspace = true
-serde_json.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
 
 [lints]
 workspace = true

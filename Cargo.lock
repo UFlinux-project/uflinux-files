@@ -1801,10 +1801,12 @@ dependencies = [
 name = "ufm-index"
 version = "0.1.0"
 dependencies = [
+ "mime_guess",
  "serde",
- "serde_json",
  "tantivy",
+ "tempfile",
  "ufm-core",
+ "ufm-vfs",
  "walkdir",
 ]
 
