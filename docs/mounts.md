@@ -30,6 +30,12 @@ path for each is already written and tested rather than a plan.
 Two consequences of using `lftp mount` for FTP are worth stating plainly. There
 is no read-only option, so `?ro` is recorded in the mount table and the UI
 refuses writes rather than pretending the kernel enforces something it does not.
+And `lftp mount` is not a program that mounts and exits: the process *is* the
+mount, and killing it drops the share. `Backend::serves()` reports that, and the
+caller then uses `Command::serve()` — spawn and keep the child, do not wait for
+it — instead of `status()`. Whether the mount exists is decided by re-reading
+mountinfo either way, never by an exit code, so the two paths agree on what
+"connected" means.
 And there is no kernel FTP client, so FTP is always FUSE.
 
 ## Mount points
@@ -40,11 +46,26 @@ URI, so the same share always gets the same directory and two mounts of one
 server never collide.
 
 A per-user runtime directory means the mounts are gone when the session is,
-which turns a stale mount into something that heals itself at login rather than
-a surprise at boot. It also means an application that cannot see `/run/user`
+which turns a stale mount into something that heals itself at boot rather than
+a surprise at login. It also means an application that cannot see `/run/user`
 needs a path it can, so the file manager maintains a `Network` folder of symlinks
 into the mount root, and that is the folder a "connect to a share" flow points
 other programs at.
+
+The folder is `$XDG_DATA_HOME/uflinux/filemanager/Network`
+(`~/.local/share/…` by default), overridable with
+`UFLINUX_FILES_NETWORK_DIR` for tests. Mounting a share puts one symlink in it,
+named after the share's label and pointing at the mount point; ejecting removes
+that symlink and nothing else. A link the user made by hand with the same name,
+pointing somewhere else, is left alone — the folder is shared with whatever else
+the desktop puts there.
+
+GTK4 is not what surfaces this folder. GtkPlacesView builds its network section
+from the GIO volume monitor, and there is no location in the library that it
+scans for network entries, so the file manager adds its own rows for the shares
+in its own table. The `Network` folder exists for *other* applications — a file
+chooser in an editor, a terminal, an uploader — which is the reason for mounting
+in the first place.
 
 ## Credentials
 
@@ -161,10 +182,11 @@ error if it failed. State is read from the kernel instead, by parsing
 `/proc/self/mountinfo`, because a table that claims a mount exists when the
 kernel has forgotten it is worse than no table.
 
-`MountState` distinguishes `Mounted`, `Stale` (present in mountinfo, unreachable
-— a FUSE daemon that died leaves exactly this), `Detached` and `Absent`. A stale
-mount needs `fusermount -u` before it can be remounted, and the UI says so rather
-than retrying a mount that will fail the same way.
+`MountState` has three cases: `Mounted`, `Stale` (mountinfo has an entry but
+nothing answers there — a FUSE daemon that died leaves exactly this) and
+`Absent`. A stale mount has to be detached before it can be remounted, with
+`fusermount -u` for FUSE and the helper for the two kernel filesystems, and the
+UI says so rather than retrying a mount that would fail the same way.
 
 ## Cleaning up: `--sweep-mounts`
 
@@ -183,7 +205,16 @@ notes list collects what could not be classified and is reported, never fatal: a
 sweep that stops halfway leaves the rest to rot, and a leftover password file is
 exactly the thing that should not rot.
 
+A sweep keeps two lists, because "what is left to do" and "what this run did" are
+not the same question. `items()` is the pending detaches; `removed()` is what has
+already been taken care of, whether `apply_files` deleted it or a detach the
+caller ran succeeded. Printing only the pending list would report a successful
+sweep as one that did nothing, which is the opposite of what a session-start
+cleanup needs to say. `--json` reports both, as `done`, `pending` and `notes`.
+
 Idle auto-unmount uses the same mechanism with `--idle-after` set, on a timer
-started when the last window closes. The idle clock is the mount record's last
-use, updated when a listing is read through it, not the mount point's atime —
-which a `noatime` NFS mount does not maintain at all.
+started when the last window closes; the file manager's own limit is 900 seconds
+(`runner::IDLE_AFTER`). A share marked connect-at-login is exempt, since it is
+meant to be there. The idle clock is the mount record's last use, updated when a
+listing is read through it, not the mount point's atime — which a `noatime` NFS
+mount does not maintain at all.

@@ -58,6 +58,24 @@ pub fn mount_root() -> PathBuf {
     }
 }
 
+/// Where the symlinks to live network shares go, so that an application which
+/// cannot see `$XDG_RUNTIME_DIR` still has a path to offer the user.
+///
+/// Deliberately under `$XDG_DATA_HOME` rather than beside the mount points: the
+/// links are not secret (a `0700` mount root behind them already decides who can
+/// read the files), and a location inside the user's data directory is one a
+/// sandboxed or remote application can display.
+#[must_use]
+pub fn network_dir() -> PathBuf {
+    if let Ok(dir) = std::env::var("UFLINUX_FILES_NETWORK_DIR") {
+        return PathBuf::from(dir);
+    }
+    data_root()
+        .join("uflinux")
+        .join("filemanager")
+        .join("Network")
+}
+
 /// The user's Desktop directory, honouring `XDG_DESKTOP_DIR` from
 /// `user-dirs.dirs` because the desktop icons have to appear exactly where the
 /// user's file manager writes them.

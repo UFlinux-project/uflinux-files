@@ -248,6 +248,20 @@ impl Backend {
         }
     }
 
+    /// Whether mounting leaves a process of ours running in the foreground.
+    ///
+    /// Every backend but `lftp` either hands the mount to the kernel or forks
+    /// itself into the background, so its plan can be run to completion. `lftp
+    /// mount` is the exception: it serves the filesystem for as long as the
+    /// `lftp` process lives, so its plan has to be spawned with
+    /// [`Command::serve`] and left alone. A caller that waited for it would hang
+    /// for the lifetime of the share, and one that killed it on exit would take
+    /// the mount with it.
+    #[must_use]
+    pub const fn serves(&self) -> bool {
+        matches!(self, Self::Lftp { .. })
+    }
+
     /// Whether the program this backend needs is present. A backend chosen at
     /// connect time can stop being present if the package is removed later, and
     /// the answer belongs in the UI before an attempt is made.
@@ -278,8 +292,8 @@ impl Backend {
     /// leaves [`MountTarget::credential_path`] alone.
     pub fn mount(&self, target: &MountTarget, password: Option<&Secret>) -> Result<Plan> {
         match self {
-            Self::Cifs { .. } => self.mount_cifs(target, password),
-            Self::Nfs { .. } => self.mount_nfs(target),
+            Self::Cifs { helper } => self.mount_cifs(helper, target, password),
+            Self::Nfs { helper } => self.mount_nfs(helper, target),
             Self::Sshfs { program } => self.mount_sshfs(program, target),
             Self::Rclone { program } => self.mount_rclone(program, target, password),
             Self::Davfs { program } => self.mount_davfs(program, target, password),
@@ -287,12 +301,23 @@ impl Backend {
         }
     }
 
-    /// Every planner takes `&self` and returns a `Result` even when it cannot
-    /// fail, so that adding a validation step to one of them — a length cap on
-    /// an option value, say — does not mean rewriting the dispatcher and the
-    /// callers. The symmetry is worth more than the two `allow`s.
+    /// Every planner takes the program it will run and returns a `Result` even
+    /// when it cannot fail, so that adding a validation step to one of them — a
+    /// length cap on an option value, say — does not mean rewriting the dispatcher
+    /// and the callers. The symmetry is worth more than the two `allow`s.
+    ///
+    /// The kernel filesystems take the helper's path rather than leaving
+    /// [`helper_argv`] to use [`crate::plan::HELPER`]: the path in the variant is
+    /// the one [`Paths::find`] settled on, and running a program at a path nobody
+    /// looked for would mean a helper installed elsewhere, or a test's stub, is
+    /// found at planning time and then ignored at run time.
     #[allow(clippy::unused_self, clippy::unnecessary_wraps)]
-    fn mount_cifs(&self, target: &MountTarget, password: Option<&Secret>) -> Result<Plan> {
+    fn mount_cifs(
+        &self,
+        helper: &Path,
+        target: &MountTarget,
+        password: Option<&Secret>,
+    ) -> Result<Plan> {
         let share = target.share;
         let guest = share.user.is_none() && password.is_none();
         if !guest && password.is_none() {
@@ -338,6 +363,7 @@ impl Backend {
             target.mountpoint,
             &join_options(&options),
         )
+        .clone_program(helper.to_path_buf())
         .secret(if password.is_some() {
             // The helper reads the password from the credentials file, which the
             // caller has already written; stdin stays unused.
@@ -349,7 +375,7 @@ impl Backend {
     }
 
     #[allow(clippy::unused_self, clippy::unnecessary_wraps)]
-    fn mount_nfs(&self, target: &MountTarget) -> Result<Plan> {
+    fn mount_nfs(&self, helper: &Path, target: &MountTarget) -> Result<Plan> {
         let share = target.share;
         let mut options = Vec::new();
         if let Some(vers) = share.option("vers") {
@@ -371,6 +397,7 @@ impl Backend {
             target.mountpoint,
             &join_options(&options),
         )
+        .clone_program(helper.to_path_buf())
         .secret(SecretUse::None);
         Ok(Plan::root(command, target.mountpoint))
     }

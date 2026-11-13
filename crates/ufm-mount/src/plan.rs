@@ -220,6 +220,33 @@ impl Command {
         })
     }
 
+    /// Spawn without waiting, for a plan whose process *is* the mount.
+    ///
+    /// `lftp mount` serves its filesystem for as long as the `lftp` process
+    /// lives, so running that plan to completion would block forever and killing
+    /// it on exit would take the share with it. Stderr is inherited rather than
+    /// piped: nothing would read a pipe for the lifetime of a mount, and a full
+    /// pipe stops the daemon that owns it. What it prints ends up in the session
+    /// log, which is where a mount that dies on its own should be visible.
+    pub fn serve(&self) -> Result<std::process::Child> {
+        let mut builder = std::process::Command::new(&self.program);
+        builder
+            .args(&self.args)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::inherit());
+        for (key, value) in &self.env {
+            builder.env(key, value);
+        }
+        builder.spawn().map_err(|e| {
+            Error::Mount(format!(
+                "{}: cannot start {} ({e})",
+                self.name(),
+                self.program.display()
+            ))
+        })
+    }
+
     /// Run to completion and report the exit status, with the helper's stderr
     /// turned into a message that is safe to show.
     pub fn status(&self) -> Result<()> {

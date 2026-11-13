@@ -128,6 +128,12 @@ impl Options {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Sweep {
     items: Vec<SweepItem>,
+    /// What has already been taken care of: the file removals [`Sweep::apply_files`]
+    /// performed, and the detaches the caller ran and reported with
+    /// [`Sweep::record_done`]. Kept apart from `items` because "what is left to do"
+    /// has to stay separate from "what this run accomplished" — `--sweep-mounts`
+    /// prints both, and a UI shows the second as a notification.
+    done: Vec<SweepItem>,
     /// Things the sweep could not classify: a directory it could not read, a
     /// backend whose program has gone missing. Reported, never fatal — a sweep
     /// that stops halfway would leave the rest to rot.
@@ -149,6 +155,7 @@ impl Sweep {
     ) -> Self {
         let mut sweep = Self {
             items: Vec::new(),
+            done: Vec::new(),
             notes: Vec::new(),
             credential_dir: options.credential_dir.clone(),
         };
@@ -330,12 +337,29 @@ impl Sweep {
         &self.notes
     }
 
+    /// What this run already took care of, in the order it happened: empty until
+    /// [`Sweep::apply_files`] runs or the caller reports a detach with
+    /// [`Sweep::record_done`]. A detach item here still carries the plan that ran;
+    /// [`SweepItem::plan`] is the way to tell the two kinds apart.
+    #[must_use]
+    pub fn removed(&self) -> &[SweepItem] {
+        &self.done
+    }
+
+    /// Report that a detach handed over by this sweep has been carried out, so
+    /// [`Sweep::summary`] and [`Sweep::removed`] say so. A caller that forgets
+    /// this prints a sweep that detached three shares as one that did nothing.
+    pub fn record_done(&mut self, item: &SweepItem) {
+        self.done.push(item.clone());
+    }
+
     /// Perform the file removals — empty directories and leftover credential
     /// files — and drop those items, leaving only the ones that need a command.
     /// A path that has vanished in the meantime counts as done.
     pub fn apply_files(&mut self) -> Result<usize> {
         let mut done = 0;
         let mut notes = Vec::new();
+        let mut taken = Vec::new();
         self.items.retain(|item| {
             if item.plan().is_some() {
                 return true;
@@ -347,6 +371,7 @@ impl Sweep {
             match outcome {
                 Ok(()) => {
                     done += 1;
+                    taken.push(item.clone());
                     false
                 }
                 Err(e) => {
@@ -355,17 +380,24 @@ impl Sweep {
                 }
             }
         });
+        self.done.extend(taken);
         self.notes.extend(notes);
         Ok(done)
     }
 
-    /// One line per item, for `--sweep-mounts` and the log.
+    /// One line per item, for `--sweep-mounts` and the log. What this run already
+    /// did comes first, marked `done`, because that is the part the user asked
+    /// for; what is left for the caller to run comes after it.
     #[must_use]
     pub fn summary(&self) -> String {
-        if self.items.is_empty() && self.notes.is_empty() {
+        if self.items.is_empty() && self.done.is_empty() && self.notes.is_empty() {
             return "nothing to clean up".into();
         }
         let mut out = String::new();
+        for item in &self.done {
+            let _ = writeln!(out, "done\t{}", item.path.display());
+            let _ = writeln!(out, "\t{}", item.why);
+        }
         for item in &self.items {
             let _ = writeln!(out, "{}\t{}", verb(&item.action), item.path.display());
             let _ = writeln!(out, "\t{}", item.why);
