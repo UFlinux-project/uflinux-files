@@ -284,9 +284,7 @@ struct Snapshot<'a> {
 ///
 /// Takes the writer by `Option` because `ChildStdin` can only be moved once, and
 /// a caller that has already consumed it should not be able to call this again.
-// Used by the mount runner in `uflinux-files`, which has no test coverage yet.
-#[allow(dead_code)]
-pub(crate) fn write_secret(
+pub fn write_secret(
     stdin: &mut Option<std::process::ChildStdin>,
     secret: &Secret,
     archive: &Path,
@@ -309,14 +307,28 @@ pub(crate) fn write_secret(
 
 /// Read a file the way a helper's credential file must be read: refuse it if
 /// anyone but the owner can see it.
-// Used by the mount runner in `uflinux-files`, which has no test coverage yet.
-#[allow(dead_code)]
-pub(crate) fn read_protected(path: &Path) -> Result<String> {
+///
+/// The privileged helper uses this as its only source for a password, so the
+/// ownership and mode checks are what stop another user — or another process
+/// running as the same user with a sloppy umask — from having planted a file
+/// for root to trust.
+pub fn read_protected(path: &Path) -> Result<String> {
+    read_protected_by(path, ufm_core::paths::uid())
+}
+
+/// [`read_protected`] with the expected owner named explicitly.
+///
+/// The helper needs this variant: it runs as root and reads a file the *user*
+/// wrote, so comparing against its own euid would reject every credential file
+/// in the directory. The mode check is unchanged, and is the part that matters
+/// most there — a root process trusting a world-readable password file would
+/// let any user plant one.
+pub fn read_protected_by(path: &Path, owner: u32) -> Result<String> {
     let meta = std::fs::metadata(path)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
-        if meta.uid() != ufm_core::paths::uid() || meta.permissions().mode() & 0o077 != 0 {
+        if meta.uid() != owner || meta.permissions().mode() & 0o077 != 0 {
             return Err(Error::Mount(format!(
                 "{} must be owned by you and not readable by anyone else",
                 path.display()

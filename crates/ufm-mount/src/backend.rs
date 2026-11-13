@@ -15,8 +15,10 @@
 //! A password never reaches argv. SMB gets a `credentials=` file the caller
 //! writes at `0600` and deletes afterwards; rclone gets `RCLONE_CONFIG_UFM_PASS`,
 //! whose *name* is in the plan but whose value is not; `lftp` gets a netrc file.
-//! Where a helper insists on a password on stdin, [`SecretUse::Stdin`] says so
-//! and [`crate::credentials::write_secret`] delivers it.
+//! [`SecretUse`] names which channel a plan uses, and
+//! [`crate::credentials::write_secret`] is there for a helper that wants the
+//! password on stdin — none of the ones here do, since a mount has to survive
+//! this process and re-read its password later.
 
 use std::path::{Path, PathBuf};
 

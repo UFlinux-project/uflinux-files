@@ -40,14 +40,17 @@ desktop icon model that `uflinux-desktop` draws.
 | `crates/ufm-index` | Tantivy schema, writer, crawler, query builder, `.desktop` parser |
 | `crates/ufm-search` | The `org.uflinux.Search1` wire format, index config, `Exec` expansion |
 | `crates/ufm-desktop-ipc` | The `org.uflinux.FileManager.Desktop1` protocol and desktop model |
-| `crates/uflinux-files` | The GTK4 UI, the mount helper, and `--provider` |
+| `crates/uflinux-files-mount` | The privileged mount helper `pkexec` runs as root |
+| `crates/uflinux-files` | The GTK4 UI, the mount runner, and `--provider` |
 | `crates/uflinux-searchd` | The indexer daemon |
 | `data/` | Desktop entry, icon, D-Bus activation, polkit policy and rules |
 | `aports/uflinux-files/` | Alpine package recipe |
 | `docs/` | Architecture, mounts, indexer, desktop integration, memory budget, validation |
 
-The first seven crates are pure Rust with no GLib in sight, which is what lets
-them be built and tested anywhere; the two binaries are where GTK and GIO enter.
+Everything above `uflinux-files` is pure Rust with no GLib in sight, which is what
+lets it be built and tested anywhere; the two binaries are where GTK and GIO
+enter. The mount helper is a binary and still pure Rust on purpose: it runs as
+root, so a small dependency graph is a security property rather than a preference.
 
 ## Building
 
@@ -56,7 +59,8 @@ The workspace needs Rust 1.88 or newer. The library crates build anywhere:
     cargo test
 
 The binaries need GTK 4.12 development files (`gtk4.0-dev`, `gtk4-layer-shell-dev`,
-`glib-dev`, `gdk-pixbuf-dev` on Alpine) and are built by the package recipe:
+`glib-dev`, `gdk-pixbuf-dev` on Alpine) and are built by the package recipe. The
+mount helper needs neither and builds with the rest:
 
     cargo build --release -p uflinux-files -p uflinux-searchd -p uflinux-files-mount
 

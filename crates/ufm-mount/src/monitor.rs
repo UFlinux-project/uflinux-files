@@ -282,9 +282,7 @@ pub fn mounted_from(text: &str, source: &str) -> Option<PathBuf> {
 
 /// Fail with the message a UI can show, when a mount root cannot be created
 /// or a mount point cannot be detached.
-// Used by the mount runner in `uflinux-files`, which has no test coverage yet.
-#[allow(dead_code)]
-pub(crate) fn cannot(path: &Path, reason: &std::io::Error) -> Error {
+pub fn cannot(path: &Path, reason: &std::io::Error) -> Error {
     Error::Mount(format!("cannot use {}: {reason}", path.display()))
 }
 

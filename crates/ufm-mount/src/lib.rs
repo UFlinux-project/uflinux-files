@@ -42,8 +42,8 @@ pub mod table;
 pub mod uri;
 
 pub use backend::{Backend, MountTarget};
-pub use credentials::{CredentialStore, FileStore, Secret};
-pub use monitor::{MountState, observe};
+pub use credentials::{CredentialStore, FileStore, Secret, read_protected, write_secret};
+pub use monitor::{MountState, cannot, observe};
 pub use plan::{Command, Plan};
 pub use sweep::{Action, Sweep, SweepItem};
 pub use table::{MountRecord, MountTable, mountpoint_for, now};

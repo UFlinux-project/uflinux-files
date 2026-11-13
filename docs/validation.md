@@ -10,10 +10,11 @@ cargo test
 cargo clippy --all-targets
 ```
 
-Both are green today with no GTK4 development packages installed, because the seven
-library crates are pure Rust and the two binaries are not default members of the
-workspace. That is the whole reason for the split: the logic that decides what a user
-sees is testable on a machine that cannot build the UI.
+Both are green today with no GTK4 development packages installed. Every default
+member is pure Rust — the seven library crates and the mount helper — and the two
+binaries that need a toolkit are not default members. That is the whole reason for
+the split: the logic that decides what a user sees is testable on a machine that
+cannot build the UI, and so is the code that runs as root.
 
 `--all-targets` and not `--workspace`: `-p uflinux-files` pulls in gtk4-sys, gsk4-sys
 and graphene-sys, which need `pkg-config` to find GTK4. Packaging builds
@@ -35,6 +36,7 @@ error type is named in the signature does not need an essay per method.
 | `ufm-index` | a commit that returned is visible after reopening the index; `hidden` filtering works with scoring on; the n-gram field finds a prefix the tokenised field cannot; a re-crawl replaces rather than accumulates. |
 | `ufm-search` | unknown fields are rejected; an oversized reply shrinks to snippets then page and says which; `Exec` expansion drops a field code with no value; a `NAME=value` prefix is not treated as an argument. |
 | `ufm-desktop-ipc` | an id with a slash cannot name a file outside the desktop directory; unplugging a monitor moves icons and deletes none; a saved layout meets a directory that changed since. |
+| `uflinux-files-mount` | the argv handed to `mount(8)` contains no argument from the request that begins with `-`; a target that is a symlink, relative, world-readable, or somebody else's is refused; a `credentials=` file anyone can read is refused and its contents never reach an error message; a `pass=` option is refused; the owner comes from `PKEXEC_UID` and is never `0`. |
 
 ## Archives
 

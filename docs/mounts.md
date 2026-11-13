@@ -55,9 +55,15 @@ avoid this, and `SecretUse` names which one a plan uses:
 
 | `SecretUse` | Backend | Where the password goes |
 | --- | --- | --- |
-| `None` | NFS, SFTP with a key | nowhere; no password exists |
+| `None` | NFS, SFTP with a key, guest SMB | nowhere; no password exists |
 | `File` | SMB, davfs2, lftp, rclone | a `0600` file, or an environment variable |
-| `Stdin` | the helper, for cifs | one line on stdin, then EOF |
+| `Stdin` | nothing today | one line on stdin, then EOF |
+
+The last row exists because a helper could ask for a password that way and
+`write_secret` is ready for it; no backend uses it, because a mount has to outlive
+the process that created it and re-read its password after a reconnect, which a
+closed pipe cannot do. That is also why the privileged helper reads SMB's password
+from the `credentials=` file rather than from the stdin `mount.cifs` would accept.
 
 The files are `<config>/mounts/<slug>.conf`, written at `0600` before the plan
 runs and removed after, with the sweep cleaning up whatever a crash left behind.
@@ -105,10 +111,43 @@ The helper's argv is fixed in shape and shared with the planner
     uflinux-files-mount mount   --type cifs --source //srv/share --target DIR --options uid=1000,…
     uflinux-files-mount unmount --type nfs  --source srv:/export --target DIR --options
 
-The helper validates the filesystem type against a short list, refuses a source
-or target outside the mount root, and never runs a shell. It does not create the
-target directory: the file manager creates it at `0700` first, because creating
-a directory as root inside a location the user controls invites a race.
+The helper validates the filesystem type against a short list — `cifs` and `nfs`,
+nothing else, since those are the two that need `mount(2)` — and never runs a
+shell. Every argument it passes on is built from its own literals, so the only
+arguments beginning with `-` are `-t` and `-o`; a source or an option list that
+starts with a dash is refused rather than re-read by `mount(8)` as a flag.
+
+The target has to be absolute, contain no `.` or `..`, not be a symlink, be a
+directory, be owned by the caller and be `0700`, and for a mount be empty. That
+stands in for "inside the mount root", which the helper cannot check: `pkexec`
+replaces the environment, so `$XDG_RUNTIME_DIR` — where the root is derived from
+— is not available to a root-run program. Ownership and mode say the same thing
+more directly: a directory somebody else owns, or one group can read, was not
+made by this file manager for this mount. The file manager creates the target at
+`0700` before asking, because creating it as root inside a location the user
+controls invites a race.
+
+`credentials=` is verified before `mount.cifs` sees it: absolute, owned by the
+caller, `0600`, and its contents are read once and discarded, so a file pointing
+at another user's secrets is refused instead of leaked into a kernel log. Any
+`pass=` or `password=` option is refused outright, because argv is readable by
+any process with `ps`. That leaves cifs needing either `guest` or a credentials
+file, and the helper says so when neither is present.
+
+`mount` and `umount` are looked up in `/usr/bin`, `/bin`, `/usr/sbin` and
+`/sbin`, never through `$PATH`: an action with `allow_active=auth_self_keep` can
+be answered without a prompt, and a retained authorization plus a caller-controlled
+`PATH` is a privilege escalation. The child runs with stdin on `/dev/null` and a
+60 second deadline, past which it is killed — a hung NFS mount is the case that
+would otherwise hold the window open forever.
+
+The exit code is the whole report: `0` means the requested state is true, which
+includes remounting something already mounted and unmounting something already
+gone, so a retry after a lost reply is not an error; `1` means `mount` or `umount`
+failed, or the child had to be killed; `2` means the request itself was refused,
+which is a bug in the caller rather than a problem with the share. The owner the
+checks compare against comes from `PKEXEC_UID`, which `pkexec` sets to the uid of
+the invoking process — the helper's own euid is always `0`.
 
 `doas` is not an option here even though the distro uses it for administration:
 it reads its password from `/dev/tty`, so it only works from a terminal. The

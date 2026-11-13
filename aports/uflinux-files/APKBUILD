@@ -40,9 +40,11 @@ prepare() {
 	cargo fetch --locked --target="$CTARGET"
 	# Source bundles normalize timestamps. Never reuse stale workspace binaries.
 	cargo clean -p ufm-core -p ufm-vfs -p ufm-archive -p ufm-mount -p ufm-index \
-		-p ufm-search -p ufm-desktop-ipc -p uflinux-files -p uflinux-searchd
+		-p ufm-search -p ufm-desktop-ipc -p uflinux-files-mount -p uflinux-files \
+		-p uflinux-searchd
 	cargo clean --release -p ufm-core -p ufm-vfs -p ufm-archive -p ufm-mount \
-		-p ufm-index -p ufm-search -p ufm-desktop-ipc -p uflinux-files -p uflinux-searchd
+		-p ufm-index -p ufm-search -p ufm-desktop-ipc -p uflinux-files-mount \
+		-p uflinux-files -p uflinux-searchd
 }
 build() {
 	# abuild enables Rust debug info when a -dbg subpackage exists, and the
@@ -106,5 +108,5 @@ mount_helper() {
 # Filled in by scripts/files-source.py --update; empty here so the recipe still
 # parses as shell before a bundle has been generated.
 sha512sums="
-d427a373453193d1faf6575813219e5b8407bbfea519550ce92452ce4b73b10779734a501303ea4a2645a9e68ee45848b25957e1477a711fcebc605637997f46  uflinux-files-0.1.0.tar
+1a51f6f3df52bfdc16769fcefa8a10b6441fada810e42bcaa8f36786bc45fc9c8fb945edb824f80fe4c8220f8d033cb666c2e9796150f0750e5b08cbc4ddc416  uflinux-files-0.1.0.tar
 "

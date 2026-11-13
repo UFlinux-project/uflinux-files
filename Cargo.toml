@@ -8,6 +8,7 @@ members = [
 	"crates/ufm-index",
 	"crates/ufm-search",
 	"crates/ufm-desktop-ipc",
+	"crates/uflinux-files-mount",
 	"crates/uflinux-files",
 	"crates/uflinux-searchd",
 ]
@@ -15,7 +16,9 @@ members = [
 # The two binaries link GTK4/GLib. Keeping them out of the default members means
 # `cargo test` only needs a C toolchain, so the pure-Rust core stays testable on
 # a host without gtk4.0-dev. Packaging builds `--workspace` inside the Alpine
-# chroot where the GTK4 development packages are installed.
+# chroot where the GTK4 development packages are installed. The mount helper is
+# a binary too but needs no GTK — it runs as root, so a small dependency graph
+# is a security property — and stays a default member so its checks run here.
 default-members = [
 	"crates/ufm-core",
 	"crates/ufm-vfs",
@@ -24,6 +27,7 @@ default-members = [
 	"crates/ufm-index",
 	"crates/ufm-search",
 	"crates/ufm-desktop-ipc",
+	"crates/uflinux-files-mount",
 ]
 
 [workspace.package]

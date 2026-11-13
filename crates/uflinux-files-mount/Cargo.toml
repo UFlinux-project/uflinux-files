@@ -1,0 +1,27 @@
+[package]
+name = "uflinux-files-mount"
+description = "Privileged mount helper for UFLinux Files"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[[bin]]
+name = "uflinux-files-mount"
+path = "src/main.rs"
+
+# Deliberately no GTK and no tokio. This runs as root, invoked by pkexec, and
+# every dependency it pulls in is code running with elevated privileges and
+# resident in a process that exists for a few hundred milliseconds.
+[dependencies]
+ufm-core.workspace = true
+ufm-mount.workspace = true
+libc.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

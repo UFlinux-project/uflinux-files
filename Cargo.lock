@@ -1754,6 +1754,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "uflinux-files-mount"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "tempfile",
+ "ufm-core",
+ "ufm-mount",
+]
+
+[[package]]
 name = "uflinux-searchd"
 version = "0.1.0"
 dependencies = [

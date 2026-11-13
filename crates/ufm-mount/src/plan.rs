@@ -12,6 +12,9 @@
 //! and [`Command::mentions`] is how the tests prove it stayed out of argv.
 
 use std::ffi::OsStr;
+use std::fs::Permissions;
+use std::io;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use ufm_core::error::{Error, Result};
@@ -21,8 +24,11 @@ use ufm_core::error::{Error, Result};
 pub enum SecretUse {
     /// The protocol takes no password: NFS, and SFTP with a key or an agent.
     None,
-    /// One line on stdin, then EOF. `mount.cifs` does this when it is not
-    /// attached to a terminal.
+    /// One line on stdin, then EOF. Kept for a helper that reads a password from
+    /// its standard input — `mount.cifs` can, when it is not attached to a
+    /// terminal — but no backend here relies on it today: SMB goes through a
+    /// `credentials=` file instead, because a mount that outlives this process has
+    /// to be able to re-read its password after a reconnect.
     Stdin,
     /// A named environment variable. Environment is not world-readable the way
     /// argv is, and `rclone` reads a password this way.
@@ -341,13 +347,45 @@ impl Plan {
         }
     }
 
-    /// The directory that has to exist before this plan can run. The privileged
-    /// helper will not create it, because creating a directory as root in a
-    /// location the user controls invites a race with whatever else is writing
-    /// there; the file manager creates it at `0700` first.
+    /// The directory that has to exist before this plan can run, created `0700`.
+    ///
+    /// The privileged helper will not create it, because creating a directory as
+    /// root in a location the user controls invites a race with whatever else is
+    /// writing there, and it refuses a target that group or other can read — so
+    /// the mode set here is part of the request being accepted, not cosmetics.
+    /// A remount reuses the directory and resets its mode rather than trusting
+    /// what happens to be on disk.
     pub fn prepare(&self) -> Result<()> {
-        std::fs::create_dir_all(&self.mountpoint)
-            .map_err(|e| Error::Mount(format!("cannot create {}: {e}", self.mountpoint.display())))
+        let point = &self.mountpoint;
+        let failed = |context: &str, e: &io::Error| {
+            Error::Mount(format!(
+                "cannot prepare {}: {context}: {e}",
+                point.display()
+            ))
+        };
+        if let Err(e) = std::fs::create_dir(point) {
+            if e.kind() == io::ErrorKind::AlreadyExists {
+                return std::fs::set_permissions(point, Permissions::from_mode(0o700))
+                    .map_err(|e| failed("resetting the mount point", &e));
+            }
+            if e.kind() != io::ErrorKind::NotFound {
+                return Err(failed("creating the mount point", &e));
+            }
+            // The first mount of the session: the mount root does not exist yet.
+            let root = point
+                .parent()
+                .ok_or_else(|| Error::Mount(format!("{} has no parent", point.display())))?;
+            std::fs::create_dir_all(root).map_err(|e| failed("creating the mount root", &e))?;
+            std::fs::set_permissions(root, Permissions::from_mode(0o700))
+                .map_err(|e| failed("protecting the mount root", &e))?;
+            std::fs::create_dir(point).map_err(|e| failed("creating the mount point", &e))?;
+        }
+        // `create_dir` applies the umask, so a fresh directory is `0755` for an
+        // instant before this line. It is empty in that instant, and the helper's
+        // refusal is what turns leaving it that way into a failed mount rather
+        // than an open one.
+        std::fs::set_permissions(point, Permissions::from_mode(0o700))
+            .map_err(|e| failed("protecting the mount point", &e))
     }
 }
 
@@ -363,6 +401,12 @@ pub const PKEXEC: &str = "/usr/bin/pkexec";
 
 /// Build the argv for the privileged helper. Kept here so the helper's argument
 /// parser and the planner cannot drift apart.
+///
+/// The result declares no [`SecretUse`]: the helper reads a password from the
+/// `credentials=` file its caller wrote at `0600` and never from stdin, so the
+/// caller says where the secret goes — `mount_cifs` marks a password mount
+/// [`SecretUse::File`], and a guest mount or an unmount stays
+/// [`SecretUse::None`].
 #[must_use]
 pub fn helper_argv(
     verb: &str,
@@ -371,7 +415,7 @@ pub fn helper_argv(
     target: &Path,
     options: &str,
 ) -> Command {
-    let mut command = Command::new(HELPER)
+    Command::new(HELPER)
         .arg(verb)
         .arg("--type")
         .arg(fstype)
@@ -380,11 +424,7 @@ pub fn helper_argv(
         .arg("--target")
         .arg(path(target))
         .arg("--options")
-        .arg(options);
-    if fstype == "cifs" {
-        command = command.secret(SecretUse::Stdin);
-    }
-    command
+        .arg(options)
 }
 
 /// `Path` to a `String`, lossy only for names that cannot be mounted anyway.
@@ -471,14 +511,21 @@ mod tests {
             Path::new("/run/user/1000/ufm/srv-share"),
             "uid=1000",
         );
-        let plan = Plan::root(inner.clone(), "/run/user/1000/ufm/srv-share");
+        let plan = Plan::root(
+            inner.secret(SecretUse::File),
+            "/run/user/1000/ufm/srv-share",
+        );
         assert_eq!(plan.privilege(), Privilege::Root);
         let run = plan.run(Path::new(PKEXEC), ACTION);
         assert_eq!(run.program(), Path::new(PKEXEC));
         assert_eq!(run.arguments()[0], ACTION, "pkexec takes the action first");
         assert_eq!(run.arguments()[1], HELPER);
         assert_eq!(run.arguments()[2], "mount");
-        assert_eq!(run.secret_use(), SecretUse::Stdin);
+        assert_eq!(
+            run.secret_use(),
+            SecretUse::File,
+            "wrapping must not lose where the password goes"
+        );
         assert!(!run.mentions("hunter2"));
     }
 
@@ -492,15 +539,18 @@ mod tests {
     }
 
     #[test]
-    fn only_cifs_asks_for_a_password_on_stdin() {
-        assert_eq!(
-            helper_argv("mount", "cifs", "//s/x", Path::new("/m"), "").secret_use(),
-            SecretUse::Stdin
-        );
-        assert_eq!(
-            helper_argv("mount", "nfs", "s:/x", Path::new("/m"), "").secret_use(),
-            SecretUse::None
-        );
+    fn the_helper_itself_declares_no_password_channel() {
+        // The helper reads `credentials=` from a file, so neither type implies a
+        // channel here; a plan that needs one says so at the call site. Getting
+        // this wrong would have the runner write a password to a stdin nobody
+        // reads and wait for a child that already gave up.
+        for fstype in ["cifs", "nfs"] {
+            assert_eq!(
+                helper_argv("mount", fstype, "s:/x", Path::new("/m"), "").secret_use(),
+                SecretUse::None,
+                "{fstype}"
+            );
+        }
     }
 
     #[test]
@@ -549,7 +599,7 @@ mod tests {
     }
 
     #[test]
-    fn preparing_creates_the_mount_point() {
+    fn preparing_creates_the_mount_point_at_the_mode_the_helper_demands() {
         let dir = tempfile::tempdir().expect("tempdir");
         let target = dir.path().join("mnt").join("srv-share");
         let plan = Plan::user(Command::new("/bin/true"), &target);
@@ -558,6 +608,34 @@ mod tests {
         assert!(target.is_dir());
         // Idempotent, because a remount after a failure reuses the directory.
         plan.prepare().expect("prepare again");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{MetadataExt, PermissionsExt};
+            // The privileged helper refuses a target that group or other can
+            // read, so a mode left at the umask default would turn every mount
+            // into a failure that looks like a polkit problem.
+            let meta = std::fs::metadata(&target).expect("metadata");
+            assert_eq!(meta.permissions().mode() & 0o777, 0o700);
+            assert_eq!(meta.uid(), ufm_core::paths::uid());
+            // The mount root too, since it holds every share's credentials-adjacent
+            // directory and is created here on the first mount of a session.
+            let root = std::fs::metadata(target.parent().expect("parent")).expect("root meta");
+            assert_eq!(root.permissions().mode() & 0o777, 0o700);
+
+            // A directory that got the wrong mode between mounts is reset rather
+            // than trusted.
+            std::fs::set_permissions(&target, Permissions::from_mode(0o755)).expect("chmod");
+            plan.prepare().expect("re-prepare");
+            assert_eq!(
+                std::fs::metadata(&target)
+                    .expect("metadata")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o700
+            );
+        }
     }
 
     #[test]

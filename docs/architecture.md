@@ -22,16 +22,21 @@ stays cheap because the shell draws icons while this program only supplies data.
       ufm-index/         pure Rust
       ufm-search/        pure Rust
       ufm-desktop-ipc/   pure Rust
+      uflinux-files-mount/  pure Rust, runs as root
       uflinux-files/     GTK4 + GIO
       uflinux-searchd/   GLib + GIO
 
-The first seven have no `GLib` anywhere in their dependency graph. That is not
-purity for its own sake: it means `cargo test` runs on any machine with a C
-toolchain, so the mount planner, the archive readers, the query builder and the
-two D-Bus wire formats are covered by ordinary unit tests on a build host that
-has no GTK installed. The packaging builds `--workspace` inside a chroot that
+Everything above `uflinux-files` has no `GLib` anywhere in its dependency graph.
+That is not purity for its own sake: it means `cargo test` runs on any machine
+with a C toolchain, so the mount planner, the archive readers, the query builder
+and the two D-Bus wire formats are covered by ordinary unit tests on a build host
+that has no GTK installed. The packaging builds `--workspace` inside a chroot that
 does. It also keeps the two binaries thin, which matters because a binary's
 resident cost starts from the libraries it links.
+
+The mount helper is a binary and still pure Rust for a second reason. It runs as
+root, so every dependency is code that runs with elevated privileges and has to be
+audited; it links `libc` for `kill(2)` and nothing else that matters.
 
 `uflinux-files --provider` is the exception worth naming: it serves the desktop
 icon protocol using GLib and GIO only, with no GTK and no windows, which is what
