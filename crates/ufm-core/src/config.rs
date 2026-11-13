@@ -147,14 +147,21 @@ pub struct Preferences {
     pub search_scope: SearchScope,
     pub search_content: bool,
     pub color_mode: ColorMode,
-    /// Desktop-icon slot layout, kept here so one file holds all UI state.
-    pub desktop_slots: HashMap<String, DesktopSlot>,
     /// Column widths of the Miller columns, outermost first.
     pub column_widths_px: Vec<u32>,
 }
 
 /// Where one desktop icon sits on the shell's grid.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// `Ord` because the desktop-icon layout keeps a set of occupied cells and
+/// walks it in reading order to find a free one.
+///
+/// This is the position on one monitor; which monitor is part of the desktop
+/// layout, not of the view preferences. The provider keeps that layout in its own
+/// file rather than here, because it is a separate process that should not have to
+/// read the UI's preferences to answer a geometry report, and because a slot with
+/// no monitor in it cannot say which of two screens an icon is on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct DesktopSlot {
     pub col: u16,
     pub row: u16,
@@ -186,7 +193,6 @@ impl Default for Preferences {
             search_scope: SearchScope::default(),
             search_content: false,
             color_mode: ColorMode::default(),
-            desktop_slots: HashMap::new(),
             column_widths_px: Vec::new(),
         }
     }

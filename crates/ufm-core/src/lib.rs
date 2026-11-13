@@ -18,7 +18,7 @@ pub mod location;
 pub mod paths;
 pub mod sort;
 
-pub use config::Preferences;
+pub use config::{DesktopSlot, Preferences};
 pub use entry::{Entry, EntryFlags, EntryKind};
 pub use error::{Error, Result};
 pub use location::Location;
