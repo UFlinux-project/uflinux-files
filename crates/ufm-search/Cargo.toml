@@ -14,5 +14,8 @@ ufm-index.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 
+[dev-dependencies]
+tempfile.workspace = true
+
 [lints]
 workspace = true
