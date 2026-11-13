@@ -229,11 +229,7 @@ impl IndexHandle {
             deleted,
             segments: searcher.segment_readers().len(),
             mmapped_files: self.directory.get_cache_info().mmapped.len(),
-            opstamp: self
-                .index
-                .load_metas()
-                .map(|meta| meta.opstamp)
-                .unwrap_or(0),
+            opstamp: self.index.load_metas().map_or(0, |meta| meta.opstamp),
         }
     }
 }

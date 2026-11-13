@@ -51,10 +51,10 @@ impl TarContainer {
     /// Detection already decided this is a tar, so a missing codec is reported
     /// here rather than pretending the file is not an archive at all.
     pub(crate) fn new(path: PathBuf, codec: Codec) -> Result<Self> {
-        if let Some(program) = codec.program() {
-            if !command::available(program) {
-                return Err(command::missing(program, &path));
-            }
+        if let Some(program) = codec.program()
+            && !command::available(program)
+        {
+            return Err(command::missing(program, &path));
         }
         Ok(Self { path, codec })
     }

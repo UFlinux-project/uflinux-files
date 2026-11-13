@@ -236,9 +236,8 @@ mod tests {
         let dir = tempfile::TempDir::new().expect("temp dir");
         let path = dir.path().join("junk.zip");
         std::fs::write(&path, b"not an archive at all").expect("write");
-        let error = match ZipContainer::new(path) {
-            Ok(_) => panic!("a text file is not a zip"),
-            Err(error) => error,
+        let Err(error) = ZipContainer::new(path) else {
+            panic!("a text file is not a zip");
         };
         assert!(error.to_string().contains("junk.zip"), "{error}");
     }

@@ -73,7 +73,7 @@ impl LocalReader {
         // device is then free to detect as a mount point, which is how a USB
         // stick inside /run/user looks different from a folder, without a
         // second stat per entry.
-        let dev = std::fs::metadata(path).map(|m| m.dev()).unwrap_or(0);
+        let dev = std::fs::metadata(path).map_or(0, |m| m.dev());
         let mut read = std::fs::read_dir(path)?;
         let mut since_report = 0usize;
         let mut total = 0usize;

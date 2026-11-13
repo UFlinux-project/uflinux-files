@@ -169,10 +169,10 @@ impl AppEntry {
         if !visible_for(&fields, session) {
             return Err(Skip::WrongSession);
         }
-        if let Some(program) = fields.get("TryExec") {
-            if !resolvable(program) {
-                return Err(Skip::TryExecMissing);
-            }
+        if let Some(program) = fields.get("TryExec")
+            && !resolvable(program)
+        {
+            return Err(Skip::TryExecMissing);
         }
         let id = path
             .file_stem()
@@ -299,13 +299,12 @@ fn visible_for(fields: &BTreeMap<String, String>, session: Option<&str>) -> bool
             return false;
         }
     }
-    if let Some(not) = fields.get("NotShowIn") {
-        if split_semicolon(not)
+    if let Some(not) = fields.get("NotShowIn")
+        && split_semicolon(not)
             .iter()
             .any(|name| matches_session(name, session))
-        {
-            return false;
-        }
+    {
+        return false;
     }
     true
 }

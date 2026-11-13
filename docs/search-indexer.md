@@ -101,6 +101,49 @@ delete the records under it, add what is there now. That is cheaper than trackin
 individual events per file and it cannot drift, because the directory listing is
 the truth.
 
+## Running
+
+The process is one GLib main loop, one indexing worker and one Tantivy merge
+thread. Nothing else runs in the background: a tick every 12 s is what services
+both the exit clock and the periodic rescan, so an idle daemon wakes up a hundred
+times an hour and does no work.
+
+It owns `org.uflinux.Search1` with `ALLOW_REPLACEMENT`, which is what lets a
+newer daemon take over during an upgrade rather than refusing to start.
+
+**The exit clock.** A request re-arms it, and so does a commit — a client that
+asked for a reindex and then stopped talking is still waiting for the result, and
+exiting under it would lose the work it paid for. The clock is held while the
+engine is busy or the queue is non-empty, so the daemon never exits mid-crawl.
+When it does fire, the reason goes to stderr with both numbers, because a daemon
+that vanishes from `systemctl --user status` with no explanation looks like a
+crash. The decision takes an injected clock rather than reading one, so the whole
+rule is tested without sleeping.
+
+**The queue.** Tasks are deduplicated — two requests for the same directory are
+one resync — and capped at 64. Past the cap the oldest `resync` is evicted, since
+a resync re-reads the directory and so absorbs whatever the dropped one would
+have found, while a whole-tree crawl would be lost work. A `Reindex` that cannot
+be queued is refused with the current depth rather than dropped silently: the
+caller asked for something and is owed an answer.
+
+**Method cross-check.** The method name GIO reports is compared against the
+`method` field inside the body, and a mismatch is refused. Without it, a client
+that posts a `status` body to `SearchFiles` would get a status reply where a
+result list belongs, which reads as a broken search rather than a broken client.
+
+**Failures are reported, not signalled.** A crawl that fails sets the status note
+and emits no `Changed`, because nothing was indexed: a client that re-queried
+after a `Changed` it did not need would re-run a search whose results had not
+moved. The note surfaces on the next `Status`, which is also where the UI shows
+why a folder is not searchable.
+
+**The periodic rescan.** inotify covers at most 16 directories, so a home
+directory with more watched folders than that always has some that are not
+watched. Every 300 s the daemon compares what it wanted to watch against what it
+actually got, re-reads the difference, and re-checks the application directories.
+That bounds how stale an unwatched folder can go rather than pretending it cannot.
+
 ## The protocol
 
 `org.uflinux.Search1` at `/org/uflinux/Search`. One JSON string in, one JSON

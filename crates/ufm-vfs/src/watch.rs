@@ -267,11 +267,7 @@ fn close(fd: RawFd) {
 /// read, so the thread simply re-checks the closed flag every time it fires.
 fn run(inotify: RawFd, notify: RawFd, stop: RawFd, state: Arc<Mutex<State>>) {
     let mut buffer = [0u8; 8192];
-    loop {
-        let timeout = match wait_timeout(&state) {
-            None => break,
-            Some(t) => t,
-        };
+    while let Some(timeout) = wait_timeout(&state) {
         let mut pfd = [
             libc::pollfd {
                 fd: inotify,
@@ -318,7 +314,11 @@ fn wait_timeout(state: &Arc<Mutex<State>>) -> Option<i32> {
             if elapsed >= Watcher::DEBOUNCE {
                 Duration::ZERO
             } else {
-                Watcher::DEBOUNCE - elapsed
+                // Saturating rather than plain subtraction: the branch above makes
+                // the result exact, and a `Duration` that went negative between the
+                // comparison and the arithmetic would panic instead of polling
+                // immediately, which is the same answer.
+                Watcher::DEBOUNCE.saturating_sub(elapsed)
             }
         })
         .min()

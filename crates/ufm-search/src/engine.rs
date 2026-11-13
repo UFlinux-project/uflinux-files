@@ -201,6 +201,34 @@ impl Engine {
         self.note.lock().map_or_else(|_| None, |note| note.clone())
     }
 
+    /// Say what went wrong, for whoever reads `Status` next.
+    ///
+    /// The daemon uses this for a task that failed on the worker: the engine
+    /// cannot see that failure itself, and a crawl that died quietly is worse
+    /// than one whose absence is visible somewhere the settings page already
+    /// looks. A crawl that finished with unreadable directories overwrites this,
+    /// which is the right order — the newer observation wins.
+    pub fn report(&self, note: Option<String>) {
+        self.set_note(note);
+    }
+
+    /// Whether neither index holds a record yet, which is how the daemon decides
+    /// to index before any client has asked it to.
+    ///
+    /// Both indexes have to be empty for this to say yes. An index that holds
+    /// applications but no files is a half-built index rather than a fresh one,
+    /// and the client that notices is the one showing an empty result list.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.files.num_records() == 0 && self.apps.num_records() == 0
+    }
+
+    /// Where desktop entries are read from, for whoever watches those directories.
+    #[must_use]
+    pub fn apps_dirs(&self) -> &[PathBuf] {
+        &self.apps_dirs
+    }
+
     fn set_note(&self, note: Option<String>) {
         if let Ok(mut slot) = self.note.lock() {
             *slot = note;

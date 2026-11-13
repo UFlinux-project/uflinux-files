@@ -184,10 +184,10 @@ impl Query {
     /// A scope that is not absolute cannot name a directory, and a page size of
     /// zero would ask for no results at all.
     pub fn validate(&self) -> std::result::Result<(), WireError> {
-        if let Some(scope) = &self.scope {
-            if !scope.starts_with('/') {
-                return Err(WireError::Invalid);
-            }
+        if let Some(scope) = &self.scope
+            && !scope.starts_with('/')
+        {
+            return Err(WireError::Invalid);
         }
         if self.page_size == 0 || self.page_size > ufm_index::MAX_PAGE_SIZE {
             return Err(WireError::Invalid);
@@ -291,6 +291,25 @@ impl Request {
             Self::SearchFiles { .. } => Some(ufm_index::IndexKind::Files),
             Self::SearchApps { .. } => Some(ufm_index::IndexKind::Apps),
             Self::Status | Self::Reindex { .. } | Self::SetRoots { .. } => None,
+        }
+    }
+
+    /// The name of the bus method this request is meant to arrive on.
+    ///
+    /// The `method` tag in the body is the kebab-case form of this, and the
+    /// method in the D-Bus message is this one. Two spellings of the same name,
+    /// written by the same client, in two places in one call — so the daemon
+    /// compares them. A client that gets one of them wrong would otherwise be
+    /// answered for a different question than the one it rang, which looks like a
+    /// bug in the search rather than a mistake in the caller.
+    #[must_use]
+    pub const fn bus_method(&self) -> &'static str {
+        match self {
+            Self::SearchFiles { .. } => "SearchFiles",
+            Self::SearchApps { .. } => "SearchApps",
+            Self::Status => "Status",
+            Self::Reindex { .. } => "Reindex",
+            Self::SetRoots { .. } => "SetRoots",
         }
     }
 }
@@ -492,6 +511,23 @@ mod tests {
         let request = decode(r#"{"method":"status"}"#).expect("a status request");
         assert_eq!(request, Request::Status);
         assert_eq!(request.kind(), None);
+    }
+
+    #[test]
+    fn a_request_names_the_bus_method_it_was_sent_as() {
+        // The daemon compares this against the method the D-Bus call arrived on, so
+        // the tag has to round-trip for every variant and not just for the two the
+        // file manager happens to send.
+        for (text, name) in [
+            (r#"{"method":"status"}"#, "Status"),
+            (r#"{"method":"search-files","text":"x"}"#, "SearchFiles"),
+            (r#"{"method":"search-apps","text":"x"}"#, "SearchApps"),
+            (r#"{"method":"reindex"}"#, "Reindex"),
+            (r#"{"method":"set-roots","roots":["/home/u"]}"#, "SetRoots"),
+        ] {
+            let request = decode(text).expect("a known method");
+            assert_eq!(request.bus_method(), name, "{text}");
+        }
     }
 
     #[test]

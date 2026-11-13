@@ -462,7 +462,7 @@ mod tests {
         store.forget(&a).expect("forget");
         assert!(store.get(&a).is_none());
         assert!(store.get(&b).is_some());
-        store.prune(&[b.clone()]).expect("prune");
+        store.prune(std::slice::from_ref(&b)).expect("prune");
         assert!(store.get(&b).is_some());
         store.prune(&[]).expect("prune all");
         assert!(store.get(&b).is_none());

@@ -104,19 +104,16 @@ pub enum ColorMode {
 }
 
 /// A saved search scope.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SearchScope {
     /// The current folder and everything below it.
     Here,
+    /// Where a search starts on a machine with no folder open: the user's own
+    /// files, and nothing system-wide.
+    #[default]
     Home,
     Everything,
-}
-
-impl Default for SearchScope {
-    fn default() -> Self {
-        Self::Home
-    }
 }
 
 /// Everything the user can change, in one file.

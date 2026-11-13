@@ -154,9 +154,8 @@ mod tests {
         let dir = tempfile::TempDir::new().expect("temp dir");
         let path = dir.path().join("plain.txt");
         std::fs::write(&path, b"x").expect("write");
-        let error = match PlainContainer::new(path, Codec::None) {
-            Ok(_) => panic!("a plain file is not a container"),
-            Err(error) => error,
+        let Err(error) = PlainContainer::new(path, Codec::None) else {
+            panic!("a plain file is not a container");
         };
         assert!(
             error.to_string().contains("not a compressed file"),

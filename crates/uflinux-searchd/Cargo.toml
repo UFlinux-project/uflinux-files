@@ -16,10 +16,15 @@ path = "src/main.rs"
 ufm-core.workspace = true
 ufm-index.workspace = true
 ufm-search.workspace = true
+ufm-vfs.workspace = true
 gio.workspace = true
 glib.workspace = true
+libc.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
 
 [lints]
 workspace = true

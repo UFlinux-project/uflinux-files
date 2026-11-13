@@ -198,8 +198,10 @@ impl Runner {
     /// in the Network group with the error next to it, and the next attempt starts
     /// from a known state. The record is added before anything runs for the same
     /// reason — a crash mid-mount then leaves a mount point the sweep can account
-    /// for instead of an unexplained directory.
-    pub fn mount(&mut self, share: &Share, password: Option<&Secret>) -> Result<Report> {
+    /// for instead of an unexplained directory. The signature says the same thing:
+    /// there is no error a caller could act on that the record does not carry.
+    #[must_use]
+    pub fn mount(&mut self, share: &Share, password: Option<&Secret>) -> Report {
         let label = share.label();
         // A password the caller just typed is the one to use and, once the mount
         // works, the one to cache. Otherwise the stored one is read here, into a
@@ -227,12 +229,12 @@ impl Runner {
                 }
                 self.table.record_mount(&id);
                 let _ = self.table.save();
-                Ok(Report::done(&id, self.publish(&label, &mountpoint)))
+                Report::done(&id, self.publish(&label, &mountpoint))
             }
             Err(message) => {
                 self.table.record_failure(&id, message.clone());
                 let _ = self.table.save();
-                Ok(Report::failed(&id, message))
+                Report::failed(&id, message)
             }
         }
     }
@@ -244,10 +246,11 @@ impl Runner {
     /// failure. A mount that survives the attempt keeps its record — dropping it
     /// would strand a mount point nobody can eject any more, which is the one
     /// outcome worse than a card that says "still mounted".
-    pub fn unmount(&mut self, id: &str) -> Result<Report> {
+    #[must_use]
+    pub fn unmount(&mut self, id: &str) -> Report {
         let Some(record) = self.table.get(id).cloned() else {
             self.retire(id);
-            return Ok(Report::done(id, "that share is not connected"));
+            return Report::done(id, "that share is not connected");
         };
         let label = record.label();
         let outcome = self.detach(&record).map_err(|e| e.to_string());
@@ -257,7 +260,7 @@ impl Runner {
             // leaving it behind is the leftover the sweep exists to clean up.
             let _ = std::fs::remove_dir(&record.mountpoint);
             self.retire(id);
-            return Ok(Report::done(id, format!("{label} is disconnected")));
+            return Report::done(id, format!("{label} is disconnected"));
         }
         let message = match outcome {
             Ok(()) => format!("{label} is still mounted; something is using it"),
@@ -265,13 +268,14 @@ impl Runner {
         };
         self.table.record_failure(id, message.clone());
         let _ = self.table.save();
-        Ok(Report::failed(id, message))
+        Report::failed(id, message)
     }
 
     /// Reconnect a share the table already knows, using its stored password.
-    pub fn reconnect(&mut self, id: &str) -> Result<Report> {
+    #[must_use]
+    pub fn reconnect(&mut self, id: &str) -> Report {
         let Some(share) = self.table.get(id).map(|record| record.share.clone()) else {
-            return Ok(Report::failed(id, "that share is no longer listed"));
+            return Report::failed(id, "that share is no longer listed");
         };
         self.mount(&share, None)
     }
@@ -727,7 +731,7 @@ mod tests {
         let target = point(&fixture, &share);
         fixture.fuse_helper("sshfs", &target, "fuse.sshfs");
         let mut runner = fixture.runner();
-        let report = runner.mount(&share, None).expect("no io error");
+        let report = runner.mount(&share, None);
         assert!(report.ok, "{}", report.message);
         let id = report.id.clone().expect("an id");
         assert_eq!(runner.state(&id), MountState::Mounted);
@@ -741,7 +745,7 @@ mod tests {
         let fixture = Fixture::new();
         let share = share("sftp://host/data");
         let mut runner = fixture.runner();
-        let report = runner.mount(&share, None).expect("no io error");
+        let report = runner.mount(&share, None);
         assert!(!report.ok, "the stub mounts nothing");
         assert!(
             report.message.contains(&share.label()),
@@ -763,9 +767,7 @@ mod tests {
             "#!/bin/sh\necho 'mount error(13): Permission denied' >&2\nexit 32\n",
         );
         let mut runner = fixture.runner();
-        let report = runner
-            .mount(&share, Some(&Secret::from("hunter2")))
-            .expect("no io error");
+        let report = runner.mount(&share, Some(&Secret::from("hunter2")));
         assert!(!report.ok);
         assert!(
             report.message.contains("Permission denied"),
@@ -787,7 +789,7 @@ mod tests {
             ),
         );
         let mut runner = fixture.runner();
-        runner.mount(&share, None).expect("no io error");
+        let _ = runner.mount(&share, None);
         assert_eq!(
             fs::read_to_string(&marker).expect("marker"),
             ufm_mount::plan::ACTION,
@@ -800,9 +802,7 @@ mod tests {
         let fixture = Fixture::new();
         let share = share("smb://user@srv/share");
         let mut runner = fixture.runner();
-        runner
-            .mount(&share, Some(&Secret::from("hunter2")))
-            .expect("no io error");
+        let _ = runner.mount(&share, Some(&Secret::from("hunter2")));
         let saved =
             fs::read_to_string(MountTable::path_at(&fixture.path("conf"))).expect("table saved");
         assert!(!saved.contains("hunter2"), "{saved}");
@@ -827,9 +827,7 @@ mod tests {
             ),
         );
         let mut runner = fixture.runner();
-        runner
-            .mount(&share, Some(&Secret::from("hunter2")))
-            .expect("no io error");
+        let _ = runner.mount(&share, Some(&Secret::from("hunter2")));
         assert_eq!(
             fs::read_to_string(&marker).expect("marker").trim(),
             "yes",
@@ -851,7 +849,7 @@ mod tests {
         let target = point(&fixture, &share);
         fixture.kernel_helper(&target, "nfs");
         let mut runner = fixture.runner();
-        let report = runner.mount(&share, None).expect("no io error");
+        let report = runner.mount(&share, None);
         assert!(report.ok, "{}", report.message);
         let link = fixture.path("net").join(share.label());
         assert_eq!(
@@ -860,9 +858,7 @@ mod tests {
             "other applications are pointed at the mount point"
         );
         assert!(report.message.contains(&link.display().to_string()));
-        let report = runner
-            .unmount(&report.id.expect("an id"))
-            .expect("no io error");
+        let report = runner.unmount(&report.id.expect("an id"));
         assert!(report.ok, "{}", report.message);
         assert!(!link.exists(), "the symlink goes with the mount");
         assert!(runner.table().is_empty());
@@ -875,7 +871,7 @@ mod tests {
         let share = share("nfs://srv/export");
         let mut runner = fixture.runner();
         let id = runner.list(&share).id.clone();
-        let report = runner.unmount(&id).expect("no io error");
+        let report = runner.unmount(&id);
         assert!(report.ok, "{}", report.message);
         assert!(runner.table().is_empty(), "and the record is gone");
     }
@@ -889,7 +885,7 @@ mod tests {
         fixture.claim(&target, "nfs");
         let mut runner = fixture.runner();
         let id = runner.list(&share).id.clone();
-        let report = runner.unmount(&id).expect("no io error");
+        let report = runner.unmount(&id);
         assert!(!report.ok, "{}", report.message);
         assert!(
             runner.table().get(&id).is_some(),
@@ -992,7 +988,7 @@ mod tests {
         // Reconnect is for a share the table already knows — the Network group
         // lists it, and the user clicked it.
         let id = runner.list(&share).id.clone();
-        let report = runner.reconnect(&id).expect("no io error");
+        let report = runner.reconnect(&id);
         assert!(report.ok, "{}", report.message);
         assert!(
             fs::read_dir(fixture.path("cred"))
@@ -1015,7 +1011,7 @@ mod tests {
             .expect("store");
         runner.forget(&share).expect("forget");
         assert!(!runner.has_password(&share));
-        let report = runner.mount(&share, None).expect("no io error");
+        let report = runner.mount(&share, None);
         assert!(
             report.message.contains("password is needed"),
             "{}",
@@ -1070,10 +1066,8 @@ mod tests {
         // A folder in the Network directory that is not one of ours.
         fs::create_dir_all(fixture.path("net").join(share.label())).expect("folder");
         let mut runner = fixture.runner();
-        let report = runner.mount(&share, None).expect("no io error");
-        runner
-            .unmount(&report.id.expect("an id"))
-            .expect("no io error");
+        let report = runner.mount(&share, None);
+        let _ = runner.unmount(&report.id.expect("an id"));
         assert!(
             fixture.path("net").join(share.label()).is_dir(),
             "the user's folder is theirs to keep"

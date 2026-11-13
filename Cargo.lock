@@ -1770,11 +1770,14 @@ version = "0.1.0"
 dependencies = [
  "gio",
  "glib",
+ "libc",
  "serde",
  "serde_json",
+ "tempfile",
  "ufm-core",
  "ufm-index",
  "ufm-search",
+ "ufm-vfs",
 ]
 
 [[package]]
