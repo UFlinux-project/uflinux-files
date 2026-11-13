@@ -1,0 +1,189 @@
+//! Getting a directory listing off the main thread and back.
+//!
+//! A read runs on a worker thread and reports through a [`Queue`], which is a
+//! mutex-guarded list of events plus a self-pipe wired to a `GLib` fd source.
+//! The
+//! pipe is why this works at all: [`glib::MainContext::invoke`] needs the
+//! closure to be `Send`, and no widget is, so a worker cannot hand a listing to
+//! the main loop by calling a closure. It writes one byte instead, and the
+//! handler that runs on the main thread takes the events out of the mutex.
+//!
+//! One worker per navigation, not a pool. A read is either running or
+//! cancelled, so the number of live threads is the number of windows plus the
+//! one the user just navigated away from, and a thread that outlives its
+//! navigation notices the [`Cancel`] flag and stops at the next chunk boundary.
+
+use std::io;
+use std::mem;
+use std::os::fd::RawFd;
+use std::sync::{Arc, Mutex, PoisonError};
+
+use glib::ControlFlow;
+use glib::source::{SourceId, unix_fd_add_local};
+
+use ufm_core::entry::Entry;
+use ufm_core::location::Location;
+use ufm_vfs::FsHints;
+
+/// Something a worker wants the main thread to know. Every variant names the
+/// folder it was read from, because a worker cannot know whether the user has
+/// navigated away since the chunk it produced was queued.
+#[derive(Debug)]
+pub enum Event {
+    /// A chunk of a listing that is still being read, in read order.
+    Batch {
+        location: Location,
+        entries: Vec<Entry>,
+    },
+    /// The complete listing, filtered and sorted. The read is over.
+    Finished {
+        location: Location,
+        entries: Vec<Entry>,
+        hints: Option<FsHints>,
+    },
+    /// The read failed. The message is for the banner, so it is already worded.
+    Failed { location: Location, message: String },
+}
+
+/// Closes a file descriptor when the last owner drops it, so a worker that
+/// finishes after its window is gone cannot close a descriptor some unrelated
+/// code has meanwhile been given the same number for.
+struct Fd(RawFd);
+
+impl Drop for Fd {
+    fn drop(&mut self) {
+        // SAFETY: the descriptor came from `pipe2` and this is its only owner.
+        unsafe { libc::close(self.0) };
+    }
+}
+
+/// The worker's end. Cheap to clone, safe to move to another thread.
+#[derive(Clone)]
+pub struct Handle {
+    out: Arc<Mutex<Vec<Event>>>,
+    write: Arc<Fd>,
+}
+
+impl Handle {
+    /// Queue one event and wake the main loop. A failed write means the queue
+    /// is gone — the window closed — and the worker will notice on the next
+    /// cancellation check, so there is nothing to report here.
+    pub fn send(&self, event: Event) {
+        self.out.lock().map(|mut q| q.push(event)).ok();
+        let byte: [u8; 1] = [1];
+        // SAFETY: `write` is a valid, open descriptor for the pipe.
+        let written = unsafe { libc::write(self.write.0, byte.as_ptr().cast(), byte.len()) };
+        let _ = written;
+    }
+}
+
+/// The main thread's end. Dropping it stops the listing from being delivered.
+pub struct Queue {
+    out: Arc<Mutex<Vec<Event>>>,
+    read: Arc<Fd>,
+    write: Arc<Fd>,
+    /// `Option` because removing a source consumes its id, and a `Drop` impl
+    /// cannot move a field out of itself.
+    source: Option<SourceId>,
+}
+
+impl Queue {
+    /// Build a queue and attach its wake-up source to the thread-default main
+    /// context, which must be the one GTK runs — call this from the main thread.
+    ///
+    /// `on_event` is called once per queued event, oldest first, and only for
+    /// events that were queued since the last wake-up.
+    pub fn new(mut on_event: impl FnMut(Event) + 'static) -> io::Result<Self> {
+        let mut fds = [NO_FD; 2];
+        // SAFETY: `fds` is two `c_int`s and `pipe2` writes both on success.
+        let ok = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_NONBLOCK | libc::O_CLOEXEC) };
+        if ok != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let read = Arc::new(Fd(fds[0]));
+        let write = Arc::new(Fd(fds[1]));
+        let out: Arc<Mutex<Vec<Event>>> = Arc::new(Mutex::new(Vec::new()));
+        let watched = Arc::clone(&out);
+        let watched_fd = Arc::clone(&read);
+        let source = unix_fd_add_local(read.0, glib::IOCondition::IN, move |_fd, _condition| {
+            // Drain the pipe so the source does not fire again immediately, and
+            // ignore the result: `WouldBlock` is the normal end of a drain.
+            let mut buf = [0_u8; 64];
+            // SAFETY: `watched_fd` is a valid, open descriptor.
+            while unsafe { libc::read(watched_fd.0, buf.as_mut_ptr().cast(), buf.len()) } > 0 {}
+            let queued: Vec<Event> =
+                mem::take(&mut *watched.lock().unwrap_or_else(PoisonError::into_inner));
+            for event in queued {
+                on_event(event);
+            }
+            ControlFlow::Continue
+        });
+        Ok(Self {
+            out,
+            read,
+            write,
+            source: Some(source),
+        })
+    }
+
+    /// The end to hand a worker.
+    #[must_use]
+    pub fn handle(&self) -> Handle {
+        Handle {
+            out: Arc::clone(&self.out),
+            write: Arc::clone(&self.write),
+        }
+    }
+}
+
+impl Drop for Queue {
+    fn drop(&mut self) {
+        // The source holds `on_event`, which holds whatever the window gave it.
+        // Without this the source outlives the window and keeps it alive.
+        if let Some(source) = self.source.take() {
+            source.remove();
+        }
+    }
+}
+
+/// What an unset descriptor looks like. `pipe2` fills both slots on success.
+const NO_FD: RawFd = -1;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn event() -> Event {
+        Event::Failed {
+            location: Location::file("/nowhere"),
+            message: "no".to_string(),
+        }
+    }
+
+    #[test]
+    fn a_handle_can_send_without_a_running_loop() {
+        // The queue is dropped straight away, which closes the read end; the
+        // write must still not panic, because a worker racing a window close is
+        // the common case rather than an edge case.
+        let queue = Queue::new(|_| {}).expect("a pipe can be made");
+        let handle = queue.handle();
+        handle.send(event());
+        drop(queue);
+        handle.send(event());
+    }
+
+    #[test]
+    fn events_queue_in_order_until_someone_reads_them() {
+        let queue = Queue::new(|_| {}).expect("a pipe can be made");
+        let handle = queue.handle();
+        handle.send(event());
+        handle.send(event());
+        assert_eq!(queue.out.lock().expect("not poisoned").len(), 2);
+    }
+
+    #[test]
+    fn a_handle_is_send() {
+        fn assert_send<T: Send>() {}
+        assert_send::<Handle>();
+    }
+}

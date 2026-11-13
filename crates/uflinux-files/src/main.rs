@@ -6,13 +6,13 @@
 
 mod cli;
 
-// The mount half of the runner has no caller yet: `--sweep-mounts` reaches
-// `open`, `refresh` and `sweep`, and everything else — `mount`, `unmount`,
-// `reconnect`, `touch`, `auto_unmount`, `Report` — is the API the GTK window and
-// `--provider` will call. Delete this attribute when `ui()` builds its first
-// window, so that a method nobody ever wanted starts warning again.
+// The window reads mounts but does not yet make them: `mount`, `unmount`,
+// `reconnect`, `remember` and `forget` are the API the "Connect to a server"
+// dialog will call, and `Report` is what that dialog reports back. Delete this
+// attribute when the dialog lands, so a method nobody ever wanted warns again.
 #[allow(dead_code)]
 mod runner;
+mod ui;
 
 use std::process::ExitCode;
 
@@ -107,17 +107,10 @@ fn verb(action: &Action) -> &'static str {
     }
 }
 
-/// Open a window. The GTK4 UI arrives in Phase 1; until then a location given on
-/// the command line is counted rather than ignored, so a launcher mistake is
-/// visible instead of silent.
+/// Open a window. The application is single-instance, so the arguments are
+/// handed to whichever process already owns the name and this call returns once
+/// that process has finished; a launcher mistake therefore shows up as an
+/// already-open window rather than a second copy of the program.
 fn ui(urls: &[String]) -> ExitCode {
-    if urls.is_empty() {
-        eprintln!("uflinux-files: the GTK4 interface is not implemented yet");
-    } else {
-        eprintln!(
-            "uflinux-files: the GTK4 interface is not implemented yet ({} given)",
-            urls.len()
-        );
-    }
-    ExitCode::from(3)
+    ui::run(urls)
 }
