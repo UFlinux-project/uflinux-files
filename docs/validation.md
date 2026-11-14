@@ -31,7 +31,7 @@ error type is named in the signature does not need an essay per method.
 | --- | --- |
 | `ufm-core` | `Location` round-trips, including a `!` inside an archive path and a `..` that is a legal Linux component; traversal out of an archive is rejected; atomic writes leave no partial file; config migration from an older `version`. |
 | `ufm-vfs` | streaming reads publish in bounded slices; the cache respects all three caps; a cancelled read stops within one chunk; the watcher's overflow path reports the directories it dropped. |
-| `ufm-archive` | `.tar.gz` is a tar and `.gz` alone is a one-member container; a corrupt or truncated archive degrades to an error row rather than a panic; a `../` member cannot escape the extract directory; a zip-in-tar navigates two levels. |
+| `ufm-archive` | `.tar.gz` is a tar and `.gz` alone is a one-member container; a corrupt archive degrades to an error row rather than a panic, and a truncated one never lists a member it cannot read whole; a `../` member cannot escape the extract directory; a zip-in-tar navigates two levels. |
 | `ufm-mount` | the mount table survives a kill mid-write; a `Share` renders for display without its password; every backend's argv is checked for the absence of the secret; `SecretUse` matches what the real program expects. |
 | `ufm-index` | a commit that returned is visible after reopening the index; `hidden` filtering works with scoring on; the n-gram field finds a prefix the tokenised field cannot; a re-crawl replaces rather than accumulates. |
 | `ufm-search` | unknown fields are rejected; an oversized reply shrinks to snippets then page and says which; `Exec` expansion drops a field code with no value; a `NAME=value` prefix is not treated as an argument. |
@@ -41,8 +41,22 @@ error type is named in the signature does not need an essay per method.
 ## Archives
 
 `tests/archive-fixtures/` holds a zip, `tar.gz`, `tar.xz`, `7z`, a zip inside a tar,
-and names with unicode, spaces and a `!` in them. Each is browsed, one member is
-extracted, and a truncated copy of each must produce an error row.
+and names with unicode, spaces and a `!` in them. Each is browsed and one member is
+extracted byte for byte, and each is then read back with its tail removed.
+
+What a truncated container has to do depends on how it is indexed, and the answer is
+not this program's to invent — `unzip`, Python's `zipfile` and GNU `tar` behave the
+same way and the tests assert that behaviour rather than a hoped-for one. A compressed
+stream must be decoded from its first byte, so a `.tar.gz` or `.tar.xz` missing its
+tail cannot be listed at all and comes back as an error row. A zip keeps its index in
+a central directory at the end and a plain tar in header blocks as it goes, so the
+surviving head of either is still a well-formed container and `unzip -l` and `tar tvf`
+both list it without complaint; the promise there is instead that no member is offered
+whose own bytes did not survive, and that nothing reads short while claiming success.
+One quirk is pinned rather than hidden: `sample.zip` stores `outer.zip` uncompressed
+near the front, so a copy missing its tail still contains a complete end-of-central-
+directory record — the inner archive's — and every tool that reads zips, this one
+included, then reads the half-file as the inner container.
 
 The truncated copies matter more than the good ones: an archive read is the only place
 in this program where the input is both untrusted and structurally parsed, and a panic

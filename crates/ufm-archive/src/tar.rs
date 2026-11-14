@@ -170,7 +170,7 @@ pub(crate) fn scan(stream: &mut Source, record_offsets: bool) -> Result<Toc> {
 fn skip_to_member(stream: &mut Source, name: &str, archive: &Path) -> Result<()> {
     let mut reader = BlockReader::new(stream);
     while let Some(header) = next_member(&mut reader)? {
-        if header.name == name {
+        if member_path(&header.name) == name {
             return Ok(());
         }
         reader.skip(header.data)?;
@@ -179,6 +179,24 @@ fn skip_to_member(stream: &mut Source, name: &str, archive: &Path) -> Result<()>
         "{}: {name} is not in the archive",
         archive.display()
     )))
+}
+
+/// A header name reduced to the form [`Toc`] stores it under.
+///
+/// GNU tar writes every member it is pointed at a directory as `./notes.txt`,
+/// and a hand-made container can carry a doubled separator. [`TocBuilder::push`]
+/// drops the empty and `.` components while building, so the table of contents
+/// knows the member as `notes.txt`, and the walk above has to compare the same
+/// reduced form. Comparing the raw field instead made every member of a
+/// compressed tar unfindable — the listing showed `notes.txt`, the walk looked
+/// for `./notes.txt` and reported it missing — which only bit `.tar.gz` and
+/// `.tar.xz`, because an uncompressed tar seeks to a recorded offset and never
+/// compares a name at all.
+fn member_path(name: &str) -> String {
+    name.split('/')
+        .filter(|component| !component.is_empty() && *component != ".")
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 /// What a header block is, once its typeflag has been read.
@@ -902,5 +920,43 @@ mod tests {
             Err(error) => error,
         };
         assert!(error.to_string().contains("not a tar"), "{error}");
+    }
+
+    #[test]
+    fn a_dotted_header_name_reduces_to_the_name_the_index_uses() {
+        assert_eq!(member_path("./notes.txt"), "notes.txt");
+        assert_eq!(member_path("docs/./x"), "docs/x");
+        assert_eq!(member_path("./a//b/"), "a/b");
+        assert_eq!(member_path("notes.txt"), "notes.txt");
+        assert_eq!(member_path("./"), "");
+    }
+
+    /// The regression this whole path exists for. GNU tar writes `./notes.txt`
+    /// into the header and the table of contents knows the member as
+    /// `notes.txt`, so a walk that compares the raw field reports a member the
+    /// listing just showed as missing — and only for a compressed container,
+    /// because an uncompressed one seeks to a recorded offset instead.
+    #[test]
+    fn a_member_written_with_a_leading_dot_is_found_by_its_index_name() {
+        let mut tar = Builder::default();
+        tar.member(b'0', "./notes.txt", b"hello", 0, "0000644");
+        tar.member(b'0', "./docs/readme.md", b"hi", 0, "0000644");
+        tar.end();
+
+        let toc = tar.toc().expect("scanned");
+        assert!(toc.find("notes.txt").is_some(), "the index drops the dot");
+        // The lookup side does not normalise, and does not need to: a location
+        // rejects a `.` component before it ever reaches the index.
+        assert!(toc.find("./notes.txt").is_none(), "one spelling, not two");
+
+        let (_file, mut source) = source_of(&tar.bytes);
+        skip_to_member(&mut source, "notes.txt", Path::new("/x/a.tar.gz"))
+            .expect("found by the name the listing shows");
+        let mut body = Vec::new();
+        source.read_to_end(&mut body).expect("read");
+        assert!(
+            body.starts_with(b"hello"),
+            "positioned on the right member's bytes"
+        );
     }
 }
