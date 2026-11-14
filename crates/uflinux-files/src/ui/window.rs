@@ -37,6 +37,7 @@ use ufm_vfs::{Cancel, FsHints, Readers};
 use super::columns::Columns;
 use super::connect;
 use super::job::{Event, Handle, Queue};
+use super::ops;
 use super::panel::{Panel, Place, Usage};
 use super::row::Row;
 use super::search::{Found, Outcome, Search};
@@ -265,6 +266,10 @@ struct State {
     results: Option<Vec<Entry>>,
     query: String,
     runner: Runner,
+    /// What this window has picked up for a paste. Per window rather than
+    /// shared: a cut in one window pasting into another would need rows that the
+    /// other window has never read.
+    clipboard: ops::Clipboard,
 }
 
 impl State {
@@ -289,6 +294,7 @@ impl State {
             results: None,
             query: String::new(),
             runner,
+            clipboard: ops::Clipboard::default(),
         }
     }
 
@@ -552,7 +558,81 @@ fn apply(ctx: &Ctx, event: Event) {
             show_banner(ctx, &format!("{}: {message}", location.display()));
         }
         Event::Mounted { report } => mounted(ctx, report),
+        Event::Operation { outcome } => operated(ctx, outcome),
     }
+}
+
+/// A file operation finished on a worker.
+///
+/// The message goes up whatever the outcome: an operation that reported nothing
+/// is indistinguishable from one that is still running, and a banner is the only
+/// place a refusal can be explained without interrupting the window.
+///
+/// The folder on screen is re-read rather than patched. A paste adds rows and a
+/// rename reorders them, so the sorted listing the window keeps would have to be
+/// rebuilt anyway, and one directory walk costs less than the bookkeeping. Parent
+/// columns are the other half: [`Columns::reload`] re-reads every pane but the
+/// deepest, so this is the same pair the reload button runs, and the two never
+/// read one folder twice.
+fn operated(ctx: &Ctx, outcome: ops::Outcome) {
+    if !outcome.message.is_empty() {
+        show_banner(ctx, &outcome.message);
+    }
+    let current = ctx.shared.state.borrow().current.clone();
+    let here = current.as_ref();
+    // The folder in the title bar changed, so its rows and its count are both
+    // wrong and only a re-read fixes either.
+    let changed_here = outcome.changed.iter().any(|folder| here == Some(folder));
+    // A change one column to the left does not touch the rows on screen, but it
+    // does touch the column that shows them, and a pane holding a row that has
+    // been moved is a pane lying about the folder it names.
+    let changed_above = outcome
+        .changed
+        .iter()
+        .any(|folder| here.is_some_and(|location| location.is_within(folder)));
+    if changed_here || changed_above {
+        ctx.columns.reload();
+    }
+    if changed_here && let Some(location) = current {
+        navigate(ctx, location, false);
+    }
+    // Free space moved, and the sidebar shows free space.
+    if let Some(panel) = ctx.panel.upgrade() {
+        panel.set_usage(usages(&ctx.shared));
+    }
+}
+
+/// The window and the queue, for the handlers that need both. Either can be gone
+/// by the time a handler runs — a window closes and its queue goes with it — and
+/// a command issued to a window that is already gone has nowhere to be reported.
+fn sink_for(ctx: &Ctx) -> Option<(gtk::ApplicationWindow, Handle)> {
+    let handle = ctx.handle.borrow().clone()?;
+    let window = ctx.window.upgrade()?;
+    Some((window, handle))
+}
+
+/// The rows a file operation should act on: the selection in grid and list, the
+/// row the column keyboard is on in columns, and nothing else. Acting on rows the
+/// user cannot see is worse than acting on none, which is why the columns report
+/// one row rather than every pane's selection.
+fn targets(ctx: &Ctx) -> Vec<Entry> {
+    if columns_on(ctx) {
+        return ctx.columns.selected();
+    }
+    ctx.view
+        .upgrade()
+        .map_or_else(Vec::new, |view| view.selected())
+}
+
+/// The folder operations write into. Index results can be on screen while the
+/// folder behind them is not, so this is the folder in the title bar rather than
+/// what the rows describe — which is also what a paste into a search should do.
+fn target_folder(ctx: &Ctx) -> Option<Location> {
+    let state = ctx.shared.state.borrow();
+    if !state.current.as_ref().is_some_and(Location::is_real) {
+        return None;
+    }
+    state.current.clone()
 }
 
 /// Put one page of index results on screen, in place of the folder.
@@ -793,6 +873,11 @@ fn sync_buttons(ctx: &Ctx) {
     enable(&window, "back", back);
     enable(&window, "forward", forward);
     enable(&window, "up", up);
+    // Paste belongs here rather than beside the three above: it is the one action
+    // whose availability depends on the folder as well as on the clipboard, and
+    // this runs on every navigation.
+    drop(window);
+    sync_paste(ctx);
 }
 
 fn enable(window: &gtk::ApplicationWindow, name: &str, on: bool) {
@@ -898,6 +983,18 @@ fn menu() -> gio::Menu {
     }
     let show = gio::Menu::new();
     show.append(Some("Show hidden files"), Some("win.hidden"));
+    // The file operations, in the order a user reaches for them: make something,
+    // name it, get rid of it, move it. `Delete Permanently` is spelled out rather
+    // than shortened to `Delete`, because a menu that offers both has to say which
+    // one can be undone.
+    let files = gio::Menu::new();
+    files.append(Some("New Folder"), Some("win.new-folder"));
+    files.append(Some("Rename"), Some("win.rename"));
+    files.append(Some("Move to Trash"), Some("win.trash"));
+    files.append(Some("Delete Permanently"), Some("win.delete"));
+    files.append(Some("Copy"), Some("win.copy"));
+    files.append(Some("Cut"), Some("win.cut"));
+    files.append(Some("Paste"), Some("win.paste"));
     let network = gio::Menu::new();
     network.append(Some("Connect to Server…"), Some("win.connect"));
     let window = gio::Menu::new();
@@ -905,6 +1002,7 @@ fn menu() -> gio::Menu {
     window.append(Some("Search files and apps"), Some("win.find"));
     window.append(Some("New window"), Some("win.new-window"));
     menu.append_section(None, &view);
+    menu.append_section(None, &files);
     menu.append_section(None, &show);
     menu.append_section(None, &network);
     menu.append_section(None, &window);
@@ -963,6 +1061,7 @@ fn wire_handlers(panel: &Rc<Panel>, view: &Rc<View>, columns: &Rc<Columns>, ctx:
 fn wire_actions(app: &gtk::Application, window: &gtk::ApplicationWindow, ctx: &Ctx) {
     let mut actions = nav_actions(ctx);
     actions.extend(view_actions(app, ctx));
+    actions.extend(op_actions(ctx));
     for action in &actions {
         ActionMapExt::add_action(window, action.as_ref());
     }
@@ -1164,6 +1263,139 @@ fn search_actions(ctx: &Ctx) -> Vec<Rc<gio::SimpleAction>> {
     vec![Rc::new(filter), Rc::new(find)]
 }
 
+/// The file operations: create, rename, throw away, and move between folders.
+///
+/// Every handler reaches the window and the queue by upgrading, for the same
+/// reason the connect action does: a handler outlives the call that installed it
+/// and cannot hold either by reference. Nothing here reads a directory. The rows
+/// to act on come from the selection, the work happens on a worker, and the
+/// answer arrives through [`operated`] — which is also why no handler has to be
+/// careful about a folder that changes underneath it.
+fn op_actions(ctx: &Ctx) -> Vec<Rc<gio::SimpleAction>> {
+    let new_folder = gio::SimpleAction::new("new-folder", None);
+    new_folder.connect_activate({
+        let ctx = ctx.clone();
+        move |_action, _parameter| {
+            let Some((window, handle)) = sink_for(&ctx) else {
+                return;
+            };
+            let Some(folder) = target_folder(&ctx) else {
+                return;
+            };
+            ops::ask_new_folder(&window, &handle, &folder);
+        }
+    });
+
+    let rename = gio::SimpleAction::new("rename", None);
+    rename.connect_activate({
+        let ctx = ctx.clone();
+        move |_action, _parameter| {
+            let Some((window, handle)) = sink_for(&ctx) else {
+                return;
+            };
+            // Renaming a selection of three has no obvious answer, so the command
+            // asks for exactly one row and stays quiet otherwise rather than
+            // guessing which of them the user meant.
+            let picked = targets(&ctx);
+            let [entry] = picked.as_slice() else {
+                return;
+            };
+            ops::ask_rename(&window, &handle, entry);
+        }
+    });
+
+    let paste = gio::SimpleAction::new("paste", None);
+    paste.connect_activate({
+        let ctx = ctx.clone();
+        move |_action, _parameter| {
+            let Some(handle) = ctx.handle.borrow().clone() else {
+                return;
+            };
+            let Some(folder) = target_folder(&ctx) else {
+                return;
+            };
+            // The plan is built while the state is borrowed, and the worker takes
+            // it by value: nothing about the operation depends on the clipboard
+            // afterwards, which is what lets one cut feed two folders.
+            let (plan, transfer) = {
+                let state = ctx.shared.state.borrow();
+                (state.clipboard.plan(&folder), state.clipboard.transfer())
+            };
+            ops::paste(&handle, plan, transfer);
+        }
+    });
+
+    vec![
+        Rc::new(new_folder),
+        Rc::new(rename),
+        discard_action("trash", false, ctx),
+        discard_action("delete", true, ctx),
+        pickup_action("copy", ops::Transfer::Copy, ctx),
+        pickup_action("cut", ops::Transfer::Move, ctx),
+        Rc::new(paste),
+    ]
+}
+
+/// `trash` and `delete` differ by one flag, so they are built by one function.
+/// Two near-identical closures would be two places to fix.
+fn discard_action(name: &'static str, permanent: bool, ctx: &Ctx) -> Rc<gio::SimpleAction> {
+    let action = gio::SimpleAction::new(name, None);
+    action.connect_activate({
+        let ctx = ctx.clone();
+        move |_action, _parameter| {
+            let Some(handle) = ctx.handle.borrow().clone() else {
+                return;
+            };
+            let picked = targets(&ctx);
+            if picked.is_empty() {
+                return;
+            }
+            ops::discard(&handle, &picked, permanent);
+        }
+    });
+    Rc::new(action)
+}
+
+/// `copy` and `cut`: remember the selection and say whether a paste should move.
+///
+/// An empty selection leaves the clipboard alone rather than clearing it. Rows
+/// can vanish from under a selection while a folder is being re-read, and losing
+/// a carefully built clipboard because one Enter was pressed on a folder would
+/// look like the file manager forgot on its own.
+fn pickup_action(name: &'static str, transfer: ops::Transfer, ctx: &Ctx) -> Rc<gio::SimpleAction> {
+    let action = gio::SimpleAction::new(name, None);
+    action.connect_activate({
+        let ctx = ctx.clone();
+        move |_action, _parameter| {
+            let picked = targets(&ctx);
+            if picked.is_empty() {
+                return;
+            }
+            ctx.shared
+                .state
+                .borrow_mut()
+                .clipboard
+                .set(&picked, transfer);
+            sync_paste(&ctx);
+        }
+    });
+    Rc::new(action)
+}
+
+/// Enable or disable paste to match the clipboard. Disabled rather than hidden:
+/// the menu is where a user looks for the command that is missing, and a
+/// greyed-out row explains itself where an absent one does not.
+fn sync_paste(ctx: &Ctx) {
+    let Some(window) = ctx.window.upgrade() else {
+        return;
+    };
+    let can = {
+        let state = ctx.shared.state.borrow();
+        !state.clipboard.is_empty() && state.current.as_ref().is_some_and(Location::is_real)
+    };
+    enable(&window, "paste", can);
+}
+
 /// The keyboard. Set on the application rather than the window, so a shortcut
 /// works in every window the session opens.
 fn install_accels(app: &gtk::Application) {
@@ -1181,6 +1413,21 @@ fn install_accels(app: &gtk::Application) {
     // keyboard shortcut for connecting is the difference between trying a share
     // and giving up on it.
     app.set_accels_for_action("win.connect", &["<Ctrl>K"]);
+    // The file operations. `Delete` goes to the trash and `<Shift>Delete` skips
+    // it, which is the one pair worth the modifier: the difference between the
+    // two is whether a mistake can be undone, and the rarer of the two should be
+    // the one that costs a chord. `<Ctrl>C`/`<Ctrl>X`/`<Ctrl>V` are the usual
+    // three; a focused text entry keeps its own copy and paste, because an entry
+    // binds those keys on its own controller and handles the event before the
+    // window's accelerator does — which is what makes renaming a file without
+    // accidentally pasting into the middle of a name possible.
+    app.set_accels_for_action("win.new-folder", &["<Ctrl><Shift>N"]);
+    app.set_accels_for_action("win.rename", &["F2"]);
+    app.set_accels_for_action("win.trash", &["Delete"]);
+    app.set_accels_for_action("win.delete", &["<Shift>Delete"]);
+    app.set_accels_for_action("win.copy", &["<Ctrl>C"]);
+    app.set_accels_for_action("win.cut", &["<Ctrl>X"]);
+    app.set_accels_for_action("win.paste", &["<Ctrl>V"]);
     for mode in [ViewMode::Grid, ViewMode::List, ViewMode::Columns] {
         app.set_accels_for_action(
             &format!("win.mode::{}", mode_name(mode)),

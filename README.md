@@ -27,6 +27,11 @@ the model over D-Bus and never opens a window.
 - **Search** over filenames, metadata and application entries, served by a
   D-Bus-activated indexer that exits when it has been idle. The same interface
   is what a start menu will use instead of its own application catalog.
+- **File operations**: copy, cut and paste, rename, new folder, trash and
+  delete, on `<Ctrl>C`/`<Ctrl>X`/`<Ctrl>V`, `F2`, `<Ctrl><Shift>N`, `Delete`
+  and `<Shift>Delete`. Each one runs on a worker and reports when it is done,
+  so a large folder never freezes the window; a paste that cannot place one row
+  skips that row with a reason instead of abandoning the rest.
 - **Desktop icons**: this program owns the model — what is on the desktop, where
   each icon sits, what happens when one is double-clicked — and
   `uflinux-desktop` draws it, so there is no second full-screen GTK process.

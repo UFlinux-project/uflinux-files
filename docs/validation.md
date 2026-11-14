@@ -38,7 +38,7 @@ error type is named in the signature does not need an essay per method.
 | `ufm-search` | unknown fields are rejected; an oversized reply shrinks to snippets then page and says which; `Exec` expansion drops a field code with no value; a `NAME=value` prefix is not treated as an argument. |
 | `ufm-desktop-ipc` | an id with a slash cannot name a file outside the desktop directory; unplugging a monitor moves icons and deletes none; a saved layout meets a directory that changed since. |
 | `uflinux-files-mount` | the argv handed to `mount(8)` contains no argument from the request that begins with `-`; a target that is a symlink, relative, world-readable, or somebody else's is refused; a `credentials=` file anyone can read is refused and its contents never reach an error message; a `pass=` option is refused; the owner comes from `PKEXEC_UID` and is never `0`. |
-| `uflinux-files` | the location on argv reaches the window; `--new-window` gives up being the single instance; the application id matches the desktop entry; a machine with no render node is asked for the cairo renderer, and an explicit `GSK_RENDERER` is never overridden. |
+| `uflinux-files` | the location on argv reaches the window; `--new-window` gives up being the single instance; the application id matches the desktop entry; a machine with no render node is asked for the cairo renderer, and an explicit `GSK_RENDERER` is never overridden; a paste plan drops the rows that cannot land and names the reason for each, growing `report (2).pdf` rather than replacing; copying a folder takes its contents and deleting one takes what is inside it; a prompt refuses an empty name, hands the typed name over exactly once, and pre-selects the stem of a filename but not its extension. |
 | `uflinux-files-provider` | the crate does not depend on GTK, checked against its own manifest; the bus name is taken through the C entry point whose handlers are nullable, not the gio-rs wrapper that aborts at logout; the polling deadline is longer than the timer that checks it; a missing login session is refused before the bus is asked for. |
 
 ## Archives
@@ -149,10 +149,24 @@ thing the interface has to a public contract. The checks, in order: a window ope
 location named on the command line; the sidebar offers every place; the header buttons
 carry the right sensitivity for the start of a history; the grid lists the folder's
 entries and counts them; the list mode swaps in a tree table with the four headings; the
-columns mode renders one pane per path level; the search action opens a field and the
-field takes typed text; a second invocation opens a `Computer` window in the running
-instance; `--new-window` opens a window rather than focusing an open one; and the indexer
-answers `Status` on the bus. The run fails if the app printed a single GLib critical.
+columns mode renders one pane per path level; `Describe` reports `paste` disabled while
+the clipboard is empty; the `new-folder` action opens a prompt, its button creates the
+folder the prompt suggested, the listing picks it up without being told to, and answering
+the prompt closes it; the search action opens a field and the field takes typed text; a
+second invocation opens a `Computer` window in the running instance; `--new-window` opens
+a window rather than focusing an open one; and the indexer answers `Status` on the bus.
+The prompt is driven through the accessibility tree, by the `press` command of the probe,
+which activates a node by name — the same controller path a mouse click takes.
+
+The run fails if the app printed a GLib critical. One message is excepted, and it is
+excepted on evidence rather than convenience: `GTK4` 4.22 re-reads a toplevel's
+accessibility properties while a window is being torn down, and with an AT-SPI client
+attached it sometimes reaches a surface that is already gone, printing
+`gdk_wayland_toplevel_set_a11y_properties: assertion 'GDK_IS_WAYLAND_TOPLEVEL
+(toplevel)' failed`. It reproduces with the connect dialog, which predates the name
+prompts, and it does not appear at all without a tree reader attached, so it is a race
+inside `GTK`'s teardown and not a report about this program. The count of what is left
+over is printed either way.
 
 The painted-frame probe is an upper bound and should be read as one — the same caveat the
 distro's own desktop tests carry. `grim` captures the frame and the test counts distinct

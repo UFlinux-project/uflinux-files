@@ -223,8 +223,10 @@ impl Columns {
             // Columns paint a folder in one go, so a partial listing would show a
             // column half full and then jump when the read finished. A share that
             // finished connecting is the window's call — it owns the history and
-            // the current location — so the columns repaint when it navigates.
-            Event::Batch { .. } | Event::Mounted { .. } => {}
+            // the current location — so the columns repaint when it navigates. A
+            // file operation is the same: the window knows which pane it touched
+            // and either patches it or re-reads it.
+            Event::Batch { .. } | Event::Mounted { .. } | Event::Operation { .. } => {}
             Event::Finished {
                 location, entries, ..
             } => {
@@ -270,6 +272,27 @@ impl Columns {
         if let Some(pane) = self.pane_for(location) {
             paint(&pane, entries);
         }
+    }
+
+    /// The row the column keyboard is on, as one entry. The window asks for this
+    /// when a file operation is invoked with the columns on screen: the grid
+    /// selection is a different widget's state, and acting on rows the user
+    /// cannot see would be worse than acting on none.
+    #[must_use]
+    pub fn selected(&self) -> Vec<Entry> {
+        let panes = self.inner.panes.borrow();
+        let Some(pane) = panes.get(self.inner.active.get()) else {
+            return Vec::new();
+        };
+        let at = usize::try_from(pane.selection.selected()).unwrap_or(usize::MAX);
+        // Read from the store rather than from the cached listing: the store is
+        // what is painted, and while the search box narrows a folder the two
+        // disagree about which row number means what.
+        pane.store
+            .item(u32::try_from(at).unwrap_or(u32::MAX))
+            .and_then(|object| object.downcast::<Row>().ok())
+            .map(|row| vec![row.entry()])
+            .unwrap_or_default()
     }
 
     /// The folders currently shown, outermost first.

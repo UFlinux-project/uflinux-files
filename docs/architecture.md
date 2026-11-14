@@ -106,6 +106,41 @@ Nothing here speaks SMB, NFS or FTP. It plans a mount and runs it. See
 `docs/mounts.md` for the protocols, the privilege split and the credential
 rules.
 
+## File operations
+
+Copy, move, rename, trash, delete and new folder live in one UI module, and
+every one of them goes through GIO on a worker thread rather than through
+`std::fs`. That is what makes them work on a mounted share, on a path with a
+non-UTF-8 name, and on a filesystem with a recycle bin, without the module
+knowing about any of those things.
+
+Two of GIO's calls are not what a file manager needs, and both are made up for
+locally. `g_file_copy` refuses a directory, so copying a folder walks it and
+rebuilds it, recreating each directory before filling it so an interrupted copy
+leaves a partial tree rather than a flat one. `g_file_delete` refuses a non-empty
+one, so deleting a folder recurses first. Trash is tried before deleting, and a
+filesystem that has no trash falls back to deleting rather than reporting a
+failure for something the user asked to be removed.
+
+Naming is decided before anything touches the disk. A paste builds a plan — a
+list of `(from, to)` pairs plus a reason for each row it dropped — and the
+worker only ever executes that plan. That is what lets a batch skip the one row
+that cannot land rather than aborting the six that can, and it is where the
+counter names come from: `report (2).pdf`, `Untitled folder 3`, with the counter
+growing after the extension and a leading dot counted as part of the stem, so
+`.bashrc` becomes `.bashrc 2` and `archive.tar.gz` becomes `archive (2).tar.gz`.
+
+The result arrives as one event on the same queue a directory listing uses, so
+an operation refreshes the folder it changed and reports through the same banner
+a failed read uses. Nothing about an operation blocks the interface, and no
+operation needs a thread of its own beyond the one running it.
+
+What is deliberately not there yet: there is no conflict dialog, so a paste
+either takes a free name or grows a counter and never asks about replacing; there
+is no progress reporting, so a large copy reports once at the end; and there is
+no undo. Those are the next step, and all three want a job record that a single
+operation does not need.
+
 ## Search
 
 `uflinux-searchd` owns the two Tantivy indexes and serves

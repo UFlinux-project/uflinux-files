@@ -26,6 +26,7 @@ use ufm_core::location::Location;
 use ufm_vfs::FsHints;
 
 use crate::runner::Report;
+use crate::ui::ops::Outcome;
 
 /// Something a worker wants the main thread to know. The listing variants each
 /// name the folder they were read from, because a worker cannot know whether the
@@ -51,6 +52,13 @@ pub enum Event {
     /// does. The [`Report`] carries the share id, which is what lets the window
     /// re-read the mount table and move into the new mount point.
     Mounted { report: Report },
+    /// A file operation finished. The other variant that is not about a listing,
+    /// and shaped on the same principle: a worker that changed something reports
+    /// what it did and which folders it left behind, and the window decides
+    /// whether that is worth a re-read. The message is shown whatever the
+    /// outcome, because an operation that silently did nothing is
+    /// indistinguishable from one that is still running.
+    Operation { outcome: Outcome },
 }
 
 /// Closes a file descriptor when the last owner drops it, so a worker that
@@ -135,7 +143,7 @@ impl Queue {
     /// source is what turns a write into a callback, and these tests never run a
     /// main loop to receive it.
     #[cfg(test)]
-    fn without_source() -> io::Result<Self> {
+    pub(crate) fn without_source() -> io::Result<Self> {
         let (read, write, out) = pipe()?;
         Ok(Self {
             out,
@@ -152,6 +160,15 @@ impl Queue {
             out: Arc::clone(&self.out),
             write: Arc::clone(&self.write),
         }
+    }
+
+    /// Everything queued so far, taken out of the list.
+    ///
+    /// The window reads its queue from the main-loop source instead; a test that
+    /// never runs a loop needs this to see what a worker reported.
+    #[cfg(test)]
+    pub(crate) fn take(&self) -> Vec<Event> {
+        mem::take(&mut *self.out.lock().unwrap_or_else(PoisonError::into_inner))
     }
 }
 

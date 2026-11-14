@@ -23,6 +23,7 @@ mod columns;
 mod connect;
 mod css;
 mod job;
+mod ops;
 mod panel;
 mod row;
 mod search;

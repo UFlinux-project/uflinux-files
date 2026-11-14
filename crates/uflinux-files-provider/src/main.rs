@@ -113,9 +113,7 @@ fn serve() -> Result<(), String> {
             // No inotify, or no descriptor for the wake pipe. The desktop still works and
             // still updates; only changes that happen while the provider is awake stop
             // being immediate, and the rescan timer catches those.
-            eprintln!(
-                "uflinux-files-provider: live updates unavailable, falling back to polling"
-            );
+            eprintln!("uflinux-files-provider: live updates unavailable, falling back to polling");
         }
 
         let loop_ = glib::MainLoop::new(None, false);

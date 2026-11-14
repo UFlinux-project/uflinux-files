@@ -125,12 +125,27 @@ def first_entry():
 
     Depth-first, so the answer is the same one every run: the search bar sits
     above the folder views in the widget tree, and it is the only editable field
-    a window has until the connect dialog is open.
+    a window has until the connect dialog or a name prompt is open.
     """
     stack = list(apps())
     while stack:
         acc = stack.pop(0)
         if role(acc) == "entry":
+            return acc
+        stack = children(acc) + stack
+    return None
+
+
+def first_named(wanted):
+    """The first node whose accessible name is WANTED, depth-first.
+
+    Same order as `dump`, so a test that reads the tree and then presses
+    something reaches the node it just saw.
+    """
+    stack = list(apps())
+    while stack:
+        acc = stack.pop(0)
+        if name(acc) == wanted:
             return acc
         stack = children(acc) + stack
     return None
@@ -162,6 +177,30 @@ def read_entry():
     return 0
 
 
+def press(wanted):
+    """Run the default action of the first node named WANTED.
+
+    This is how a test clicks a dialog's button: the accessibility tree is what
+    the script can see, and an activation through it goes through the same
+    controller a mouse click would.
+    """
+    acc = first_named(wanted)
+    if acc is None:
+        print("no node named %s" % wanted)
+        return 2
+    iface = Atspi.Accessible.get_action_iface(acc)
+    if iface is None:
+        print("%s has no Action interface" % wanted)
+        return 3
+    if iface.get_n_actions() < 1:
+        print("%s offers no action" % wanted)
+        return 4
+    if not iface.do_action(0):
+        print("%s refused its action" % wanted)
+        return 5
+    return 0
+
+
 def main(argv):
     Atspi.init()
     command = argv[0] if argv else "dump"
@@ -171,7 +210,9 @@ def main(argv):
         return type_into(argv[1])
     if command == "entry":
         return read_entry()
-    print("usage: files-ui-a11y.py [dump | type TEXT | entry]", file=sys.stderr)
+    if command == "press":
+        return press(argv[1])
+    print("usage: files-ui-a11y.py [dump | type TEXT | entry | press NAME]", file=sys.stderr)
     return 64
 
 
