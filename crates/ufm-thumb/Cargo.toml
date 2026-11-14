@@ -1,0 +1,26 @@
+[package]
+name = "ufm-thumb"
+description = "Freedesktop thumbnail cache: the cache key, the staleness rule, and the decode"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+# The desktop provider and the file manager build the same pictures out of the
+# same rules, and a cache the two disagree about is a cache that is read twice.
+# Hence a crate of its own rather than a module in either binary. No GTK here:
+# the UI reaches the cache through `bytes`, which hands back encoded PNG.
+[dependencies]
+ufm-core.workspace = true
+gio.workspace = true
+glib.workspace = true
+gdk-pixbuf.workspace = true
+libc.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

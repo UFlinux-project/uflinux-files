@@ -129,6 +129,13 @@ pub struct Preferences {
     pub sorts: HashMap<String, SortKey>,
     pub show_hidden: bool,
     pub show_toolbar: bool,
+    /// Show a picture of a picture instead of a generic icon.
+    ///
+    /// On by default, and switchable, because reading a folder of camera JPEGs is
+    /// the one thing in a file manager that costs a low-end machine real work.
+    /// The switch lives here rather than only in the view so that a second window
+    /// and the desktop provider can be told the same thing.
+    pub thumbnails: bool,
     pub panel_mode: PanelMode,
     pub panel_groups: HashMap<PanelGroup, PanelMode>,
     /// Panel groups the user switched off entirely.
@@ -176,6 +183,7 @@ impl Default for Preferences {
             sorts: HashMap::new(),
             show_hidden: false,
             show_toolbar: true,
+            thumbnails: true,
             panel_mode: PanelMode::Visible,
             panel_groups,
             panel_hidden: Vec::new(),

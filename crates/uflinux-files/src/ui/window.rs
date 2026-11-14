@@ -45,6 +45,7 @@ use super::ops;
 use super::panel::{Panel, Place, Usage};
 use super::row::Row;
 use super::search::{Found, Outcome, Search};
+use super::thumb::Pipeline;
 use super::view::View;
 use super::watch::Live;
 use crate::runner::{Layout, Report, Runner};
@@ -78,9 +79,18 @@ pub fn open(app: &gtk::Application, urls: &[String]) {
     window.set_title(Some(&start.display()));
 
     let panel = Rc::new(Panel::new());
-    let view = Rc::new(View::new(key));
+    // One preview pipeline per window: the worker, the queue and the token table
+    // are per-window state, because a window is the unit that has a viewport.
+    let thumbs = Pipeline::new();
+    thumbs.set_enabled(prefs.thumbnails);
+    let view = Rc::new(View::new(key, thumbs.clone()));
     view.set_mode(mode);
-    let columns = Rc::new(Columns::new(Arc::clone(&readers), key, prefs.show_hidden));
+    let columns = Rc::new(Columns::new(
+        Arc::clone(&readers),
+        key,
+        prefs.show_hidden,
+        thumbs.clone(),
+    ));
     let (banner, banner_label) = banner_bar();
     let path = path_label(&start);
     // The bar starts out knowing the same folder the window will open on and
@@ -121,6 +131,7 @@ pub fn open(app: &gtk::Application, urls: &[String]) {
         find,
         shared: Rc::clone(&shared),
         handle: Rc::new(RefCell::new(None)),
+        thumbs: thumbs.clone(),
         // Filled in right after the queue, because the answer to a change is a
         // re-read and a re-read needs somewhere to report to.
         live: Rc::new(RefCell::new(None)),
@@ -140,6 +151,9 @@ pub fn open(app: &gtk::Application, urls: &[String]) {
     };
     *ctx.handle.borrow_mut() = Some(queue.handle());
     ctx.columns.set_handle(queue.handle());
+    // Previews travel on the same pipe as listings. A second one would be a
+    // second fd source waking the main loop to do the same work.
+    thumbs.set_handle(queue.handle());
     let live = watch_for(&ctx);
     wire_find(&ctx);
 
@@ -152,24 +166,7 @@ pub fn open(app: &gtk::Application, urls: &[String]) {
     wire_handlers(&panel, &view, &columns, &ctx);
 
     wire_actions(app, &window, &ctx);
-    window.connect_close_request({
-        let shared = Rc::clone(&shared);
-        let weak = window.downgrade();
-        move |_window| {
-            // Saving before the widgets go away keeps a crash after closing from
-            // losing the mode the user last chose.
-            save(&shared);
-            if let Some(window) = weak.upgrade() {
-                OPEN.with(|open| {
-                    let mut open = open.borrow_mut();
-                    if let Some(at) = open.iter().position(|w| w.top == window) {
-                        open.remove(at);
-                    }
-                });
-            }
-            Propagation::Proceed
-        }
-    });
+    wire_close(&window, &shared);
 
     app.add_window(&window);
     window.present();
@@ -182,9 +179,33 @@ pub fn open(app: &gtk::Application, urls: &[String]) {
             _view: view,
             _columns: columns,
             _shared: shared,
+            _thumbs: thumbs,
             _queue: queue,
             _live: live,
         });
+    });
+}
+
+/// Save preferences and drop the window from the list that keeps its widgets
+/// alive. The handler holds a weak reference and a cloned `Rc` rather than the
+/// window itself: it is owned by the window, and a strong reference back would be
+/// the cycle this file's second ownership rule is about.
+fn wire_close(window: &gtk::ApplicationWindow, shared: &Rc<Shared>) {
+    let shared = Rc::clone(shared);
+    let weak = window.downgrade();
+    window.connect_close_request(move |_window| {
+        // Saving before the widgets go away keeps a crash after closing from
+        // losing the mode the user last chose.
+        save(&shared);
+        if let Some(window) = weak.upgrade() {
+            OPEN.with(|open| {
+                let mut open = open.borrow_mut();
+                if let Some(at) = open.iter().position(|w| w.top == window) {
+                    open.remove(at);
+                }
+            });
+        }
+        Propagation::Proceed
     });
 }
 
@@ -240,6 +261,9 @@ struct Ctx {
     banner: gtk::Box,
     banner_label: gtk::Label,
     search: Rc<RefCell<Option<gtk::SearchEntry>>>,
+    /// Previews for this window's rows. The window answers for it because a
+    /// reply arrives on the listing queue, and the queue reports here.
+    thumbs: Pipeline,
     /// The bar that asks the index, as opposed to the filter above, which only
     /// narrows what this window already read.
     find: Search,
@@ -395,6 +419,9 @@ struct Window {
     _view: Rc<View>,
     _columns: Rc<Columns>,
     _shared: Rc<Shared>,
+    /// The preview worker and its token table. Dropping this is what tells the
+    /// worker to stop, so it has to outlive the widgets it paints into.
+    _thumbs: Pipeline,
     /// Removing the fd source is what stops the wake-ups; the field owns it.
     _queue: Queue,
     /// Likewise the watch: dropping this detaches the source and releases the
@@ -679,6 +706,10 @@ fn apply(ctx: &Ctx, event: Event) {
         }
         Event::Mounted { report } => mounted(ctx, report),
         Event::Operation { outcome } => operated(ctx, outcome),
+        // Not about a folder, so no location to match against the window: the
+        // token says which widget asked, and the pipeline knows whether that
+        // widget is still showing the file it asked about.
+        Event::Thumb { token, png } => ctx.thumbs.deliver(token, png),
     }
 }
 
@@ -1198,6 +1229,7 @@ fn menu() -> gio::Menu {
     }
     let show = gio::Menu::new();
     show.append(Some("Show hidden files"), Some("win.hidden"));
+    show.append(Some("Picture previews"), Some("win.thumbnails"));
     // The file operations, in the order a user reaches for them: make something,
     // name it, get rid of it, move it. `Delete Permanently` is spelled out rather
     // than shortened to `Delete`, because a menu that offers both has to say which
@@ -1387,6 +1419,30 @@ fn view_actions(app: &gtk::Application, ctx: &Ctx) -> Vec<Rc<gio::SimpleAction>>
         }
     });
 
+    // The same shape as `hidden`: a switch whose state is the preference, so the
+    // menu shows a checkmark that matches what the window is doing. Unlike
+    // `hidden` this one needs no re-read — the rows on screen are the same files
+    // either way — so it re-binds them instead, which is what asks the factories
+    // for a picture or leaves them with the themed icon.
+    let thumbnails = gio::SimpleAction::new_stateful(
+        "thumbnails",
+        Some(glib::VariantTy::BOOLEAN),
+        &ctx.shared.prefs.borrow().thumbnails.to_variant(),
+    );
+    thumbnails.connect_change_state({
+        let ctx = ctx.clone();
+        move |action, value| {
+            let on = value.and_then(glib::Variant::get::<bool>).unwrap_or(false);
+            ctx.shared.prefs.borrow_mut().thumbnails = on;
+            action.set_state(&on.to_variant());
+            ctx.thumbs.set_enabled(on);
+            if let Some(view) = ctx.view.upgrade() {
+                view.rebind();
+            }
+            ctx.columns.rebind();
+        }
+    });
+
     let new_window = gio::SimpleAction::new("new-window", None);
     new_window.connect_activate({
         let app = app.clone();
@@ -1410,6 +1466,7 @@ fn view_actions(app: &gtk::Application, ctx: &Ctx) -> Vec<Rc<gio::SimpleAction>>
 
     actions.extend([
         Rc::new(hidden),
+        Rc::new(thumbnails),
         Rc::new(new_window),
         Rc::new(connect_server),
     ]);

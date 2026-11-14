@@ -29,9 +29,15 @@ ufm-mount.workspace = true
 ufm-search.workspace = true
 ufm-index.workspace = true
 ufm-desktop-ipc.workspace = true
+# The same thumbnail cache the desktop provider writes, so a picture already
+# decoded by one component is not decoded again by the other.
+ufm-thumb.workspace = true
 gtk.workspace = true
 gio.workspace = true
 glib.workspace = true
+# Decode only, on the main thread: a worker hands back encoded PNG because
+# `Pixbuf` is neither `Send` nor `Sync`. Already in the graph through gtk4.
+gdk-pixbuf.workspace = true
 # `pipe2`, `write` and `close` for the listing queue, which cannot use a GLib
 # channel because glib 0.21 has none.
 libc.workspace = true

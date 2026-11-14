@@ -48,6 +48,13 @@ the model over D-Bus and never opens a window.
   repaints instead of walking the directory again — the same path a mounted share
   would otherwise pay a round trip for. Whatever changes a folder drops its entry,
   which is why watching and caching are the same feature seen from two sides.
+- **Picture previews**: images are decoded at the size of the cell on one worker,
+  started when the first folder needs one, with a queue that drops the oldest
+  request when a scroll outruns the decoder — so the cost of previews is the
+  viewport's and not the folder's. The cache follows the freedesktop thumbnail
+  spec, so pictures already drawn by other software are read rather than decoded,
+  and the desktop provider and the file manager share one implementation of the
+  key and the freshness rule. Off with one click in the view menu.
 
 ## Layout
 
@@ -61,6 +68,7 @@ the model over D-Bus and never opens a window.
 | `crates/ufm-search` | The `org.uflinux.Search1` wire format, index config, `Exec` expansion |
 | `crates/ufm-desktop-ipc` | The `org.uflinux.FileManager.Desktop1` protocol and desktop model |
 | `crates/uflinux-files-mount` | The privileged mount helper `pkexec` runs as root |
+| `crates/ufm-thumb` | The thumbnail cache: key, freshness rule, decode. GLib and GdkPixbuf, no GTK |
 | `crates/uflinux-files` | The GTK4 UI and the mount runner |
 | `crates/uflinux-files-provider` | The desktop-icons provider: GLib and GIO, no GTK |
 | `crates/uflinux-searchd` | The indexer daemon |
@@ -69,11 +77,11 @@ the model over D-Bus and never opens a window.
 | `docs/` | Architecture, mounts, indexer, desktop integration, memory budget, validation |
 
 Everything above `uflinux-files-mount` is pure Rust with no GLib in sight, which is
-what lets it be built and tested anywhere; the three binaries are where GLib enters,
-and only the file manager links GTK. The mount helper is a binary and still pure Rust
-on purpose: it runs as root, so a small dependency graph is a security property rather
-than a preference. The provider links GLib and nothing above it, which is a memory
-property rather than a preference — see
+what lets it be built and tested anywhere; the three binaries and `ufm-thumb` are
+where GLib enters, and only the file manager links GTK. The mount helper is a binary
+and still pure Rust on purpose: it runs as root, so a small dependency graph is a
+security property rather than a preference. The provider and `ufm-thumb` link GLib and
+nothing above it, which is a memory property rather than a preference — see
 [memory-budget.md](docs/memory-budget.md).
 
 ## Building

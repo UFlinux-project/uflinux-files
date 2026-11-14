@@ -29,6 +29,7 @@ mod ops;
 mod panel;
 mod row;
 mod search;
+mod thumb;
 mod view;
 mod watch;
 mod window;

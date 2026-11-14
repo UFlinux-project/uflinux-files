@@ -474,6 +474,63 @@ else
     ok "a file deleted outside the program disappears from the listing"
 fi
 
+# --- picture previews --------------------------------------------------------
+# The one feature whose machinery is invisible from the accessibility tree: a row
+# that got a picture and a row that fell back to the themed icon are the same node
+# with the same name, because an image carries no label. So the assertion is made
+# on the cache directory instead, which is where the freedesktop thumbnail spec
+# says the answer has to land and what makes a preview outlive this window.
+#
+# Whether a decode is possible at all depends on the machine and not on this
+# program: `GdkPixbuf` hands every format but `XPM` to a loader that runs out of
+# process inside a sandbox, and a container that cannot create a pty cannot start
+# one. The probe writes the picture and reports whether it can read one back, so a
+# host with no loader reports a skip rather than a failure it did not cause.
+probe=$(python3 "$HERE/files-ui-pixbuf.py" "$TARGET/photo.png" 2>/dev/null || echo no)
+if [ "$probe" != ok ]; then
+    echo "skip picture previews: this machine cannot decode an image"
+else
+    # The row arrives through the watcher, and the picture is encoded on a worker
+    # afterwards, so both are waited for rather than slept on once.
+    i=0
+    cached=
+    while [ "$i" -lt 100 ] && [ -z "$cached" ]; do
+        cached=$(find "$HOME/.cache/thumbnails" -name '*.png' -size +0 2>/dev/null |
+            head -1)
+        [ -n "$cached" ] || {
+            i=$((i + 1))
+            sleep 0.2
+        }
+    done
+    if [ -n "$cached" ]; then
+        ok "a picture in the folder is decoded and written to the thumbnail cache"
+    else
+        fail "a picture in the folder is decoded and written to the thumbnail cache"
+    fi
+
+    # The menu switch. Its state is the preference, so `Describe` is the honest
+    # place to look: a checkmark that disagreed with what the window does would be
+    # worse than no switch at all. Turning it off and on again also exercises the
+    # re-bind, whose mistakes would surface as a GLib critical below.
+    if describe thumbnails | grep -qF '[<true>]'; then
+        ok "picture previews are on to begin with"
+    else
+        fail "picture previews are on to begin with ($(describe thumbnails))"
+    fi
+    act thumbnails "[<false>]" "[]"
+    if describe thumbnails | grep -qF '[<false>]'; then
+        ok "the switch turns previews off and remembers it in its state"
+    else
+        fail "the switch turns previews off ($(describe thumbnails))"
+    fi
+    act thumbnails "[<true>]" "[]"
+    if describe thumbnails | grep -qF '[<true>]'; then
+        ok "the switch turns previews back on"
+    else
+        fail "the switch turns previews back on ($(describe thumbnails))"
+    fi
+fi
+
 # --- the search bar -----------------------------------------------------------------
 # The bar opens and the field takes text. Whether it finds anything depends on the
 # indexer, which is checked separately below; the field accepting input is the UI's job.

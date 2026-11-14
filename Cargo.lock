@@ -1737,6 +1737,7 @@ dependencies = [
 name = "uflinux-files"
 version = "0.1.0"
 dependencies = [
+ "gdk-pixbuf",
  "gio",
  "glib",
  "gtk4",
@@ -1752,6 +1753,7 @@ dependencies = [
  "ufm-index",
  "ufm-mount",
  "ufm-search",
+ "ufm-thumb",
  "ufm-vfs",
 ]
 
@@ -1769,7 +1771,6 @@ dependencies = [
 name = "uflinux-files-provider"
 version = "0.1.0"
 dependencies = [
- "gdk-pixbuf",
  "gio",
  "glib",
  "libc",
@@ -1778,6 +1779,7 @@ dependencies = [
  "tempfile",
  "ufm-core",
  "ufm-desktop-ipc",
+ "ufm-thumb",
  "ufm-vfs",
 ]
 
@@ -1862,6 +1864,18 @@ dependencies = [
  "tempfile",
  "ufm-core",
  "ufm-index",
+]
+
+[[package]]
+name = "ufm-thumb"
+version = "0.1.0"
+dependencies = [
+ "gdk-pixbuf",
+ "gio",
+ "glib",
+ "libc",
+ "tempfile",
+ "ufm-core",
 ]
 
 [[package]]

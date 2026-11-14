@@ -8,6 +8,7 @@ members = [
 	"crates/ufm-index",
 	"crates/ufm-search",
 	"crates/ufm-desktop-ipc",
+	"crates/ufm-thumb",
 	"crates/uflinux-files-mount",
 	"crates/uflinux-files",
 	"crates/uflinux-files-provider",
@@ -22,7 +23,8 @@ members = [
 # with the UI, which a host without any GLib development headers does not have.
 # The mount helper is a binary too but needs no GLib at all — it runs as root, so
 # a small dependency graph is a security property — and stays a default member so
-# its checks run here.
+# its checks run here. `ufm-thumb` links GLib for the cache key alone (a URI and a
+# checksum), so it stays out with the rest of them.
 default-members = [
 	"crates/ufm-core",
 	"crates/ufm-vfs",
@@ -50,6 +52,7 @@ ufm-mount = { path = "crates/ufm-mount" }
 ufm-index = { path = "crates/ufm-index" }
 ufm-search = { path = "crates/ufm-search" }
 ufm-desktop-ipc = { path = "crates/ufm-desktop-ipc" }
+ufm-thumb = { path = "crates/ufm-thumb" }
 
 # gtk4 0.10 rather than 0.11: 0.11 bumps the MSRV to 1.92, which is above the
 # toolchain Alpine packages, and gtk4-layer-shell 0.7 is built against the same

@@ -59,6 +59,12 @@ pub enum Event {
     /// outcome, because an operation that silently did nothing is
     /// indistinguishable from one that is still running.
     Operation { outcome: Outcome },
+    /// A picture is ready, or was not to be had. The third variant that is not
+    /// about a folder. `token` names the widget that asked — see [`super::thumb`]
+    /// — so the answer can be dropped when that widget has since been rebound,
+    /// which is the ordinary outcome of scrolling rather than a failure. Only
+    /// encoded bytes travel, because a `Pixbuf` is not `Send`.
+    Thumb { token: u64, png: Option<Vec<u8>> },
 }
 
 /// Closes a file descriptor when the last owner drops it, so a worker that

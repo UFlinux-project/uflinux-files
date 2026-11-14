@@ -26,6 +26,7 @@ use ufm_core::entry::Entry;
 use ufm_core::sort::{SortField, SortKey, sort_entries};
 
 use super::row::{Row, format_items};
+use super::thumb::Pipeline;
 
 /// Icon size in grid and columns mode. Small enough that a 512 px pane fits
 /// three icons, which is what keeps a Miller-column view usable.
@@ -119,18 +120,19 @@ pub struct View {
     status: Rc<Status>,
     headers: Headers,
     selections: Selections,
+    thumbs: Pipeline,
 }
 
 impl View {
     #[must_use]
-    pub fn new(key: SortKey) -> Self {
+    pub fn new(key: SortKey, thumbs: Pipeline) -> Self {
         let store = gio::ListStore::new::<Row>();
         let selection = gtk::MultiSelection::new(Some(store.clone()));
         let icon_size = Rc::new(Cell::new(GRID_ICON));
 
         let grid = gtk::GridView::new(
             Some(selection.clone()),
-            Some(grid_factory(Rc::clone(&icon_size))),
+            Some(grid_factory(Rc::clone(&icon_size), thumbs.clone())),
         );
         grid.set_single_click_activate(false);
         // The width decides the column count; GTK's "no ceiling" is its largest
@@ -146,7 +148,7 @@ impl View {
         for column in Column::ALL {
             let widget = gtk::ColumnViewColumn::new(
                 Some(column.title()),
-                Some(list_factory(column, Rc::clone(&icon_size))),
+                Some(list_factory(column, Rc::clone(&icon_size), thumbs.clone())),
             );
             widget.set_expand(column.is_name());
             widget.set_resizable(true);
@@ -175,6 +177,7 @@ impl View {
             status: Rc::new(Status::new()),
             headers: Rc::new(RefCell::new(Vec::new())),
             selections: Rc::new(RefCell::new(Vec::new())),
+            thumbs,
         };
         view.wire_activate();
         view.wire_selection();
@@ -270,9 +273,17 @@ impl View {
         if self.icon_size.replace(size.clamp(16, 256)) == size.clamp(16, 256) {
             return;
         }
-        // The factories read the size while binding, so nothing repaints until
-        // the rows are rebound. Splicing the same rows back in place asks for
-        // that, and it keeps the selection.
+        self.rebind();
+    }
+
+    /// Ask the factories to bind the rows already in the model again, without
+    /// reading the folder a second time. Used when something a factory reads has
+    /// changed — a thumbnail setting, an icon size — and the rows themselves have
+    /// not.
+    pub fn rebind(&self) {
+        // Splicing the same rows back in place is the only way to ask for a
+        // re-bind while keeping the selection, which a position-based update
+        // would have to rebuild by hand.
         let rows: Vec<Row> = self.store.iter::<Row>().filter_map(Result::ok).collect();
         self.store.splice(0, self.store.n_items(), &rows);
     }
@@ -481,7 +492,10 @@ fn fire_selection(handlers: &Selections) {
 ///
 /// Shared with the column panes so that a folder looks the same in the grid and
 /// in a Miller column, and so there is one factory to keep correct.
-pub(super) fn grid_factory(icon_size: Rc<Cell<i32>>) -> gtk::SignalListItemFactory {
+pub(super) fn grid_factory(
+    icon_size: Rc<Cell<i32>>,
+    thumbs: Pipeline,
+) -> gtk::SignalListItemFactory {
     let factory = gtk::SignalListItemFactory::new();
     let size = Rc::clone(&icon_size);
     factory.connect_setup(move |_factory, object| {
@@ -511,6 +525,7 @@ pub(super) fn grid_factory(icon_size: Rc<Cell<i32>>) -> gtk::SignalListItemFacto
         if let Some(image) = image {
             image.set_pixel_size(icon_size.get());
             image.set_icon_name(Some(&row.icon_name()));
+            thumbs.request(&image, &row, icon_size.get());
         }
         if let Some(label) = label {
             label.set_text(&row.name());
@@ -520,7 +535,11 @@ pub(super) fn grid_factory(icon_size: Rc<Cell<i32>>) -> gtk::SignalListItemFacto
 }
 
 /// List mode: one column of the table.
-fn list_factory(column: Column, icon_size: Rc<Cell<i32>>) -> gtk::SignalListItemFactory {
+fn list_factory(
+    column: Column,
+    icon_size: Rc<Cell<i32>>,
+    thumbs: Pipeline,
+) -> gtk::SignalListItemFactory {
     let factory = gtk::SignalListItemFactory::new();
     let size = Rc::clone(&icon_size);
     factory.connect_setup(move |_factory, object| {
@@ -565,6 +584,7 @@ fn list_factory(column: Column, icon_size: Rc<Cell<i32>>) -> gtk::SignalListItem
         if let Some(image) = image {
             image.set_pixel_size(icon_size.get());
             image.set_icon_name(Some(&row.icon_name()));
+            thumbs.request(&image, &row, icon_size.get());
         }
         if let Some(label) = label {
             label.set_text(&text);
@@ -659,7 +679,7 @@ mod tests {
     #[test]
     fn a_view_starts_empty() {
         tk::ui(|| {
-            let view = View::new(SortKey::default());
+            let view = View::new(SortKey::default(), Pipeline::new());
             assert!(view.is_empty());
             assert_eq!(view.len(), 0);
             assert_eq!(view.selected_count(), 0);
@@ -670,7 +690,7 @@ mod tests {
     #[test]
     fn a_listing_is_shown_in_the_order_it_arrived() {
         tk::ui(|| {
-            let view = View::new(SortKey::default());
+            let view = View::new(SortKey::default(), Pipeline::new());
             view.set_entries(vec![
                 entry("zebra", EntryKind::File),
                 entry("Docs", EntryKind::Directory),
@@ -683,7 +703,7 @@ mod tests {
     #[test]
     fn resorting_reorders_the_rows_it_already_holds() {
         tk::ui(|| {
-            let view = View::new(SortKey::default());
+            let view = View::new(SortKey::default(), Pipeline::new());
             view.set_entries(vec![
                 entry("a", EntryKind::File),
                 entry("bb", EntryKind::File),
@@ -702,7 +722,7 @@ mod tests {
     #[test]
     fn a_batch_appends_without_replacing() {
         tk::ui(|| {
-            let view = View::new(SortKey::default());
+            let view = View::new(SortKey::default(), Pipeline::new());
             view.push_batch(&[entry("one", EntryKind::File)]);
             view.push_batch(&[entry("two", EntryKind::File)]);
             assert_eq!(view.len(), 2);
@@ -712,7 +732,7 @@ mod tests {
     #[test]
     fn selection_is_reported_as_entries() {
         tk::ui(|| {
-            let view = View::new(SortKey::default());
+            let view = View::new(SortKey::default(), Pipeline::new());
             view.set_entries(vec![
                 entry("a", EntryKind::File),
                 entry("b", EntryKind::File),
@@ -726,7 +746,7 @@ mod tests {
     #[test]
     fn replacing_a_listing_clears_the_selection() {
         tk::ui(|| {
-            let view = View::new(SortKey::default());
+            let view = View::new(SortKey::default(), Pipeline::new());
             view.set_entries(vec![entry("a", EntryKind::File)]);
             view.select_first();
             assert_eq!(view.selected_count(), 1);
@@ -738,7 +758,7 @@ mod tests {
     #[test]
     fn the_status_label_counts_and_reports_selection() {
         tk::ui(|| {
-            let view = View::new(SortKey::default());
+            let view = View::new(SortKey::default(), Pipeline::new());
             let label = view.status_label();
             view.set_entries(vec![
                 entry("a", EntryKind::File),
@@ -755,7 +775,7 @@ mod tests {
     #[test]
     fn one_item_is_one_item_not_one_items() {
         tk::ui(|| {
-            let view = View::new(SortKey::default());
+            let view = View::new(SortKey::default(), Pipeline::new());
             let label = view.status_label();
             view.set_entries(vec![entry("a", EntryKind::File)]);
             assert_eq!(label.text(), "1 item");
@@ -787,7 +807,7 @@ mod tests {
     #[test]
     fn switching_modes_shows_the_matching_child_and_icon_size() {
         tk::ui(|| {
-            let view = View::new(SortKey::default());
+            let view = View::new(SortKey::default(), Pipeline::new());
             view.set_mode(ViewMode::List);
             assert_eq!(view.mode(), ViewMode::List);
             assert_eq!(view.icon_size.get(), LIST_ICON);

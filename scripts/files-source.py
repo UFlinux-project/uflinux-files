@@ -25,7 +25,11 @@ ROOT = Path(__file__).resolve().parents[1]
 NAME = "uflinux-files"
 # `target` is the build output; `aports` and `scripts` are the packaging that
 # consumes the bundle, so including them would make the tarball depend on itself.
-SKIP = {"target", "out", ".git", "__pycache__", ".cache", "aports", "scripts"}
+# `tmp` is the scratch directory the probes and harnesses write into: it is
+# gitignored, and a digest that moved because a developer ran a probe would make
+# `--check` fail on a clean checkout of an unchanged tree. No tracked path has a
+# `tmp` component.
+SKIP = {"target", "out", ".git", "__pycache__", ".cache", "aports", "scripts", "tmp"}
 INCLUDE = ["Cargo.toml", "Cargo.lock", "rust-toolchain.toml", "LICENSE", "README.md",
            "crates", "data", "docs", "po", "tests"]
 

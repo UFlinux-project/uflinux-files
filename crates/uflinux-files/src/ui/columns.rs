@@ -40,6 +40,7 @@ use ufm_vfs::{Readers, read_all};
 
 use super::job::{Event, Handle};
 use super::row::Row;
+use super::thumb::Pipeline;
 use super::view::{GRID_ICON, grid_factory};
 
 /// How many panes may be on screen. Deep paths lose their topmost components
@@ -94,6 +95,13 @@ struct Inner {
     readers: Arc<Readers>,
     key: RefCell<SortKey>,
     show_hidden: Cell<bool>,
+    /// Every pane draws its icons at the same size, so the cell the factories
+    /// read is shared rather than built per pane: a size that only one column
+    /// knew about could not be changed by anything that changes the others.
+    icon_size: Rc<Cell<i32>>,
+    /// Previews for the rows of every pane. Shared with the view, which is the
+    /// same rows in a different presentation.
+    thumbs: Pipeline,
     /// Filled in once the window's listing queue exists.
     handle: RefCell<Option<Handle>>,
     /// Which pane the keyboard is in, so a new column can be scrolled into view
@@ -111,7 +119,7 @@ pub struct Columns {
 
 impl Columns {
     #[must_use]
-    pub fn new(readers: Arc<Readers>, key: SortKey, show_hidden: bool) -> Self {
+    pub fn new(readers: Arc<Readers>, key: SortKey, show_hidden: bool, thumbs: Pipeline) -> Self {
         let scroll = gtk::ScrolledWindow::new();
         scroll.set_hscrollbar_policy(gtk::PolicyType::Automatic);
         scroll.set_vscrollbar_policy(gtk::PolicyType::Never);
@@ -128,6 +136,8 @@ impl Columns {
             readers,
             key: RefCell::new(key),
             show_hidden: Cell::new(show_hidden),
+            icon_size: Rc::new(Cell::new(GRID_ICON)),
+            thumbs,
             handle: RefCell::new(None),
             active: Cell::new(0),
             on_open: RefCell::new(None),
@@ -269,6 +279,17 @@ impl Columns {
         self.inner.panes.borrow_mut().clear();
     }
 
+    /// Ask every pane to bind the rows it already holds again, without reading a
+    /// folder a second time. The columns mode keeps its own listings, so a change
+    /// to something a factory reads has to reach them here rather than through
+    /// the view.
+    pub fn rebind(&self) {
+        for pane in self.inner.panes.borrow().iter() {
+            let rows: Vec<Row> = pane.store.iter::<Row>().filter_map(Result::ok).collect();
+            pane.store.splice(0, pane.store.n_items(), &rows);
+        }
+    }
+
     /// Put one delivered listing in the pane that asked for it. Events for
     /// folders that are not on screen are ignored rather than queued: a pane
     /// the user has scrolled past will ask again if it becomes relevant.
@@ -280,7 +301,13 @@ impl Columns {
             // the current location — so the columns repaint when it navigates. A
             // file operation is the same: the window knows which pane it touched
             // and either patches it or re-reads it.
-            Event::Batch { .. } | Event::Mounted { .. } | Event::Operation { .. } => {}
+            // A picture is the same kind of no-op: a pane asks for one through
+            // the shared pipeline, which the window answers, and the panes have
+            // nothing to match a token against.
+            Event::Batch { .. }
+            | Event::Mounted { .. }
+            | Event::Operation { .. }
+            | Event::Thumb { .. } => {}
             Event::Finished {
                 location, entries, ..
             } => {
@@ -434,7 +461,10 @@ fn build(inner: &Rc<Inner>, location: &Location, read: bool) -> Rc<Pane> {
     selection.set_autoselect(true);
     let list = gtk::ListView::new(
         Some(selection.clone()),
-        Some(grid_factory(Rc::new(Cell::new(GRID_ICON)))),
+        Some(grid_factory(
+            Rc::clone(&inner.icon_size),
+            inner.thumbs.clone(),
+        )),
     );
     list.set_show_separators(false);
     list.set_single_click_activate(false);
@@ -686,7 +716,12 @@ mod tests {
     }
 
     fn columns() -> Columns {
-        Columns::new(Arc::new(Readers::local_only()), SortKey::default(), false)
+        Columns::new(
+            Arc::new(Readers::local_only()),
+            SortKey::default(),
+            false,
+            Pipeline::new(),
+        )
     }
 
     fn done(path: &str, entries: Vec<Entry>) -> Event {

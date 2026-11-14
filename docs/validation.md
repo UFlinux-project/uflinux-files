@@ -159,7 +159,9 @@ there; `Describe` reports `extract` disabled on an ordinary folder, a
 second window opened on a real `.tar` reports it enabled, activating it leaves a folder
 beside the container holding the members, and the window that asked for it says so in
 its banner; a file created and then deleted by the shell appears and disappears in the
-listing on its own; the search action opens a field and the field takes typed text; a
+listing on its own; a picture placed in the folder is decoded and lands in the
+thumbnail cache, and the `thumbnails` switch reports its state through `Describe`;
+the search action opens a field and the field takes typed text; a
 second invocation opens a `Computer` window in the running instance; `--new-window` opens
 a window rather than focusing an open one; and the indexer answers `Status` on the bus.
 The prompt is driven through the accessibility tree, by the `press` command of the probe,
@@ -203,6 +205,22 @@ looking would make the check pass with watching removed entirely, and would be t
 reload button instead. Both directions are checked: a directory that gained an entry and
 one that lost it, since the watcher reports those through different events and only the
 second can arrive after the kernel has already dropped the watch.
+
+The picture-preview checks cannot assert on the accessibility tree at all. A row that
+received a preview and a row that kept its themed icon are the same node with the same
+name, because an image carries no label, so the assertion moves to the one place a
+preview has to leave a trace: the freedesktop cache directory under the throwaway
+`$HOME`. The switch is checked through `Describe`, whose state is the preference — a
+menu checkmark that disagreed with what the window does would be worse than no switch
+at all. Whether a decode is possible at all depends on the machine and not on this
+program: `GdkPixbuf` hands every format but `XPM` to a loader that runs out of process
+inside a sandbox, and a container that cannot create a pty cannot start one. So the
+section begins with `tests/files-ui-pixbuf.py`, which writes a real `PNG`, tries to
+read it back, and answers `ok` or `no`; on `no` the section prints a `skip` line rather
+than a failure it did not cause. On a host that can decode, the same checks run for
+real, and the one that matters is the cache file: it says the worker ran, the decode
+succeeded, the encoder accepted the result and the write landed, which no view of the
+tree could show.
 
 The extraction checks are the first to act on a window other than the one the script
 started. `GTK` exports every window an application owns, so the archive window is

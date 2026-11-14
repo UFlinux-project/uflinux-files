@@ -155,7 +155,7 @@ struct State {
     /// of a freshly built model.
     thumbnails: bool,
     /// Whether this build can encode a PNG at all. Cached because
-    /// [`gdk_pixbuf::Pixbuf::formats`] allocates and `Status` is asked often.
+    /// [`ufm_thumb::available`] walks the loader table and `Status` is asked often.
     loader: bool,
     thumbnail_size: u32,
     /// The desktop directory could not be read. Reported in `Status.note`, because an

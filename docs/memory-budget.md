@@ -16,7 +16,7 @@ below is a consequence of a decision already made elsewhere, not a wish:
 | Process | Budget | Why it is that size |
 | --- | --- | --- |
 | `uflinux-files`, one window, 2k-entry folder | **≤90 MiB PSS** | GTK4 + a widget per *visible* row. `GtkGridView`/`GtkColumnView` build widgets lazily, so the cost is the viewport, not the directory. |
-| same, column view + thumbnails, peak | ≤120 MiB | up to 6 columns of widgets plus a 256-entry thumbnail LRU at 128 px. |
+| same, column view + thumbnails, peak | ≤120 MiB | up to 6 columns of widgets plus at most 64 previews in flight, each one encoded `PNG` of the cell's own size. |
 | `uflinux-files-provider` | **≤10 MiB PSS** | GLib and GIO only, in a binary of its own. No window, no widget tree, no CSS provider, no GTK. This is the process that makes desktop icons cost something, so it is the one worth keeping small — and the reason it is a separate program rather than a mode of the file manager. See [Why the provider is its own binary](#why-the-provider-is-its-own-binary). |
 | `uflinux-searchd`, idle | **≤24 MiB PSS** | an index and a searcher, and no writer: the writer holds the directory's write lock, so it exists only during a run. |
 | `uflinux-searchd`, indexing | ≤64 MiB | 15 MB of that is tantivy's own writer floor, allocated eagerly; one worker, one merge thread. |
@@ -24,8 +24,8 @@ below is a consequence of a decision already made elsewhere, not a wish:
 
 Measured on the reference machine, release build, three sessions, full fixtures, cairo
 renderer (see [The renderer is most of a window](#the-renderer-is-most-of-a-window)):
-provider 2.1, cold window 28.0, warm window 28.0, 5k columns 32.5, `uflinux-searchd`
-idle 4.1 and 4.2 answering a query, desktop model 2.1 MiB. Every row is inside its
+provider 3.4, cold window 52.8, warm window 55.9, 5k columns 57.6, `uflinux-searchd`
+idle 5.0 and 5.0 answering a query, desktop model 3.3 MiB. Every row is inside its
 budget with room for the thumbnail cache and the widgets a real desktop has that the
 bench does not build. The window rows are the ones to read against the directory
 cache: the bench walks a five-thousand-entry folder and then revisits folders on the
@@ -36,17 +36,26 @@ with how the container was started rather than with anything in this crate.
 
 That last sentence now applies to the window rows too, and the honest way to read this
 table is as a distance from a budget rather than as a measurement. The same build with
-the same fixtures measured cold 50.6 and 5k columns 54.8 in an earlier run and 28.0 and
-32.5 in this one, on the same machine, the same renderer and the same budget — a swing
-of 22 MiB that no change to this crate explains. What a window costs is dominated by
-mapped shared libraries, and shared pages are divided by PSS among every process
+the same fixtures measured cold 28.0 and 5k columns 32.5 in one run and 52.8 and 57.6
+in the run quoted above, on the same machine, the same renderer and the same budget — a
+swing of 25 MiB that no change to this crate explains. What a window costs is dominated
+by mapped shared libraries, and shared pages are divided by PSS among every process
 standing next to it, so a bench that starts a compositor, a bus, an AT-SPI registry and
 a second copy of itself gets a different answer each time. The two things worth reading
 from these numbers are therefore the gap to the budget, which is wide enough that no
 plausible measurement noise closes it, and the difference between scenarios within one
-session — 5k columns costs about 4 MiB more than a warm window here, and that figure is
+session — 5k columns costs about 2 MiB more than a warm window here, and that figure is
 ours rather than the loader's. A regression is caught by the gate's ceiling, not by
 comparing one session's total against another day's.
+
+One row is worth naming as unmeasured rather than merely low. The bench fixture is a
+folder of `.txt` files, so no preview is ever requested and the window figures above
+are the figures of a folder with no pictures in it. The 120 MiB ceiling is the column
+view with previews on, and what holds it down is not a number anyone has to measure but
+a bound the code enforces: previews cost the viewport, one worker, at most 64 requests
+in flight, each one encoded at the cell's own size. A folder of ten thousand photos
+therefore costs no more to scroll than a folder of ten thousand text files, which is
+the property the design was arranged for.
 
 Latency, same machine:
 
@@ -69,10 +78,16 @@ transport.
 **No libadwaita.** Application CSS using `@theme_*` tokens only, so the theme still
 follows `adw-gtk-theme` without linking a second toolkit's widgets.
 
-**Thumbnails decoded at display size.** `gdk_pixbuf_new_from_stream_at_scale` rather
+**Thumbnails decoded at display size.** `gdk_pixbuf_new_from_file_at_scale` rather
 than decode-then-scale: a 12 MP phone photo decoded whole is 48 MB of pixel buffer for
 a 128 px square. The disk cache follows the freedesktop thumbnail spec, so thumbnails
-written by other software are reused and vice versa.
+written by other software are reused and vice versa, and both binaries share one
+implementation of the key and the freshness rule so a picture is decoded once per
+machine rather than once per program. In flight there are at most 64 requests, one
+worker, and a policy of dropping the oldest when a fast scroll outruns the decoder, so
+the cost of previews is the viewport's and not the folder's. Video previews are left
+to the freedesktop thumbnailer spec for the reason given in
+[What is deliberately not budgeted](#what-is-deliberately-not-budgeted).
 
 **The index is mmap'd with `Advice::Random`.** The pages of an index that is read once
 per query are the pages the kernel should reclaim first. `MmapDirectory` also reports

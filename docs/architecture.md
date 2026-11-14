@@ -23,10 +23,12 @@ stays cheap because the shell draws icons while this program only supplies data.
       ufm-search/        pure Rust
       ufm-desktop-ipc/   pure Rust
       uflinux-files-mount/  pure Rust, runs as root
+      ufm-thumb/         GLib + GIO + GdkPixbuf, no GTK
       uflinux-files/     GTK4 + GIO
+      uflinux-files-provider/  GLib + GIO
       uflinux-searchd/   GLib + GIO
 
-Everything above `uflinux-files` has no `GLib` anywhere in its dependency graph.
+Everything above `ufm-thumb` has no `GLib` anywhere in its dependency graph.
 That is not purity for its own sake: it means `cargo test` runs on any machine
 with a C toolchain, so the mount planner, the archive readers, the query builder
 and the two D-Bus wire formats are covered by ordinary unit tests on a build host
@@ -46,6 +48,14 @@ program's whole library closure at `exec`, so sharing an executable with the UI 
 have charged the provider for Mesa and `LLVM` — measured at 28.6 MiB against a 10 MiB
 budget, of which all but 7 MiB was shared library text. See
 [memory-budget.md](memory-budget.md).
+
+`ufm-thumb` is where the thumbnail rules live for the same reason. The provider and
+the file manager both draw pictures, and a cache the two disagree about is a cache
+that is read twice and decoded twice, so the cache key, the freshness rule and the
+decode are one crate that both binaries call. It stops at `GdkPixbuf` and does not
+reach GTK, which is what lets the provider keep its budget; the UI asks for encoded
+`PNG` bytes rather than a paintable, because a `Pixbuf` is neither `Send` nor `Sync`
+and the work belongs on a worker. See [Picture previews](#picture-previews).
 
 ## The location model
 
@@ -263,6 +273,45 @@ the reason: the command reports once, when it is over.
 configuration, the text extractors and the `Exec` expander — everything the
 client and the daemon must agree on, so the two cannot drift. The file manager is
 a client; it never opens the index. See `docs/search-indexer.md`.
+
+## Picture previews
+
+A folder of photographs and a folder of source files cost the same to list, so
+previews are a feature that has to earn its place on a small machine. `ufm-thumb`
+holds the rules — the freedesktop cache key, the freshness test, the size clamps and
+the decode — and both binaries call it, so a thumbnail the desktop drew is read by
+the file manager instead of decoded again.
+
+The UI half is `ui/thumb.rs`: one worker, started on the first request rather than at
+startup, and a queue capped at 64 requests, where a full queue drops the oldest. The
+cap is the whole design in one number. A fast scroll through a folder of a thousand
+pictures would otherwise queue a thousand decodes for cells that were on screen for
+two frames, and the memory cost of a preview is not the encoded bytes but the decoded
+pixbuf behind them.
+
+Three rules keep it honest:
+
+- **Only bytes cross the thread.** A `Pixbuf` is neither `Send` nor `Sync`, and
+  neither is a `gtk::Image`, so a worker reads, decodes and re-encodes and hands back
+  a `Vec<u8>`. The main thread decodes that — cheap, because the bytes are already
+  the size of the cell — and paints it. Previews travel on the same wake-up pipe as
+  listings; a second file descriptor waking the main loop for the same job would cost
+  a syscall per picture to achieve nothing.
+- **The widget carries its own token.** A recycled row is a recycled widget, and the
+  answer to a question about a picture that scrolled away has to be recognisable as
+  such. Each request stamps a generation number onto the widget with `set_data`; an
+  answer whose token no longer matches is dropped. Overwriting the key drops the old
+  value, so a widget that is bound a hundred times leaks nothing.
+- **Refuse early.** A folder, a broken link, a member of an archive, a file over
+  16 MiB, or anything whose MIME type does not start with `image/` never reaches the
+  worker. The archive case is the one that bites: `Location::as_path()` answers with
+  the container, so gating on it would preview `holiday.zip` by its own picture and
+  call that a preview of the folder. The gate is `Location::is_real()`.
+
+Previews are a preference (`thumbnails`, on by default) and a menu switch whose state
+is that preference. Turning it off re-binds the rows rather than re-reading the
+folder — the files on screen are the same files either way — which is the same
+distinction the icon-size control makes.
 
 ## Desktop icons
 
