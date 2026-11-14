@@ -152,16 +152,55 @@ impl Format {
         let name = path
             .file_name()
             .map_or_else(|| "file".to_string(), |n| n.to_string_lossy().into_owned());
-        for &(suffix, _) in SUFFIXES {
-            if name.len() > suffix.len() && name.ends_with(suffix) {
-                return name[..name.len() - suffix.len()].to_string();
-            }
-        }
-        name
+        strip_container_suffix(&name).unwrap_or(&name).to_string()
+    }
+
+    /// The name to give the folder a container is unpacked into: `photos.tar.gz`
+    /// gives `photos`, `app.apk` gives `app`, and a name no container suffix
+    /// explains is left as it is.
+    ///
+    /// The same rule [`Self::bare_member_name`] uses, because the two questions
+    /// are the same question — what would this file be called if it were the
+    /// thing inside rather than the wrapper — and a folder called `archive.tar`
+    /// next to `archive.tar` is what a second rule produces.
+    #[must_use]
+    pub fn base_name(path: &Path) -> String {
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            return "archive".to_string();
+        };
+        strip_container_suffix(name).unwrap_or(name).to_string()
     }
 }
 
+/// Drop the container suffix that explains the end of `name`, when there is one.
+///
+/// Every known suffix is tried, not only the one the format turned out to be: a
+/// caller with a path and no [`Format`] in hand cannot know which applies, and a
+/// file named `notes.zip.gz` is a gzipped zip whose folder should be `notes.zip`
+/// rather than `notes.zip.`. The order matters twice over: [`SUFFIXES`] is
+/// longest-first so `.tar.gz` wins over `.gz`, and the two suffixes
+/// [`Format::from_name`] checks ahead of that table — `.7z` and a plain `.tar` —
+/// come last, so that `a.tar.gz` is never read as a tar called `a.gz`.
+///
+/// A name equal to its suffix is left alone: `.zip` and `.7z` are dotfiles, not
+/// containers with nothing in front of them.
+fn strip_container_suffix(name: &str) -> Option<&str> {
+    const PLAIN: [&str; 2] = [".7z", ".tar"];
+    let lower = name.to_ascii_lowercase();
+    let suffix = SUFFIXES
+        .iter()
+        .map(|&(suffix, _)| suffix)
+        .chain(ZIP_NAMES.iter().copied())
+        .chain(PLAIN)
+        .find(|suffix| name.len() > suffix.len() && lower.ends_with(suffix))?;
+    Some(&name[..name.len() - suffix.len()])
+}
+
 /// `.tgz` is a tar and `.gz` is not, so the suffix itself carries the answer.
+///
+/// Longest first, which is what lets [`strip_container_suffix`] stop at the
+/// first match: `.tar.gz` has to be tried before `.gz`, or a tarball becomes a
+/// compressed file called `a.tar`.
 const SUFFIXES: &[(&str, Codec)] = &[
     (".tar.gz", Codec::Gzip),
     (".tar.bz2", Codec::Bzip2),
@@ -256,6 +295,38 @@ mod tests {
             Format::detect(&p("/t/mystery"), &block),
             Some(Format::Tar(Codec::None))
         );
+    }
+
+    #[test]
+    fn a_compound_suffix_is_removed_whole() {
+        // The order the suffixes are tried in is what makes these agree with
+        // `from_name`: `a.tar.gz` is a gzipped tar, so the folder is `a`. Reading
+        // the plain `.gz` rule first would give `a.tar`, and a folder called
+        // `a.tar` beside `a.tar.gz` is what a second rule produces.
+        assert_eq!(Format::base_name(&p("/t/a.tar.gz")), "a");
+        assert_eq!(Format::base_name(&p("/t/a.tar.xz")), "a");
+        assert_eq!(Format::base_name(&p("/t/a.tar")), "a");
+        assert_eq!(Format::base_name(&p("/t/a.tgz")), "a");
+        assert_eq!(Format::base_name(&p("/t/photos.TGZ")), "photos");
+        assert_eq!(Format::base_name(&p("/t/notes.txt.gz")), "notes.txt");
+    }
+
+    #[test]
+    fn a_name_with_no_container_suffix_is_kept() {
+        // A name that is nothing but a suffix is a dotfile, and a name with no
+        // suffix at all is already the folder name a user would expect.
+        assert_eq!(Format::base_name(&p("/t/.zip")), ".zip");
+        assert_eq!(Format::base_name(&p("/t/README")), "README");
+        assert_eq!(Format::base_name(&p("/t/archive.7z")), "archive");
+        assert_eq!(Format::base_name(&p("/t/app.apk")), "app");
+    }
+
+    #[test]
+    fn a_path_with_no_name_still_gets_a_folder_name() {
+        // The caller has somewhere to put the result either way, and a folder
+        // called `archive` beats refusing to name one.
+        assert_eq!(Format::base_name(&p("/")), "archive");
+        assert_eq!(Format::base_name(&p("a/b/..")), "archive");
     }
 
     #[test]

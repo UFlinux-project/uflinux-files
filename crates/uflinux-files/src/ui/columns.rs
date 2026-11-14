@@ -58,6 +58,12 @@ type OpenHandler = Rc<dyn Fn(&Entry)>;
 /// folder, which is the window's business because the window owns the history.
 type UpHandler = Rc<dyn Fn()>;
 
+/// A callback into the window: the row the keyboard is on has changed, so a
+/// command whose availability depends on what that row *is* has to be asked
+/// again. The reason a window needs to hear about this at all is
+/// [`super::view::View::on_selection`].
+type SelectionHandler = Rc<dyn Fn()>;
+
 /// One column: a folder, the rows inside it, and the read that was asked for.
 ///
 /// Always held behind an `Rc`. The widgets are shared anyway, and the two
@@ -94,6 +100,7 @@ struct Inner {
     active: Cell<usize>,
     on_open: RefCell<Option<OpenHandler>>,
     on_up: RefCell<Option<UpHandler>>,
+    on_selection: RefCell<Option<SelectionHandler>>,
 }
 
 /// The columns view. Cheap to hand out; the state is shared with the handlers.
@@ -124,6 +131,7 @@ impl Columns {
             active: Cell::new(0),
             on_open: RefCell::new(None),
             on_up: RefCell::new(None),
+            on_selection: RefCell::new(None),
         });
         install_keys(&Rc::clone(&inner));
         Self { inner }
@@ -152,6 +160,12 @@ impl Columns {
         *self.inner.on_up.borrow_mut() = Some(Rc::new(f));
     }
 
+    /// React to the row under the column keyboard changing, or to the panes
+    /// themselves being rebuilt.
+    pub fn on_selection<F: Fn() + 'static>(&self, f: F) {
+        *self.inner.on_selection.borrow_mut() = Some(Rc::new(f));
+    }
+
     /// Show the chain that ends at `target`, reading every folder that is not
     /// already on screen. The listing for `target` itself is expected from the
     /// window, which is reading it for the other modes anyway.
@@ -172,6 +186,10 @@ impl Columns {
         self.inner.active.set(next.len().saturating_sub(1));
         self.inner.panes.replace(next);
         self.reveal_active();
+        // A new chain means a new row under the keyboard even when its position
+        // number did not change, so the window has to be told rather than left
+        // to a signal that may not come.
+        fire_selection(&self.inner);
     }
 
     /// Re-read every pane but the deepest, including the ones already on
@@ -197,6 +215,9 @@ impl Columns {
             sort_entries(&mut entries, key);
             paint(pane, &entries);
         }
+        // The selected position survives a re-sort, so the row under the keyboard
+        // is usually a different file afterwards.
+        fire_selection(&self.inner);
     }
 
     /// Show or hide dotfiles. Every cached listing was read under the old rule,
@@ -248,6 +269,7 @@ impl Columns {
                 // one per row on a folder the user opens twice.
                 pane.entries.borrow_mut().clone_from(entries);
                 paint(&pane, entries);
+                fire_selection(&self.inner);
                 // Back to the top of a column that was replaced. Guarded,
                 // because `scroll_to` asserts on a position in an empty model
                 // and an empty folder is a folder that exists.
@@ -261,6 +283,7 @@ impl Columns {
                     pane.entries.borrow_mut().clear();
                     paint(&pane, &[]);
                     pane.scroll.set_tooltip_text(Some(message));
+                    fire_selection(&self.inner);
                 }
             }
         }
@@ -271,6 +294,7 @@ impl Columns {
     pub fn set_filter(&self, location: &Location, entries: &[Entry]) {
         if let Some(pane) = self.pane_for(location) {
             paint(&pane, entries);
+            fire_selection(&self.inner);
         }
     }
 
@@ -488,6 +512,16 @@ fn fire_up(inner: &Rc<Inner>) {
     }
 }
 
+/// Run the selection handler. Cloned out first, like the other two: a handler
+/// that greys a button out runs in the middle of a repaint, and one that
+/// replaced the listing would do it through a borrowed handler list.
+fn fire_selection(inner: &Rc<Inner>) {
+    let handler = inner.on_selection.borrow().clone();
+    if let Some(handler) = handler {
+        handler();
+    }
+}
+
 /// Focusing a pane makes it the keyboard's, so a column appearing on the right
 /// does not steal the arrow keys from a pane the user is reading.
 fn wire(pane: &Pane, inner: &Rc<Inner>) {
@@ -509,8 +543,18 @@ fn wire(pane: &Pane, inner: &Rc<Inner>) {
                 .position(|pane| pane.location == location)
                 .unwrap_or(0),
         );
+        // Moving the keyboard into a different pane changes the row a command
+        // would act on without changing any selection.
+        fire_selection(&tracked);
     });
     pane.list.add_controller(focus);
+
+    // The row the keyboard is on, including the first one a freshly painted pane
+    // autoselects. `notify::selected` rather than a selection-model signal:
+    // `GtkSingleSelection` has no `selection-changed`.
+    let tracked = Rc::clone(inner);
+    pane.selection
+        .connect_selected_notify(move |_selection| fire_selection(&tracked));
 }
 
 /// The keyboard. Captured before the focused list sees it, because the arrows

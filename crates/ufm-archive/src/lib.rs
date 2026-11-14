@@ -32,6 +32,7 @@
 
 mod bare;
 mod command;
+mod extract;
 mod format;
 mod reader;
 mod sevenz;
@@ -40,6 +41,8 @@ mod toc;
 mod util;
 mod zip;
 
+pub use extract::Report;
+pub use extract::extract;
 pub use format::{Codec, Format};
 pub use reader::{ArchiveReader, Opened};
 pub use toc::{Cache, DIR_MODE, FILE_MODE, Key, NO_HANDLE, Node, NodeKind, Toc, TocBuilder};

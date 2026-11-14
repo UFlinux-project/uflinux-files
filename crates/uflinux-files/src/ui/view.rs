@@ -103,6 +103,7 @@ impl Status {
 
 type Activators = Rc<RefCell<Vec<Rc<dyn Fn(&Row)>>>>;
 type Headers = Rc<RefCell<Vec<(Column, gtk::Button)>>>;
+type Selections = Rc<RefCell<Vec<Rc<dyn Fn()>>>>;
 
 /// The widget that shows one folder, in whichever mode is active.
 pub struct View {
@@ -117,6 +118,7 @@ pub struct View {
     activators: Activators,
     status: Rc<Status>,
     headers: Headers,
+    selections: Selections,
 }
 
 impl View {
@@ -172,6 +174,7 @@ impl View {
             activators: Rc::new(RefCell::new(Vec::new())),
             status: Rc::new(Status::new()),
             headers: Rc::new(RefCell::new(Vec::new())),
+            selections: Rc::new(RefCell::new(Vec::new())),
         };
         view.wire_activate();
         view.wire_selection();
@@ -189,6 +192,14 @@ impl View {
         self.activators.borrow_mut().push(Rc::new(f));
     }
 
+    /// React to the selection changing, or to the rows it points into being
+    /// replaced. The window uses this for the one command whose availability
+    /// depends on what the selected row *is* rather than merely on there being
+    /// one, which no amount of clipboard bookkeeping can predict.
+    pub fn on_selection<F: Fn() + 'static>(&self, f: F) {
+        self.selections.borrow_mut().push(Rc::new(f));
+    }
+
     /// Replace the whole listing. Called once per navigation, and again when a
     /// watch event says the folder changed. The entries arrive sorted; sorting
     /// here as well would be a second pass over a list that can be large.
@@ -198,6 +209,10 @@ impl View {
         self.status.selected.set(0);
         self.store.splice(0, self.store.n_items(), &rows);
         self.status.report();
+        // Replacing the rows can change what the selection means without any
+        // signal saying so: a splice that leaves a selected position in place
+        // points it at a different row, or at no row at all.
+        fire_selection(&self.selections);
     }
 
     /// Append one batch of a streaming read, so a large folder paints its first
@@ -427,6 +442,7 @@ impl View {
         // The store, not the selection model: `GtkSelectionModel` has no
         // `n-items`, and the count it would report is the store's anyway.
         let store = self.store.clone();
+        let selections = Rc::clone(&self.selections);
         self.selection
             .connect_selection_changed(move |_selection, _position, _n| {
                 status.selected.set(
@@ -435,6 +451,7 @@ impl View {
                         .count(),
                 );
                 status.report();
+                fire_selection(&selections);
             });
     }
 }
@@ -446,6 +463,17 @@ fn fire(handlers: &Activators, row: &Row) {
     let cloned: Vec<_> = handlers.borrow().iter().map(Rc::clone).collect();
     for handler in cloned {
         handler(row);
+    }
+}
+
+/// Run the selection handlers. Same clone-before-calling rule as [`fire`]: a
+/// handler that changes a button's sensitivity runs while the model is still
+/// being repainted, and one that replaced the listing would replace it through a
+/// borrowed handler list.
+fn fire_selection(handlers: &Selections) {
+    let cloned: Vec<_> = handlers.borrow().iter().map(Rc::clone).collect();
+    for handler in cloned {
+        handler();
     }
 }
 

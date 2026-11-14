@@ -36,6 +36,7 @@ use ufm_vfs::{Cancel, FsHints, Readers};
 
 use super::columns::Columns;
 use super::connect;
+use super::extract;
 use super::job::{Event, Handle, Queue};
 use super::ops;
 use super::panel::{Panel, Place, Usage};
@@ -878,6 +879,7 @@ fn sync_buttons(ctx: &Ctx) {
     // this runs on every navigation.
     drop(window);
     sync_paste(ctx);
+    sync_extract(ctx);
 }
 
 fn enable(window: &gtk::ApplicationWindow, name: &str, on: bool) {
@@ -995,6 +997,10 @@ fn menu() -> gio::Menu {
     files.append(Some("Copy"), Some("win.copy"));
     files.append(Some("Cut"), Some("win.cut"));
     files.append(Some("Paste"), Some("win.paste"));
+    // Its own row rather than a submenu: extracting is the reason most people
+    // open an archive at all, and the label says what happens — a folder named
+    // after the container, appearing beside it, with no dialog in between.
+    files.append(Some("Extract to Folder"), Some("win.extract"));
     let network = gio::Menu::new();
     network.append(Some("Connect to Server…"), Some("win.connect"));
     let window = gio::Menu::new();
@@ -1052,6 +1058,17 @@ fn wire_handlers(panel: &Rc<Panel>, view: &Rc<View>, columns: &Rc<Columns>, ctx:
     columns.on_up({
         let ctx = ctx.clone();
         move || go_up(&ctx)
+    });
+    // Extract is the one command that has to hear about the selection: whether it
+    // applies depends on what the row under the keyboard *is*, and moving that row
+    // fires no navigation and changes no clipboard.
+    view.on_selection({
+        let ctx = ctx.clone();
+        move || sync_extract(&ctx)
+    });
+    columns.on_selection({
+        let ctx = ctx.clone();
+        move || sync_extract(&ctx)
     });
 }
 
@@ -1325,6 +1342,20 @@ fn op_actions(ctx: &Ctx) -> Vec<Rc<gio::SimpleAction>> {
         }
     });
 
+    let unpack = gio::SimpleAction::new("extract", None);
+    unpack.connect_activate({
+        let ctx = ctx.clone();
+        move |_action, _parameter| {
+            let Some(handle) = ctx.handle.borrow().clone() else {
+                return;
+            };
+            let Some(container) = extract_target(&ctx) else {
+                return;
+            };
+            extract::extract(&handle, container);
+        }
+    });
+
     vec![
         Rc::new(new_folder),
         Rc::new(rename),
@@ -1333,7 +1364,38 @@ fn op_actions(ctx: &Ctx) -> Vec<Rc<gio::SimpleAction>> {
         pickup_action("copy", ops::Transfer::Copy, ctx),
         pickup_action("cut", ops::Transfer::Move, ctx),
         Rc::new(paste),
+        Rc::new(unpack),
     ]
+}
+
+/// Which container the extract command would unpack, mirroring the sensitivity
+/// rule in [`sync_extract`] so the two can never disagree about what is on screen.
+///
+/// One selected row wins when it names a container. Otherwise the folder in the
+/// title bar is the candidate, which is what makes the command work from inside
+/// an archive: the user is standing in the thing they want unpacked.
+fn extract_target(ctx: &Ctx) -> Option<Location> {
+    let picked = targets(ctx);
+    if let [entry] = picked.as_slice() {
+        // A directory called `bundle.tar` has the right name and is still not
+        // something to unpack; the reader would fail on it either way.
+        if !entry.kind.is_dir() && extract::container_of(&entry.location).is_some() {
+            return Some(entry.location.clone());
+        }
+    }
+    let current = ctx.shared.state.borrow().current.clone()?;
+    extract::container_of(&current).is_some().then_some(current)
+}
+
+/// Enable or disable extract to match the row under the keyboard. The only file
+/// command whose answer depends on *what* is selected rather than on there being
+/// a selection, which is why it is synced from the selection handlers as well as
+/// from navigation.
+fn sync_extract(ctx: &Ctx) {
+    let Some(window) = ctx.window.upgrade() else {
+        return;
+    };
+    enable(&window, "extract", extract_target(ctx).is_some());
 }
 
 /// `trash` and `delete` differ by one flag, so they are built by one function.
@@ -1428,6 +1490,10 @@ fn install_accels(app: &gtk::Application) {
     app.set_accels_for_action("win.copy", &["<Ctrl>C"]);
     app.set_accels_for_action("win.cut", &["<Ctrl>X"]);
     app.set_accels_for_action("win.paste", &["<Ctrl>V"]);
+    // `<Ctrl>E` is free here: the trash is on `Delete`, where GNOME keeps it in
+    // the keyboard rather than on a chord, so the letter most people expect for
+    // extract is not spoken for.
+    app.set_accels_for_action("win.extract", &["<Ctrl>E"]);
     for mode in [ViewMode::Grid, ViewMode::List, ViewMode::Columns] {
         app.set_accels_for_action(
             &format!("win.mode::{}", mode_name(mode)),

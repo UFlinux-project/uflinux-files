@@ -132,13 +132,6 @@ impl Toc {
         Some(node)
     }
 
-    /// Resolve a path that may name a directory rather than a member, for
-    /// extraction, where an absent directory is not an error.
-    #[must_use]
-    pub fn find_dir(&self, inner: &str) -> Option<usize> {
-        self.find(inner).filter(|&i| self.nodes[i].kind.is_dir())
-    }
-
     fn child_by_name(&self, parent: usize, name: &str) -> Option<usize> {
         let range = self.ranges.get(parent)?.clone();
         let kids = self.kids.get(range)?;

@@ -100,6 +100,35 @@ corrupt container degrades to an error row in the listing rather than an empty
 folder, which is the difference between "this archive is odd" and "this archive
 is empty".
 
+Unpacking a whole container goes through a helper process — `unzip`, `tar`, `7z`
+— rather than through the readers, because a helper applies its own long-tested
+rules about permissions and links and because extracting a 4 GiB container then
+costs about what `unzip` would cost. Member-by-member extraction through this
+crate's own readers is what a single selected folder needs, what a bare `.gz`
+holding one file needs, and what runs when no helper is installed; it is also the
+fallback when a helper fails, so the fast path is an optimisation and never a
+requirement. Both paths stream, and both write each member to a dotted temporary
+name before renaming it, so a container that fails halfway leaves no member that
+looks complete; the destination folder is removed whole when the extract fails, so
+a cancelled one leaves nothing to clean up by hand. What reaches the caller is a
+`Report`: where it landed, how many items, how many bytes, and what was skipped.
+
+The UI half of extraction is a separate module from the file operations, because
+the two answer to different rules. A paste takes names the user chose and goes
+through GIO; an extract takes a name the archive chose and goes through
+`ufm-archive`, and the folder it creates is a sibling of the container rather than
+a child of whatever folder happens to be on screen. The destination is computed
+before the worker starts — the container's base name, with the codec suffix removed
+whole so `photos.tar.gz` becomes `photos` and not `photos.tar`, made unique by the
+same counter a paste uses — and there is no dialog asking for it, which is what lets
+the command be a single keystroke. Extract is offered in two places and both go
+down the same path: on a selected archive row, and while standing inside an
+archive, in which case the location being browsed is turned into the root of its own
+archive so the library sees one shape of input rather than two. A position partway
+inside an archive deliberately has no extract command; unpacking `docs/` and
+unpacking the card that holds it are different questions, and guessing wrong about
+which one was asked is worse than not offering it.
+
 ## Mounts
 
 Nothing here speaks SMB, NFS or FTP. It plans a mount and runs it. See
@@ -139,7 +168,8 @@ What is deliberately not there yet: there is no conflict dialog, so a paste
 either takes a free name or grows a counter and never asks about replacing; there
 is no progress reporting, so a large copy reports once at the end; and there is
 no undo. Those are the next step, and all three want a job record that a single
-operation does not need.
+operation does not need. Extracting an archive shares all three gaps, and shares
+the reason: the command reports once, when it is over.
 
 ## Search
 

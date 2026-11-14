@@ -97,10 +97,8 @@ pub(crate) fn failure(archive: &Path, program: &str, stderr: &[u8], stdout: &[u8
 /// because to the user those are the same event.
 ///
 /// Listing and streaming read stdout, so they use [`output`] or [`spawn`]
-/// instead; this is for the helpers that only have to succeed, which is what
-/// extracting into a directory needs. Until that lands the tests below are its
-/// only caller, hence the allowance.
-#[allow(dead_code)]
+/// instead; this is for the helpers that only have to succeed, which is extracting
+/// a whole container with `unzip`, `tar` or `7z` and creating one in a test.
 pub(crate) fn status_ok(command: &mut Command, archive: &Path, program: &str) -> Result<()> {
     let output = match command.output() {
         Ok(output) => output,

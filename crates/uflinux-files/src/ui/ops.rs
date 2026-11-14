@@ -478,7 +478,7 @@ fn discard_one(file: &gio::File) -> Result<Gone, String> {
 /// The fallback for a thread that could not start is the point of taking the
 /// queue here rather than in the closure: nothing was done, and a window that
 /// heard nothing back would go on showing rows that are still there.
-fn spawn(handle: &Handle, work: impl FnOnce() -> Outcome + Send + 'static) {
+pub(crate) fn spawn(handle: &Handle, work: impl FnOnce() -> Outcome + Send + 'static) {
     let worker = handle.clone();
     let spawned = thread::Builder::new()
         .stack_size(256 * 1024)

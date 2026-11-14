@@ -20,7 +20,8 @@ the model over D-Bus and never opens a window.
 - **Three views** of the same folder: icon grid, list with columns, and macOS
   Miller columns. Per-tab view mode, sort order and column widths are remembered.
 - **Archives as folders**: zip, tar and its codecs, and 7z open like a directory
-  and extract from there. Read-only browsing plus extract; no write-back.
+  and unpack with `<Ctrl>E` into a folder named after them. Read-only browsing
+  plus extract; no write-back.
 - **Network shares as folders**: SMB, NFS, SFTP, WebDAV and FTP are *mounted*
   rather than spoken, under `$XDG_RUNTIME_DIR/ufm`, so every view, thumbnail and
   file operation works on them without remote special-casing.

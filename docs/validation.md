@@ -152,11 +152,22 @@ entries and counts them; the list mode swaps in a tree table with the four headi
 columns mode renders one pane per path level; `Describe` reports `paste` disabled while
 the clipboard is empty; the `new-folder` action opens a prompt, its button creates the
 folder the prompt suggested, the listing picks it up without being told to, and answering
-the prompt closes it; the search action opens a field and the field takes typed text; a
+the prompt closes it; `Describe` reports `extract` disabled on an ordinary folder, a
+second window opened on a real `.tar` reports it enabled, activating it leaves a folder
+beside the container holding the members, and the window that asked for it says so in
+its banner; the search action opens a field and the field takes typed text; a
 second invocation opens a `Computer` window in the running instance; `--new-window` opens
 a window rather than focusing an open one; and the indexer answers `Status` on the bus.
 The prompt is driven through the accessibility tree, by the `press` command of the probe,
 which activates a node by name — the same controller path a mouse click takes.
+
+The extraction checks are the first to act on a window other than the one the script
+started. `GTK` exports every window an application owns, so the archive window is
+`window/2` on the bus and the script's action helpers take an object path rather than
+assuming the first one. The numbering survives the folder prompt that runs before it
+for a reason worth keeping in mind when adding to either: a prompt is a plain window
+that is only made transient for the main one, so it is never exported and never takes
+an index.
 
 The run fails if the app printed a GLib critical. One message is excepted, and it is
 excepted on evidence rather than convenience: `GTK4` 4.22 re-reads a toplevel's

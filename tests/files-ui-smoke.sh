@@ -75,6 +75,14 @@ export HOME XDG_DATA_HOME
 # The path the window opens on. Two entries, so the status line has a number to say.
 TARGET=$ROOT/tree/alpha
 
+# A real container to unpack, in a folder of its own. Its own folder is what keeps
+# the checks above about how many entries the window opens on honest, and a real
+# archive rather than a file named like one is what lets the extract check tell a
+# command that ran from one that was merely sensitive.
+PACK=$ROOT/pack
+mkdir -p "$PACK"
+cp "$HERE/archive-fixtures/nested.tar" "$PACK/bundle.tar"
+
 # labwc on the headless backend, pixman renderer: no GPU, no DRM, no X. The Xwayland
 # complaints it prints are noise and are not treated as failure.
 labwc >"$ROOT/labwc.log" 2>&1 &
@@ -104,6 +112,16 @@ WIN=/org/uflinux/FileManager/window/1
 # `[<'value'>]`.
 act() {
     gdbus call --session --dest org.uflinux.FileManager --object-path "$WIN" \
+        --method org.gtk.Actions.Activate "$@" >/dev/null 2>&1 || :
+}
+
+# The same, on a window other than the first. GTK numbers the windows it exports,
+# so a second window is `window/2`; the archive check runs in one of those because
+# the window opened on the command line is standing on a plain folder.
+act_on() {
+    path=$1
+    shift
+    gdbus call --session --dest org.uflinux.FileManager --object-path "$path" \
         --method org.gtk.Actions.Activate "$@" >/dev/null 2>&1 || :
 }
 
@@ -244,6 +262,12 @@ describe() {
     gdbus call --session --dest org.uflinux.FileManager --object-path "$WIN" \
         --method org.gtk.Actions.Describe "$1" 2>/dev/null || true
 }
+# The same, on another window. Some commands are only available somewhere other
+# than where the first window is standing.
+describe_on() {
+    gdbus call --session --dest org.uflinux.FileManager --object-path "$1" \
+        --method org.gtk.Actions.Describe "$2" 2>/dev/null || true
+}
 if describe paste | grep -qF '(false'; then
     ok "Paste is disabled while the clipboard is empty"
 else
@@ -290,6 +314,55 @@ if printf '%s\n' "$DUMP" | grep -qF "$(printf 'frame\tNew Folder\t')"; then
     fail "answering the prompt closes it"
 else
     ok "answering the prompt closes it"
+fi
+
+# --- extracting an archive -----------------------------------------------------
+# The one write the archive browser offers. Checked against a real container
+# rather than a file named like one, because the assertion that matters is the
+# folder the command leaves on disk: a menu row that merely became sensitive would
+# pass a check that only looks at the accessibility tree. The command runs in a
+# window opened on the archive itself, which is also where a user would ask for
+# it — standing inside the thing to be unpacked.
+if describe extract | grep -qF '(false'; then
+    ok "Extract is disabled on an ordinary folder"
+else
+    fail "Extract is disabled on an ordinary folder ($(describe extract))"
+fi
+"$BIN" "archive://$PACK/bundle.tar!/" >"$ROOT/archive.log" 2>&1 ||
+    fail "opening an archive exits non-zero"
+i=0
+while [ "$i" -lt 50 ] && ! printf '%s\n' "$DUMP" | grep -qF "$(printf 'frame\t%s' "$PACK")"; do
+    refresh
+    i=$((i + 1))
+    sleep 0.2
+done
+if printf '%s\n' "$DUMP" | grep -qF "$(printf 'frame\t%s' "$PACK")"; then
+    ok "an archive opens as a folder of its own"
+else
+    fail "an archive opens as a folder of its own (no frame for $PACK)"
+fi
+ARCH=/org/uflinux/FileManager/window/2
+if describe_on "$ARCH" extract | grep -qF '(true'; then
+    ok "Extract is sensitive while standing inside an archive"
+else
+    fail "Extract is sensitive while standing inside an archive ($(describe_on "$ARCH" extract))"
+fi
+act_on "$ARCH" extract "[]" "[]"
+i=0
+while [ "$i" -lt 100 ] && [ ! -f "$PACK/bundle/docs/readme.md" ]; do
+    i=$((i + 1))
+    sleep 0.2
+done
+if [ -f "$PACK/bundle/docs/readme.md" ]; then
+    ok "Extract unpacks the container into a folder named after it"
+else
+    fail "Extract unpacks the container into a folder named after it (no $PACK/bundle)"
+fi
+refresh
+if printf '%s\n' "$DUMP" | grep -qF "Extracted"; then
+    ok "the window says what it extracted, in the folder it landed in"
+else
+    fail "the window says what it extracted, in the folder it landed in"
 fi
 
 # --- the search bar -----------------------------------------------------------------
