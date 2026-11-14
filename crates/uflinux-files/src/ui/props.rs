@@ -194,7 +194,12 @@ fn build(entry: &Entry) -> (gtk::Window, Option<gtk::Label>) {
 }
 
 /// Escape closes the dialog, as it does every other prompt in this program.
-fn escape_to_close(window: &gtk::Window) -> gtk::EventControllerKey {
+///
+/// `pub(crate)` because the "Open With" chooser is the same shape of window — a
+/// plain [`gtk::Window`] attached to the application — and a prompt that closes on
+/// Escape in one place and not in another is an inconsistency a user notices
+/// without being able to name it.
+pub(crate) fn escape_to_close(window: &gtk::Window) -> gtk::EventControllerKey {
     let keys = gtk::EventControllerKey::new();
     let target = window.clone();
     keys.connect_key_pressed(move |_, key, _code, _state| {

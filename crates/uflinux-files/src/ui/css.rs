@@ -84,6 +84,13 @@ box.ufm-find {
 label.ufm-mono {
     font-family: monospace;
 }
+box.ufm-open-with {
+    padding: 2px;
+}
+box.ufm-open-with button {
+    padding: 6px 8px;
+    border-radius: 6px;
+}
 ";
 
 /// Install the stylesheet for the current display.
@@ -133,6 +140,7 @@ mod tests {
             "ufm-columns",
             "ufm-find",
             "ufm-mono",
+            "ufm-open-with",
             "ufm-grid",
             "ufm-list",
             "ufm-row",

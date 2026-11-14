@@ -183,6 +183,7 @@ pub fn background(on_press: &ContextHandler, in_current: bool) -> gtk::GestureCl
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Command {
     Open,
+    OpenWith,
     NewFolder,
     Rename,
     Trash,
@@ -196,8 +197,9 @@ pub enum Command {
 
 impl Command {
     /// Every row, in the order the sections below lay them out.
-    const ALL: [Self; 10] = [
+    const ALL: [Self; 11] = [
         Self::Open,
+        Self::OpenWith,
         Self::NewFolder,
         Self::Rename,
         Self::Trash,
@@ -213,6 +215,7 @@ impl Command {
     pub fn label(self) -> &'static str {
         match self {
             Self::Open => "Open",
+            Self::OpenWith => "Open With\u{2026}",
             Self::NewFolder => "New Folder",
             Self::Rename => "Rename",
             Self::Trash => "Move to Trash",
@@ -230,6 +233,7 @@ impl Command {
     pub fn action(self) -> &'static str {
         match self {
             Self::Open => "win.open",
+            Self::OpenWith => "win.open-with",
             Self::NewFolder => "win.new-folder",
             Self::Rename => "win.rename",
             Self::Trash => "win.trash",
@@ -244,7 +248,7 @@ impl Command {
 
     fn section(self) -> Section {
         match self {
-            Self::Open => Section::Open,
+            Self::Open | Self::OpenWith => Section::Open,
             Self::NewFolder | Self::Paste => Section::Add,
             Self::Rename | Self::Trash | Self::Delete => Section::Change,
             Self::Copy | Self::Cut => Section::Take,
@@ -309,6 +313,12 @@ pub struct Scope {
     /// The selection is something we can unpack: an archive, or the archive
     /// folder currently open.
     pub extracting: bool,
+    /// Exactly one row is selected and it is something an external program could
+    /// be handed. A folder is entered rather than opened, and a virtual location
+    /// has no bytes to give a program, so the chooser has nothing to list. Asked
+    /// of the window rather than worked out here, because the window is what knows
+    /// whether the selection is one row or three.
+    pub openable: bool,
     /// The clipboard has something to put into this folder. The same test the
     /// Paste action uses.
     pub pastable: bool,
@@ -346,6 +356,13 @@ fn one_row(entry: &Entry, scope: Scope) -> Vec<Command> {
     let mut rows = Vec::new();
     if entry.navigable() {
         rows.push(Command::Open);
+    }
+    // The other half of the same question, and offered on the opposite condition:
+    // `Open` needs something to enter, this needs bytes to hand over. A container
+    // offers both — entering it and taking one program to the container itself —
+    // and a plain file only this one, which is why the row above is not enough.
+    if scope.openable {
+        rows.push(Command::OpenWith);
     }
     if scope.in_current {
         rows.push(Command::NewFolder);
@@ -570,10 +587,12 @@ mod tests {
     }
 
     /// A press in the folder the window is showing, which is where a menu is
-    /// usually opened.
+    /// usually opened. Nothing on the clipboard, and the row selected is a folder,
+    /// which is entered rather than opened.
     const HERE: Scope = Scope {
         in_current: true,
         extracting: false,
+        openable: false,
         pastable: false,
     };
 
@@ -581,6 +600,7 @@ mod tests {
     const THERE: Scope = Scope {
         in_current: false,
         extracting: false,
+        openable: false,
         pastable: false,
     };
 
@@ -649,6 +669,29 @@ mod tests {
             !rows.contains(&Command::Open),
             "the default handler may not exist, and a row that cannot be entered \
              should not promise it will"
+        );
+    }
+
+    #[test]
+    fn a_file_that_a_program_could_take_is_offered_to_one() {
+        // The other half of the row above: a file cannot be entered, and this is
+        // where it stops being something the user can only hope has a handler.
+        let chooser = Scope {
+            openable: true,
+            ..HERE
+        };
+        let rows = rows_for(&[file("note.txt")], chooser);
+        assert!(
+            rows.contains(&Command::OpenWith),
+            "a file with bytes to hand over should say which programs will take them"
+        );
+        assert!(
+            !rows.contains(&Command::Open),
+            "and it should still not promise a folder to enter"
+        );
+        assert!(
+            !rows_for(&[folder("one")], HERE).contains(&Command::OpenWith),
+            "a folder is entered, not opened"
         );
     }
 
@@ -765,6 +808,7 @@ mod tests {
             Scope {
                 in_current: true,
                 extracting: true,
+                openable: false,
                 pastable: true,
             },
         ));
@@ -792,6 +836,7 @@ mod tests {
                 Scope {
                     in_current: true,
                     extracting: false,
+                    openable: false,
                     pastable: true
                 }
             ))),

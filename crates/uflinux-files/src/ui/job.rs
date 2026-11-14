@@ -72,6 +72,13 @@ pub enum Event {
     /// window is only the postman. `path` is the folder that was walked, which is
     /// what lets an answer for a dialog the user has since closed be dropped.
     Sized { path: PathBuf, tally: Tally },
+    /// One member of an archive has been written out, so the chooser waiting for
+    /// it can open. The fifth variant that is not about a folder, and the reason
+    /// it carries an id rather than a path is that a `gio::AppInfo` is neither
+    /// `Send` nor `Sync`: the list of programs that could take the file cannot
+    /// travel to the worker and back, so the worker brings the bytes and the
+    /// dialog reads the list itself (see [`super::openwith`]).
+    Materialised { id: usize, path: PathBuf },
 }
 
 /// Closes a file descriptor when the last owner drops it, so a worker that

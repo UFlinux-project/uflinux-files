@@ -41,6 +41,7 @@ use super::conflict;
 use super::connect;
 use super::extract;
 use super::job::{Event, Handle, Queue};
+use super::openwith;
 use super::ops;
 use super::panel::{Panel, Place, Usage};
 use super::popup::{self, Popup};
@@ -750,6 +751,12 @@ fn apply(ctx: &Ctx, event: Event) {
             ref path,
             ref tally,
         } => props::deliver(path, tally),
+        // Also not about the folder on screen: a member written out belongs to the
+        // chooser that asked for it, which decides whether it is still open. The
+        // chooser itself is built here rather than on the worker, because a
+        // `gio::AppInfo` is neither `Send` nor `Sync` and the list of programs has
+        // to be read on the main thread.
+        Event::Materialised { id, ref path } => openwith::arrived(id, path),
     }
 }
 
@@ -1275,6 +1282,13 @@ fn menu() -> gio::Menu {
     // than shortened to `Delete`, because a menu that offers both has to say which
     // one can be undone.
     let files = gio::Menu::new();
+    // First among the commands that act on a row, because it is the one a user
+    // reaches for before anything else: the folder opened by double-click and the
+    // default handler disagree, or there is no default handler, and this is where
+    // the machine says what it actually has registered. No chord, for the reason
+    // the context menu's Open row has none — `Return` already means "take this
+    // row", and a second name for one command is a chord wasted.
+    files.append(Some("Open With\u{2026}"), Some("win.open-with"));
     files.append(Some("New Folder"), Some("win.new-folder"));
     files.append(Some("Rename"), Some("win.rename"));
     files.append(Some("Move to Trash"), Some("win.trash"));
@@ -1712,6 +1726,24 @@ fn op_actions(ctx: &Ctx) -> Vec<Rc<gio::SimpleAction>> {
         }
     });
 
+    let chooser = gio::SimpleAction::new("open-with", None);
+    chooser.connect_activate({
+        let ctx = ctx.clone();
+        move |_action, _parameter| {
+            let Some((window, handle)) = sink_for(&ctx) else {
+                return;
+            };
+            // One row again, and for the same reason as the chooser's own list:
+            // "which of these three should the editor open?" has no answer that a
+            // dialog could act on.
+            let picked = targets(&ctx);
+            let [entry] = picked.as_slice() else {
+                return;
+            };
+            openwith::show(&window, &handle, entry);
+        }
+    });
+
     vec![
         Rc::new(new_folder),
         Rc::new(rename),
@@ -1721,8 +1753,22 @@ fn op_actions(ctx: &Ctx) -> Vec<Rc<gio::SimpleAction>> {
         pickup_action("cut", ops::Transfer::Move, ctx),
         Rc::new(paste),
         Rc::new(unpack),
+        Rc::new(chooser),
         Rc::new(facts),
     ]
+}
+
+/// Which row the "Open With" chooser would be opened for, mirroring the
+/// sensitivity rule in [`sync_open_with`] so the two cannot disagree.
+///
+/// Exactly one row, and one that an external program could be pointed at: a folder
+/// is entered rather than opened, and a virtual location has no bytes to hand over.
+fn open_with_target(ctx: &Ctx) -> Option<Entry> {
+    let picked = targets(ctx);
+    let [entry] = picked.as_slice() else {
+        return None;
+    };
+    openwith::openable(entry).then(|| entry.clone())
 }
 
 /// Which container the extract command would unpack, mirroring the sensitivity
@@ -1750,7 +1796,18 @@ fn extract_target(ctx: &Ctx) -> Option<Location> {
 /// change without a navigation.
 fn sync_ops(ctx: &Ctx) {
     sync_extract(ctx);
+    sync_open_with(ctx);
     sync_properties(ctx);
+}
+
+/// Enable or disable the chooser. Depends on what the one selected row *is* — a
+/// folder has no program to take it — which is a third answer than extract's or
+/// properties' and so its own function.
+fn sync_open_with(ctx: &Ctx) {
+    let Some(window) = ctx.window.upgrade() else {
+        return;
+    };
+    enable(&window, "open-with", open_with_target(ctx).is_some());
 }
 
 /// Enable or disable extract to match the row under the keyboard. The one file
@@ -1881,6 +1938,7 @@ fn menu_rows(ctx: &Ctx, in_current: bool) -> Vec<popup::Command> {
     let scope = popup::Scope {
         in_current,
         extracting: extract_target(ctx).is_some(),
+        openable: open_with_target(ctx).is_some(),
         pastable: can_paste(ctx),
     };
     popup::rows_for(&picked, scope)
@@ -1903,6 +1961,7 @@ fn show_context_menu(ctx: &Ctx, widget: &gtk::Widget, target: popup::Target, x: 
         // whenever the menu would have a row to unpack, and the action's own
         // sensitivity is what stops a stale answer from doing anything.
         extracting: extract_target(ctx).is_some(),
+        openable: open_with_target(ctx).is_some(),
         pastable: can_paste(ctx),
     };
     ctx.popup.show(

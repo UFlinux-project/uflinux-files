@@ -38,7 +38,7 @@ error type is named in the signature does not need an essay per method.
 | `ufm-search` | unknown fields are rejected; an oversized reply shrinks to snippets then page and says which; `Exec` expansion drops a field code with no value; a `NAME=value` prefix is not treated as an argument. |
 | `ufm-desktop-ipc` | an id with a slash cannot name a file outside the desktop directory; unplugging a monitor moves icons and deletes none; a saved layout meets a directory that changed since. |
 | `uflinux-files-mount` | the argv handed to `mount(8)` contains no argument from the request that begins with `-`; a target that is a symlink, relative, world-readable, or somebody else's is refused; a `credentials=` file anyone can read is refused and its contents never reach an error message; a `pass=` option is refused; the owner comes from `PKEXEC_UID` and is never `0`. |
-| `uflinux-files` | the location on argv reaches the window; `--new-window` gives up being the single instance; the application id matches the desktop entry; a machine with no render node is asked for the cairo renderer, and an explicit `GSK_RENDERER` is never overridden; a paste plan drops the rows that cannot land and names the reason for each, growing `report (2).pdf` rather than replacing; copying a folder takes its contents and deleting one takes what is inside it; a prompt refuses an empty name, hands the typed name over exactly once, and pre-selects the stem of a filename but not its extension; a properties form draws a row only for a fact the entry actually has, spells one file without an `s`, says *at least* for a stopped walk, and holds the size row for a folder so the answer can be delivered into it or dropped when the dialog is gone. |
+| `uflinux-files` | the location on argv reaches the window; `--new-window` gives up being the single instance; the application id matches the desktop entry; a machine with no render node is asked for the cairo renderer, and an explicit `GSK_RENDERER` is never overridden; a paste plan drops the rows that cannot land and names the reason for each, growing `report (2).pdf` rather than replacing; copying a folder takes its contents and deleting one takes what is inside it; a prompt refuses an empty name, hands the typed name over exactly once, and pre-selects the stem of a filename but not its extension; a properties form draws a row only for a fact the entry actually has, spells one file without an `s`, says *at least* for a stopped walk, and holds the size row for a folder so the answer can be delivered into it or dropped when the dialog is gone; the Open With list is deduplicated by desktop entry, drops an entry that asked not to be shown, keeps a fallback when nothing is registered for the type, and names a file whose type nothing owns; a member of an archive is written out under its own name with its own bytes and a second one of the same name does not clobber the first, while a folder inside an archive is refused rather than written as a zero-byte file; a week-old write-out is swept; and a menu over one file offers Open With where a menu over a folder does not. |
 | `uflinux-files-provider` | the crate does not depend on GTK, checked against its own manifest; the bus name is taken through the C entry point whose handlers are nullable, not the gio-rs wrapper that aborts at logout; the polling deadline is longer than the timer that checks it; a missing login session is refused before the bus is asked for. |
 
 ## Archives
@@ -167,8 +167,12 @@ bits `stat` gives for it, and its Size row stops saying it is counting and state
 total; the `context-menu` action opens a menu over the selected row whose rows are
 exactly the set that selection and that folder allow, each carrying the accelerator of
 the command it names, pressing one runs that command and closes the menu, and
-navigating away closes an open one; the search action opens a field and the field takes
-typed text; a
+navigating away closes an open one; `Describe` reports `open-with` disabled with a
+folder as the one selection and enabled with a plain file, the chooser it opens is a
+window of its own that lists the program the desktop database registers for that type,
+pressing its row really starts that program and hands it the file that was selected,
+and its `Close` dismisses it; the search action opens a field and the field takes typed
+text; a
 second invocation opens a `Computer` window in the running instance; `--new-window` opens
 a window rather than focusing an open one; and the indexer answers `Status` on the bus.
 The prompt is driven through the accessibility tree, by the `press` command of the probe,
@@ -273,6 +277,23 @@ the section began from; `History::push` was comparing a location with the tip of
 list instead of with the entry under the cursor. The unit tests for `History` could not
 have caught it, because the two agree until something moves the cursor off the tip, and
 only the harness walks that far.
+
+The Open With checks are the only ones that install something into the fixture, and
+that is the point of them. The chooser's list comes from the desktop database, and a
+container with no `MimeType=` anywhere has an honest empty list — a check that only
+looked for a dialog would pass on a machine where the lookup returns nothing at all.
+So the section writes `Probe Editor` into the private `$XDG_DATA_HOME` the whole script
+already runs with, refreshes the database, and then asserts the whole chain: that
+`Describe` reports the action disabled for a folder and enabled for a plain file, that
+the chooser draws a row for a name nothing else in the interface says, that pressing it
+leaves a marker file behind, and that the argument the program was handed names the
+selected file. The last of those is asserted against a plain path rather than the
+`file:` URI the chooser passed, because `GIO` turns a `file:` URI back into a filename
+when it builds a desktop entry's command line — which is the right answer for a program
+expecting an argument it can open, and is reported as measured rather than as hoped.
+The section prints a `skip` line where there is no `update-desktop-database`, on the
+same reasoning as the picture previews. The chooser is closed again at the end because
+the frame count `--new-window` is checked against is read from the same bus.
 
 The run fails if the app printed a GLib critical. One message is excepted, and it is
 excepted on evidence rather than convenience: `GTK4` 4.22 re-reads a toplevel's

@@ -368,8 +368,10 @@ Half of `ui/popup.rs` is policy and half is hit-testing, and the split is the
 point. The policy is `rows_for`, a plain function from the selected entries plus
 a `Scope` to a list of rows, tested without a display and shared by both
 presentations. A row is left out rather than greyed when the command cannot work
-here at all: `Extract` only when the selection is something we can unpack,
-`Paste` only when the clipboard has something for this folder, and the
+here at all: `Extract` only when the selection is something we can unpack, `Open
+With…` only when it is something a program could take — one file rather than a
+folder, on disk or a member of an archive — and `Paste` only when the clipboard
+has something for this folder, and the
 folder-level rows — New Folder, Paste — only when the press happened in the
 folder the window is actually in, because in a Miller column they would otherwise
 name one pane and act on another. The folder-level rows sit in the row menus too
@@ -398,10 +400,49 @@ go. The wrong branch only matters once something else has moved the cursor off
 the tip, which is what the UI harness does on its way to checking that navigating
 away closes an open menu.
 
-## Desktop icons
+## Opening a file with a program
 
-The file manager owns the model, `uflinux-desktop` draws it, over
-`org.uflinux.FileManager.Desktop1`. See `docs/desktop-integration.md`.
+Double-clicking asks the desktop for its default. That is usually the right
+answer and sometimes the only possible one, and when it is wrong there has to be
+a way to say so — which is what `ui/openwith.rs` is, behind `Open With…` in both
+menus and no accelerator of its own.
+
+The list of programs is not this program's to keep. `gio::AppInfo::all_for_type`
+answers for the content type and `fallback_for_type` answers when nothing does,
+which is the same pair `gio mime` reads, so the chooser cannot drift from what
+the system believes about a file. The two lists overlap, so they are merged on
+the desktop entry's id, and an entry that says `NoDisplay=true` is dropped: a
+program that asked not to be listed in a menu asked not to be listed here either.
+A content type nothing owns is said out loud rather than answered with an empty
+dialog, because an empty dialog reads as a program that failed to load.
+
+The content type comes from the `mime` the reader already worked out for the row,
+and only then from a name-based guess. That order is what makes a member of an
+archive open as the document it is: the archive reader knows `notes.txt` inside a
+`.tar` is plain text, and a chooser that re-guessed from a path no filesystem
+holds would not.
+
+`gio::AppInfo` is neither `Send` nor `Sync`, so nothing about the chooser happens
+off the main thread — the lookup, the drawing and the `launch_uris` call itself
+all run where the widget tree does. The one thing that does leave the main thread
+is materialising a member of an archive, since a program launched through the
+desktop cannot be handed `archive://…!/notes.txt`. That is the same shape as every
+other command here: a worker writes the member out and posts `Event::Materialised`
+with a request id, and the pending requests are a thread-local list keyed by that
+id holding a weak reference to the window that asked. An answer whose window was
+closed is dropped, as it is for a folder total whose dialog went away.
+
+Written-out members land in `paths::extracted_dir()` under a name the collision
+rule would have produced anyway, and everything older than a week is swept when
+the next one is written. A cache with no expiry is a leak with a folder icon: the
+alternative to sweeping is either refusing to reuse what was already written or
+growing without bound, and neither is what a machine with 2 GiB wants.
+
+The chooser is a plain `gtk::Window` added to the application, like the name
+prompt and the properties dialog, so it is not exported on the bus and the window
+paths a test drives do not shift when it opens. Its rows are buttons whose child
+is a box — `gtk::Button` has no image property in this `GTK` — so the name a
+screen reader reads is set explicitly rather than inherited from a label.
 
 ## Concurrency
 

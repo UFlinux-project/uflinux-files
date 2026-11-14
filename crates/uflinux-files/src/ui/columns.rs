@@ -320,12 +320,14 @@ impl Columns {
             // A picture is the same kind of no-op: a pane asks for one through
             // the shared pipeline, which the window answers, and the panes have
             // nothing to match a token against. A folder's total is the same
-            // again — it belongs to a dialog, not to a pane.
+            // again — it belongs to a dialog, not to a pane. So does a member
+            // written out of an archive, which belongs to the chooser that asked.
             Event::Batch { .. }
             | Event::Mounted { .. }
             | Event::Operation { .. }
             | Event::Thumb { .. }
-            | Event::Sized { .. } => {}
+            | Event::Sized { .. }
+            | Event::Materialised { .. } => {}
             Event::Finished {
                 location, entries, ..
             } => {

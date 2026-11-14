@@ -712,6 +712,123 @@ if ! printf '%s\n' "$DUMP" | grep -qF "$(printf 'frame\t%s\t' "$TARGET")"; then
 else
     ok "the window is back on the folder the menu checks began from"
 fi
+
+# --- opening a file with a program ------------------------------------------
+# The chooser reads its list out of the desktop database, so the check has to
+# install a program of its own: a container with no `MimeType=` anywhere has an
+# honest empty list, and an empty list proves nothing about whether the lookup
+# works. The desktop file is written into the private `$XDG_DATA_HOME` the whole
+# script already runs with, so nothing is left behind and the machine's real
+# applications are not disturbed.
+#
+# What is asserted is the whole chain rather than the dialog: that the action
+# knows a folder cannot be opened this way, that it knows a plain file can, that
+# the chooser names the registered program, and that pressing the row really
+# runs it — which the marker file the `Exec=` line leaves behind shows. A dialog
+# that listed a program but could not start it would pass every check that stops
+# at the accessibility tree.
+if ! command -v update-desktop-database >/dev/null; then
+    echo "skip open with: this machine has no desktop database updater"
+else
+    # The `Exec=` line is a shell command rather than a bare `touch` because the
+    # check wants two facts out of one launch: that a program ran at all, and that
+    # the file it was handed is the one the row was standing on. The link's target
+    # is the URI the chooser passed, so the assertion covers the argument and not
+    # only the attempt. The whole command is one double-quoted desktop argument,
+    # which is how the desktop-entry parser wants a shell command anyway.
+    mkdir -p "$XDG_DATA_HOME/applications"
+    printf '%s\n' \
+        '[Desktop Entry]' \
+        'Type=Application' \
+        'Name=Probe Editor' \
+        'Comment=Writes a marker where the ui smoke test can see it' \
+        'Exec=/bin/sh -c "touch '"$ROOT"'/probe.marker; ln -sf %u '"$ROOT"'/probe.link"' \
+        'NoDisplay=false' \
+        'MimeType=text/plain;' \
+        >"$XDG_DATA_HOME/applications/ufm-probe.desktop"
+    update-desktop-database "$XDG_DATA_HOME/applications" 2>/dev/null || :
+
+    # A folder is not something to open with an editor, and the row has to say so
+    # rather than open a chooser with nothing to launch. The selection is set
+    # explicitly rather than inherited from the checks above, because navigation
+    # clears it and an action disabled for having no selection would pass this
+    # check for the wrong reason.
+    python3 "$A11Y" select one >/dev/null 2>&1 || :
+    if describe open-with | grep -qF '(false'; then
+        ok "Open With is disabled while a folder is the one selection"
+    else
+        fail "Open With is disabled while a folder is the one selection ($(describe open-with))"
+    fi
+
+    printf hello >"$TARGET/note.txt"
+    if ! wait_named "note.txt"; then
+        fail "a plain file appears so Open With can be asked about it"
+    else
+        ok "a plain file appears so Open With can be asked about it"
+        if ! python3 "$A11Y" select note.txt >/dev/null 2>&1; then
+            fail "Open With is sensitive with one plain file selected"
+        elif describe open-with | grep -qF '(true'; then
+            ok "Open With is sensitive with one plain file selected"
+        else
+            fail "Open With is sensitive with one plain file selected ($(describe open-with))"
+        fi
+        act open-with "[]" "[]"
+        has_frame "Open With" "Open With opens a chooser of its own"
+        # `Probe Editor` is a name nothing else in the interface says, so finding
+        # it here can only mean the chooser read the desktop database and drew a
+        # row for what it found.
+        has_named "Probe Editor" "the chooser lists the program the desktop database registers"
+        # The press goes into the chooser's subtree by name, because the main
+        # window's titlebar has a Close button too and an unscoped press would
+        # reach that one first.
+        if ! python3 "$A11Y" press "Probe Editor" "Open With" >/dev/null 2>&1; then
+            fail "the chooser's row can be activated"
+        else
+            i=0
+            while [ "$i" -lt 50 ] && [ ! -f "$ROOT/probe.marker" ]; do
+                i=$((i + 1))
+                sleep 0.2
+            done
+            if [ -f "$ROOT/probe.marker" ]; then
+                ok "pressing a row starts the program it names"
+            else
+                fail "pressing a row starts the program it names (no marker written)"
+            fi
+            # Which file the program was handed: the difference between a chooser
+            # that opens the selected file and one that opens whatever the last row
+            # it drew happened to be. The comparison is against a path rather than
+            # the `file://` URI the chooser passed, because `GIO` turns a `file:`
+            # URI back into a plain filename when it builds a desktop file's
+            # command line — which is the right answer for a program that expects
+            # an argument it can open, and is what the check reports honestly
+            # rather than wishing it were a URI.
+            handed=$(readlink "$ROOT/probe.link" 2>/dev/null || echo nothing)
+            if [ "$handed" = "$TARGET/note.txt" ]; then
+                ok "the program is handed the file that was selected"
+            else
+                fail "the program is handed the file that was selected (got: $handed)"
+            fi
+        fi
+        # The dialog is closed again rather than left open: the frame count that
+        # `--new-window` is checked against below is taken from this same bus, and
+        # a chooser still on screen would be counted as a window the program
+        # opened on its own.
+        python3 "$A11Y" press Close "Open With" >/dev/null 2>&1 || :
+        i=0
+        while [ "$i" -lt 50 ] && printf '%s\n' "$DUMP" |
+            grep -qF "$(printf 'frame\tOpen With\t')"; do
+            refresh
+            i=$((i + 1))
+            sleep 0.2
+        done
+        if printf '%s\n' "$DUMP" | grep -qF "$(printf 'frame\tOpen With\t')"; then
+            fail "the chooser closes when its Close button is pressed"
+        else
+            ok "the chooser closes when its Close button is pressed"
+        fi
+    fi
+fi
+
 # --- the search bar -----------------------------------------------------------------
 # The bar opens and the field takes text. Whether it finds anything depends on the
 # indexer, which is checked separately below; the field accepting input is the UI's job.

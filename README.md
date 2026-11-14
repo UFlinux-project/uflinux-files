@@ -67,6 +67,12 @@ the model over D-Bus and never opens a window.
   folder. Each row activates the window's own action, which is why it is sensitive
   exactly where the header menu and the keyboard are; `Menu` and `<Shift>F10` open
   the same menu over the focused row.
+- **Open With…**: the list of programs is the desktop database's, not a second list
+  kept here, so the chooser cannot disagree with what the system believes about a
+  file — and a type nothing is registered for is named out loud rather than answered
+  with an empty dialog. It works on a member of an archive too: the one member is
+  written out to a cache that forgets what is a week old, and the program is handed
+  that.
 
 ## Layout
 

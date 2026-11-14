@@ -117,5 +117,5 @@ mount_helper() {
 # Filled in by scripts/files-source.py --update; empty here so the recipe still
 # parses as shell before a bundle has been generated.
 sha512sums="
-73b368cac54997579a46c15c903857fcc5d350ad8523a6ccf3b665eb553473c8fc53b8b6fda979c059d7e6758097a69ebf965878dc7678e829d20229020362c8  uflinux-files-0.1.0.tar
+b335b7a9177d3bdce6d0154adebb3309e995148783f5383bd2bf035bd37ea5995dcb5623e7bbd9f9a16edce5b720c19fd00b523c2c84afd56b8bb0965825be2b  uflinux-files-0.1.0.tar
 "
