@@ -164,7 +164,11 @@ thumbnail cache, and the `thumbnails` switch reports its state through `Describe
 `Describe` reports `properties` enabled with exactly one row selected, the dialog it
 opens is a window of its own that names the folder the row lives in and prints the mode
 bits `stat` gives for it, and its Size row stops saying it is counting and states a
-total; the search action opens a field and the field takes typed text; a
+total; the `context-menu` action opens a menu over the selected row whose rows are
+exactly the set that selection and that folder allow, each carrying the accelerator of
+the command it names, pressing one runs that command and closes the menu, and
+navigating away closes an open one; the search action opens a field and the field takes
+typed text; a
 second invocation opens a `Computer` window in the running instance; `--new-window` opens
 a window rather than focusing an open one; and the indexer answers `Status` on the bus.
 The prompt is driven through the accessibility tree, by the `press` command of the probe,
@@ -244,6 +248,31 @@ assuming the first one. The numbering survives the folder prompt that runs befor
 for a reason worth keeping in mind when adding to either: a prompt is a plain window
 that is only made transient for the main one, so it is never exported and never takes
 an index.
+
+The context-menu checks cannot name a row, which is worth knowing before adding to
+them. `GTK` 4.22 rebuilt `GtkPopoverMenu` on a widget tree, and the rows it produces
+answer the role `menu item` with an empty accessible name, empty description and empty
+id — the label is drawn by a child that is not itself exposed — so there is no text for
+a test to reach a row by. What a row does expose is a `keyshortcuts` attribute holding
+the accelerator installed for the action it names, so the probe gained `menu`, which
+prints one chord per visible row, and `menu-press`, which activates a row found by its
+chord. That is a handle on the row and on the accelerator table at once, which is what a
+keyboard user has. A row with no accelerator prints `-`; the one row that has none is
+`Open`, because plain `Return` already activates a row. A closed popover contributes no
+nodes at all, and the application has no other node of role `menu` while one is open, so
+the presence and absence of that role is what says whether the menu opened and whether it
+closed. The expected row set is compared whole rather than row by row, and it contains
+`Control+V` because the copy that fed the collision prompt is still on the clipboard — a
+copy can be pasted more than once — while `Control+E` is absent because the window is
+standing on an ordinary folder.
+
+That section is also how a real bug in the navigation history was found. Going up from
+the fixture, back to it, and up again left the history's cursor pointing at the wrong
+entry, so the following `Back` did nothing and the window never returned to the folder
+the section began from; `History::push` was comparing a location with the tip of the
+list instead of with the entry under the cursor. The unit tests for `History` could not
+have caught it, because the two agree until something moves the cursor off the tip, and
+only the harness walks that far.
 
 The run fails if the app printed a GLib critical. One message is excepted, and it is
 excepted on evidence rather than convenience: `GTK4` 4.22 re-reads a toplevel's

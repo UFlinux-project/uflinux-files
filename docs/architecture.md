@@ -355,6 +355,49 @@ turn into two. It is a plain `gtk::Window` added to the application rather than
 an `ApplicationWindow`, which keeps it off the D-Bus like the other prompts, so
 the window paths a test drives do not shift when a dialog opens.
 
+## Context menus
+
+One `Popup` per window, reused: its model is swapped for each opening and then
+popped up over whatever was clicked. Because it is parented to the window, its
+`win.` rows resolve against that window's own actions, so a menu row is sensitive
+exactly where the header menu and the keyboard say the command is available.
+There is no second copy of the sensitivity logic to fall out of agreement, and
+pressing a row activates the same action its accelerator would.
+
+Half of `ui/popup.rs` is policy and half is hit-testing, and the split is the
+point. The policy is `rows_for`, a plain function from the selected entries plus
+a `Scope` to a list of rows, tested without a display and shared by both
+presentations. A row is left out rather than greyed when the command cannot work
+here at all: `Extract` only when the selection is something we can unpack,
+`Paste` only when the clipboard has something for this folder, and the
+folder-level rows — New Folder, Paste — only when the press happened in the
+folder the window is actually in, because in a Miller column they would otherwise
+name one pane and act on another. The folder-level rows sit in the row menus too
+and not only over the background: the folder a row lives in is implied by the
+row, and in a folder whose rows fill the view there is no empty space left to
+right-click.
+
+The hit-testing is the awkward half. `gtk_list_view_compute_item_for_point()` has
+no binding in gtk4-rs 0.10, and a row's wrapper (`GtkListItem`,
+`GtkColumnViewCell`) is not a widget, so `Widget::pick` cannot report one and
+walking up from a picked widget cannot reach one either. So the row is identified
+from *inside* it: every cell a factory builds carries a right-click gesture that
+reads its own item's position when it fires — at press time, not setup time,
+because cells are recycled and a position remembered at setup goes stale. Menus
+over empty space come from a second gesture on the list widget itself, which
+fires only when `pick()` reports nothing or the list, since a press over a row
+picks a descendant of the row rather than the list.
+
+The same kind of note applies to navigation history. `History::push` recognises a
+location already visited by comparing it with the entry *under the cursor*, not
+with the tip of the list. The two look equivalent and are not: after up and back,
+the folder gone up from is still the tip while the cursor has moved off it, and a
+push that then returns early leaves the cursor where it was — the window shows the
+parent while the history believes it shows the child, and `Back` has nowhere to
+go. The wrong branch only matters once something else has moved the cursor off
+the tip, which is what the UI harness does on its way to checking that navigating
+away closes an open menu.
+
 ## Desktop icons
 
 The file manager owns the model, `uflinux-desktop` draws it, over

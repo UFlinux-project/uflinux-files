@@ -39,6 +39,7 @@ use ufm_core::sort::{SortKey, sort_entries};
 use ufm_vfs::{Readers, read_all};
 
 use super::job::{Event, Handle};
+use super::popup::{self, ContextHandler, Listeners};
 use super::row::Row;
 use super::thumb::Pipeline;
 use super::view::{GRID_ICON, grid_factory};
@@ -110,6 +111,10 @@ struct Inner {
     on_open: RefCell<Option<OpenHandler>>,
     on_up: RefCell<Option<UpHandler>>,
     on_selection: RefCell<Option<SelectionHandler>>,
+    /// Right-clicks, reported to whoever shows the menu. Shared by every pane so
+    /// that one subscription covers the whole widget, and so the columns and the
+    /// grid answer a right-click with the same menu.
+    contexts: Listeners,
 }
 
 /// The columns view. Cheap to hand out; the state is shared with the handlers.
@@ -143,6 +148,7 @@ impl Columns {
             on_open: RefCell::new(None),
             on_up: RefCell::new(None),
             on_selection: RefCell::new(None),
+            contexts: Listeners::new(),
         });
         install_keys(&Rc::clone(&inner));
         Self { inner }
@@ -175,6 +181,16 @@ impl Columns {
     /// themselves being rebuilt.
     pub fn on_selection<F: Fn() + 'static>(&self, f: F) {
         *self.inner.on_selection.borrow_mut() = Some(Rc::new(f));
+    }
+
+    /// React to a right-click, on a row or on the empty part of a pane. The
+    /// target says which row and which folder; see [`super::popup`] for how a row
+    /// is identified, and for what [`popup::Target::in_current`] means here.
+    pub fn on_context<F>(&self, f: F)
+    where
+        F: Fn(&gtk::Widget, popup::Target, f64, f64) + 'static,
+    {
+        self.inner.contexts.push(f);
     }
 
     /// Show the chain that ends at `target`, reading every folder that is not
@@ -454,6 +470,49 @@ fn chain(target: &Location) -> Vec<Location> {
     out.split_off(skip)
 }
 
+/// The right-click handler for one pane.
+///
+/// Two things happen before the press is passed on. The row is selected first: a
+/// menu over a row that is not the row the keyboard is on would otherwise act on
+/// a different file than the one under the pointer, and the window builds its
+/// rows from the selection rather than from the position. Then the press is
+/// reported with the answer to "is this the folder the window is in?", which for a
+/// column is whether this pane is the deepest one — the pane holding the folder in
+/// the title bar. That is asked at press time rather than at build time, because
+/// the chain is rebuilt under a pane that stays on screen.
+fn pane_press(
+    inner: Rc<Inner>,
+    location: Location,
+    store: &gio::ListStore,
+    selection: &gtk::SingleSelection,
+) -> ContextHandler {
+    let on_press = inner.contexts.handler();
+    let store = store.clone();
+    let selection = selection.clone();
+    Rc::new(move |widget, mut target, x, y| {
+        let in_current = inner
+            .panes
+            .borrow()
+            .last()
+            .is_some_and(|pane| pane.location == location);
+        target = match target {
+            popup::Target::Row { position, .. } => {
+                // A recycled cell can report a position past the end of a
+                // listing that was replaced since it was bound.
+                if entry_at(&store, position).is_some() {
+                    selection.set_selected(position);
+                }
+                popup::Target::Row {
+                    position,
+                    in_current,
+                }
+            }
+            popup::Target::Background { .. } => popup::Target::Background { in_current },
+        };
+        on_press(widget, target, x, y);
+    })
+}
+
 /// A new pane for one folder. `read` says whether the pane fills itself; the
 /// leaf is left to the window, which is reading that folder already.
 fn build(inner: &Rc<Inner>, location: &Location, read: bool) -> Rc<Pane> {
@@ -461,15 +520,18 @@ fn build(inner: &Rc<Inner>, location: &Location, read: bool) -> Rc<Pane> {
     let selection = gtk::SingleSelection::new(Some(store.clone()));
     selection.set_can_unselect(false);
     selection.set_autoselect(true);
+    let on_press = pane_press(Rc::clone(inner), location.clone(), &store, &selection);
     let list = gtk::ListView::new(
         Some(selection.clone()),
         Some(grid_factory(
             Rc::clone(&inner.icon_size),
             inner.thumbs.clone(),
+            &on_press,
         )),
     );
     list.set_show_separators(false);
     list.set_single_click_activate(false);
+    list.add_controller(popup::background(&on_press, false));
 
     let scroll = gtk::ScrolledWindow::new();
     scroll.set_child(Some(&list));

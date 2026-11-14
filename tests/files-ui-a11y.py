@@ -285,6 +285,75 @@ def select_at(trail):
     return 3
 
 
+def menu_rows():
+    """Every `menu item` under an open `menu`, in the order drawn.
+
+    `GTK` 4.22 rebuilt `GtkPopoverMenu` on a widget tree rather than on a
+    `GtkMenu`, and the rows it produces answer `menu item` with an empty
+    accessible name: the label is drawn by a child that is not itself exposed,
+    so a test cannot reach a row by the text on it. What a row does carry is a
+    `keyshortcuts` attribute, filled in from the accelerator installed for the
+    action the row names, which makes the chord the handle a test has on a row —
+    and a handle that ties the menu to the same table the keyboard reads from.
+    """
+    out = []
+    queue = list(apps())
+    while queue:
+        acc = queue.pop(0)
+        if role(acc) == "menu":
+            collect_rows(acc, out)
+        else:
+            queue.extend(children(acc))
+    return out
+
+
+def collect_rows(acc, out):
+    """Depth-first under ACC, stopping at the first `menu item` so a nested
+    submenu's rows are not pulled up into the parent menu's list."""
+    if role(acc) == "menu item":
+        out.append(acc)
+        return
+    for child in children(acc):
+        collect_rows(child, out)
+
+
+def chord_of(acc):
+    """The `keyshortcuts` attribute of a menu row, empty when it has none."""
+    try:
+        attrs = Atspi.Accessible.get_attributes(acc) or {}
+    except Exception:  # noqa: BLE001
+        return ""
+    return attrs.get("keyshortcuts", "")
+
+
+def menu():
+    """Print one line per open menu row: its chord, or `-` for a row with none."""
+    for acc in menu_rows():
+        print(chord_of(acc) or "-")
+    return 0
+
+
+def menu_press(wanted):
+    """Run the action of the open menu's row whose chord is WANTED.
+
+    The same activation path `press` takes, reached by chord rather than by
+    name, because a menu row has no name to reach it by.
+    """
+    for acc in menu_rows():
+        if chord_of(acc) != wanted:
+            continue
+        iface = Atspi.Accessible.get_action_iface(acc)
+        if iface is None or iface.get_n_actions() < 1:
+            print("menu row %s offers no action" % wanted)
+            return 3
+        if not iface.do_action(0):
+            print("menu row %s refused its action" % wanted)
+            return 5
+        return 0
+    print("no open menu row with chord %s" % wanted)
+    return 2
+
+
 def main(argv):
     Atspi.init()
     command = argv[0] if argv else "dump"
@@ -298,9 +367,13 @@ def main(argv):
         return press(argv[1], argv[2] if len(argv) > 2 else None)
     if command == "select":
         return select(argv[1])
+    if command == "menu":
+        return menu()
+    if command == "menu-press":
+        return menu_press(argv[1])
     print(
         "usage: files-ui-a11y.py [dump | type TEXT | entry | press NAME [FRAME] |"
-        " select NAME]",
+        " select NAME | menu | menu-press CHORD]",
         file=sys.stderr,
     )
     return 64

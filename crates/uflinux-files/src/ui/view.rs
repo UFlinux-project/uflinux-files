@@ -25,6 +25,7 @@ use ufm_core::config::ViewMode;
 use ufm_core::entry::Entry;
 use ufm_core::sort::{SortField, SortKey, sort_entries};
 
+use super::popup::{self, ContextHandler, Listeners};
 use super::row::{Row, format_items};
 use super::thumb::Pipeline;
 
@@ -120,6 +121,7 @@ pub struct View {
     status: Rc<Status>,
     headers: Headers,
     selections: Selections,
+    contexts: Listeners,
     thumbs: Pipeline,
 }
 
@@ -129,10 +131,33 @@ impl View {
         let store = gio::ListStore::new::<Row>();
         let selection = gtk::MultiSelection::new(Some(store.clone()));
         let icon_size = Rc::new(Cell::new(GRID_ICON));
+        let contexts = Listeners::new();
+        // A right-click on a row that is not the selected one selects it first, so
+        // that the menu is built from the row under the pointer. A row already in a
+        // multi-selection is left alone: collapsing three selected rows to the one
+        // the pointer happened to be over would quietly change what Trash does.
+        let on_press: ContextHandler = {
+            let report = contexts.handler();
+            let store = store.clone();
+            let selection = selection.clone();
+            Rc::new(move |widget, target, x, y| {
+                if let popup::Target::Row { position, .. } = target
+                    && position < store.n_items()
+                    && !selection.is_selected(position)
+                {
+                    selection.select_item(position, true);
+                }
+                report(widget, target, x, y);
+            })
+        };
 
         let grid = gtk::GridView::new(
             Some(selection.clone()),
-            Some(grid_factory(Rc::clone(&icon_size), thumbs.clone())),
+            Some(grid_factory(
+                Rc::clone(&icon_size),
+                thumbs.clone(),
+                &on_press,
+            )),
         );
         grid.set_single_click_activate(false);
         // The width decides the column count; GTK's "no ceiling" is its largest
@@ -148,7 +173,12 @@ impl View {
         for column in Column::ALL {
             let widget = gtk::ColumnViewColumn::new(
                 Some(column.title()),
-                Some(list_factory(column, Rc::clone(&icon_size), thumbs.clone())),
+                Some(list_factory(
+                    column,
+                    Rc::clone(&icon_size),
+                    thumbs.clone(),
+                    &on_press,
+                )),
             );
             widget.set_expand(column.is_name());
             widget.set_resizable(true);
@@ -177,8 +207,15 @@ impl View {
             status: Rc::new(Status::new()),
             headers: Rc::new(RefCell::new(Vec::new())),
             selections: Rc::new(RefCell::new(Vec::new())),
+            contexts,
             thumbs,
         };
+        // Right-click below the last row is a click on the folder, and both
+        // presentations need it: a grid has empty space beside its columns as
+        // well as below them. Either one is showing the folder the window is in,
+        // which is what makes the folder-level rows safe to offer.
+        view.grid.add_controller(popup::background(&on_press, true));
+        view.list.add_controller(popup::background(&on_press, true));
         view.wire_activate();
         view.wire_selection();
         view
@@ -201,6 +238,15 @@ impl View {
     /// one, which no amount of clipboard bookkeeping can predict.
     pub fn on_selection<F: Fn() + 'static>(&self, f: F) {
         self.selections.borrow_mut().push(Rc::new(f));
+    }
+
+    /// React to a right-click, on a row or on the folder behind the rows. See
+    /// [`super::popup`] for how a row is identified.
+    pub fn on_context<F>(&self, f: F)
+    where
+        F: Fn(&gtk::Widget, popup::Target, f64, f64) + 'static,
+    {
+        self.contexts.push(f);
     }
 
     /// Replace the whole listing. Called once per navigation, and again when a
@@ -495,9 +541,11 @@ fn fire_selection(handlers: &Selections) {
 pub(super) fn grid_factory(
     icon_size: Rc<Cell<i32>>,
     thumbs: Pipeline,
+    on_press: &ContextHandler,
 ) -> gtk::SignalListItemFactory {
     let factory = gtk::SignalListItemFactory::new();
     let size = Rc::clone(&icon_size);
+    let on_press = Rc::clone(on_press);
     factory.connect_setup(move |_factory, object| {
         let Some(item) = object.downcast_ref::<gtk::ListItem>() else {
             return;
@@ -513,6 +561,7 @@ pub(super) fn grid_factory(
         cell.append(&image);
         cell.append(&label);
         item.set_child(Some(&cell));
+        popup::attach(&cell, item, true, &on_press);
     });
     factory.connect_bind(move |_factory, object| {
         let Some(item) = object.downcast_ref::<gtk::ListItem>() else {
@@ -539,9 +588,11 @@ fn list_factory(
     column: Column,
     icon_size: Rc<Cell<i32>>,
     thumbs: Pipeline,
+    on_press: &ContextHandler,
 ) -> gtk::SignalListItemFactory {
     let factory = gtk::SignalListItemFactory::new();
     let size = Rc::clone(&icon_size);
+    let on_press = Rc::clone(on_press);
     factory.connect_setup(move |_factory, object| {
         let Some(item) = object.downcast_ref::<gtk::ListItem>() else {
             return;
@@ -555,17 +606,21 @@ fn list_factory(
         });
         label.set_xalign(if column == Column::Size { 1.0 } else { 0.0 });
         label.set_lines(1);
-        if column.is_name() {
+        // Every column carries the gesture, not just the name: a right-click on
+        // a size or a date is still a right-click on that row.
+        let cell: gtk::Widget = if column.is_name() {
             let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
             row.add_css_class("ufm-row");
             let image = gtk::Image::new();
             image.set_pixel_size(size.get());
             row.append(&image);
             row.append(&label);
-            item.set_child(Some(&row));
+            row.upcast()
         } else {
-            item.set_child(Some(&label));
-        }
+            label.upcast()
+        };
+        item.set_child(Some(&cell));
+        popup::attach(&cell, item, true, &on_press);
     });
     factory.connect_bind(move |_factory, object| {
         let Some(item) = object.downcast_ref::<gtk::ListItem>() else {

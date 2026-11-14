@@ -601,6 +601,117 @@ else
     ok "Close dismisses the dialog"
 fi
 
+# --- the context menu ----------------------------------------------------------------
+# The menu is built from the selection, so the row selected for the properties check
+# above is the one it is asked about. What is worth asserting is not that a popover
+# exists but that the rows drawn are the ones the policy says belong to one selected
+# folder, and that pressing one runs the window's own command rather than a private
+# copy of it — which is what the header menu and the keyboard already promise.
+#
+# The menu is opened by its action rather than by a right-click because the harness has
+# no pointer to inject, and the action is the honest way in: it is what the Menu key
+# does, it reads the same selection and the same folder, and it points the menu at the
+# focused row instead of at a cursor.
+#
+# Rows are identified by accelerator, not by label. `GTK` 4.22 rebuilt `GtkPopoverMenu`
+# on a widget tree, and the rows it produces answer `menu item` with an empty accessible
+# name — the label is drawn by a child that is not itself exposed — so a test cannot
+# reach a row by the text on it. What a row does carry is the chord installed for the
+# action it names, which is a handle on both the row and the accelerator table — the two
+# together are what a keyboard user sees. The `-` is the Open row, which has no
+# accelerator: plain `Return` already activates a row, so a chord for the same command
+# would be a second name for one thing.
+act context-menu "[]" "[]"
+if ! python3 "$A11Y" menu >/dev/null 2>&1; then
+    fail "the context menu opens over the selected row"
+elif [ -z "$(python3 "$A11Y" menu 2>/dev/null)" ]; then
+    fail "the context menu opens over the selected row (no rows in it)"
+else
+    ok "the context menu opens over the selected row"
+fi
+# The whole row set, compared as a set rather than row by row: a menu that grew a row
+# nobody asked for is as much a change as one that lost a row, and the comparison says
+# so in one line. `Control+V` is in it because the copy that fed the collision prompt is
+# still on the clipboard — a copy can be pasted more than once — and `Control+E` is not,
+# because the window is standing on an ordinary folder. The two together are the point of
+# the assertion: the rows track what the window can actually do right now, which is also
+# what keeps the header menu honest.
+want=$(printf '%s\n' - Shift+Control+N F2 Delete Shift+Delete Control+C Control+X Control+V Alt+Enter | sort)
+got=$(python3 "$A11Y" menu 2>/dev/null | sort)
+if [ "$got" = "$want" ]; then
+    ok "the menu holds exactly the rows for one folder, each carrying its chord"
+else
+    fail "the menu holds exactly the rows for one folder, each carrying its chord (got $(printf '%s' "$got" | tr '\n' ' '))"
+fi
+# The negative half, spelled out because it is the half a menu gets wrong: the window is
+# standing on an ordinary folder, so there is nothing to unpack and the row must not be
+# offered at all rather than offered and inert.
+if printf '%s\n' "$got" | grep -qF 'Control+E'; then
+    fail "the menu leaves out what the selection cannot do (Extract offered)"
+else
+    ok "the menu leaves out what the selection cannot do"
+fi
+# Pressing a row goes through the accessibility tree, so the assertion covers the whole
+# path: the model button, the `win.` action it names, and the prompt the action opens.
+# Cancelling rather than creating keeps the fixture as the checks below expect it.
+python3 "$A11Y" menu-press Shift+Control+N >/dev/null 2>&1 || true
+if wait_named "Folder name:"; then
+    ok "pressing a menu row runs the command it names"
+else
+    fail "pressing a menu row runs the command it names (no prompt)"
+fi
+python3 "$A11Y" press Cancel "New Folder" >/dev/null 2>&1 || true
+i=0
+while [ "$i" -lt 50 ] && printf '%s\n' "$DUMP" | grep -qF "$(printf 'frame\tNew Folder\t')"; do
+    refresh
+    i=$((i + 1))
+    sleep 0.2
+done
+# An open menu over a folder that is no longer on screen is a menu of commands for
+# somewhere the user has left, so navigation closes it. The menu is the only node of its
+# role in the tree — a closed popover has no item widgets, which is what made the check
+# above able to say the menu had opened at all — so counting them is the assertion.
+refresh
+if printf '%s\n' "$DUMP" | grep -qE "^menu"; then
+    fail "pressing a menu row closes the menu"
+else
+    ok "pressing a menu row closes the menu"
+fi
+act context-menu "[]" "[]"
+if python3 "$A11Y" menu 2>/dev/null | grep -qF 'F2'; then
+    act up "[]" "[]"
+    i=0
+    while [ "$i" -lt 50 ]; do
+        refresh
+        printf '%s\n' "$DUMP" | grep -qE "^menu" || break
+        i=$((i + 1))
+        sleep 0.2
+    done
+    if printf '%s\n' "$DUMP" | grep -qE "^menu"; then
+        fail "navigating away closes an open menu"
+    else
+        ok "navigating away closes an open menu"
+    fi
+    act back "[]" "[]"
+else
+    fail "navigating away closes an open menu (the menu would not open a second time)"
+fi
+# The last check of this section re-reads the tree rather than reusing the dump the
+# check above waited on, because the dump it would otherwise reuse was taken while the
+# window was still on the parent folder.
+i=0
+while [ "$i" -lt 50 ] && ! printf '%s\n' "$DUMP" |
+    grep -qF "$(printf 'frame\t%s\t' "$TARGET")"; do
+    refresh
+    i=$((i + 1))
+    sleep 0.2
+done
+if ! printf '%s\n' "$DUMP" | grep -qF "$(printf 'frame\t%s\t' "$TARGET")"; then
+    fail "the window is back on the folder the menu checks began from ($(printf '%s\n' "$DUMP" |
+        grep -E '^frame' | cut -f1,2 | tr '\n' ' '))"
+else
+    ok "the window is back on the folder the menu checks began from"
+fi
 # --- the search bar -----------------------------------------------------------------
 # The bar opens and the field takes text. Whether it finds anything depends on the
 # indexer, which is checked separately below; the field accepting input is the UI's job.

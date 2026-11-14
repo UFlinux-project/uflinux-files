@@ -61,6 +61,12 @@ the model over D-Bus and never opens a window.
   that has to be counted, so it says it is counting and the number arrives when a
   bounded walk finishes on a worker; a walk that stopped early says *at least*
   rather than stating a total it did not finish computing.
+- **A right-click menu that says what this folder allows**: the rows are built from
+  the selection and from where the click landed, so `Extract` appears only over
+  something unpackable and `Paste` only when the clipboard has something for this
+  folder. Each row activates the window's own action, which is why it is sensitive
+  exactly where the header menu and the keyboard are; `Menu` and `<Shift>F10` open
+  the same menu over the focused row.
 
 ## Layout
 

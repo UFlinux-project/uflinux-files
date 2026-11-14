@@ -43,6 +43,7 @@ use super::extract;
 use super::job::{Event, Handle, Queue};
 use super::ops;
 use super::panel::{Panel, Place, Usage};
+use super::popup::{self, Popup};
 use super::props;
 use super::row::Row;
 use super::search::{Found, Outcome, Search};
@@ -78,6 +79,12 @@ pub fn open(app: &gtk::Application, urls: &[String]) {
     let window = gtk::ApplicationWindow::new(app);
     window.set_default_size(1080, 680);
     window.set_title(Some(&start.display()));
+
+    // One menu per window, built before anything can ask for it. Parenting it to
+    // the window is what lets its rows carry `win.` action names, so a menu row is
+    // greyed out in exactly the places the header menu and the keyboard are greyed
+    // out rather than having a second set of rules of its own.
+    let popup = Popup::install(&window);
 
     let panel = Rc::new(Panel::new());
     // One preview pipeline per window: the worker, the queue and the token table
@@ -132,6 +139,7 @@ pub fn open(app: &gtk::Application, urls: &[String]) {
         find,
         shared: Rc::clone(&shared),
         handle: Rc::new(RefCell::new(None)),
+        popup: Rc::clone(&popup),
         thumbs: thumbs.clone(),
         // Filled in right after the queue, because the answer to a change is a
         // re-read and a re-read needs somewhere to report to.
@@ -183,6 +191,7 @@ pub fn open(app: &gtk::Application, urls: &[String]) {
             _thumbs: thumbs,
             _queue: queue,
             _live: live,
+            _popup: popup,
         });
     });
 }
@@ -271,6 +280,10 @@ struct Ctx {
     shared: Rc<Shared>,
     /// Filled in once the queue exists, which is after the handlers are built.
     handle: Rc<RefCell<Option<Handle>>>,
+    /// The right-click menu. Strong rather than weak: the handlers that fill it are
+    /// owned by widgets inside the window, and the menu is parented to that window,
+    /// so nothing else in the tree would keep it alive.
+    popup: Rc<Popup>,
     /// The folders this window has on screen, watched. `None` when the kernel
     /// refused an inotify instance, which leaves the window refreshing on
     /// navigation alone exactly as it did before there were watches.
@@ -380,8 +393,20 @@ impl History {
     /// Record a new location, dropping everything ahead of the cursor. Going
     /// somewhere new from the middle of the history invalidates the forward
     /// branch, which is what every browser does and what users expect.
+    ///
+    /// The location already visited is recognised by comparing it with the entry
+    /// under the cursor rather than with the tip of the list. Comparing with the
+    /// tip looks equivalent and is not: after up and back, the folder gone up
+    /// from is still the tip while the cursor has moved off it, and a push that
+    /// then returns early leaves the cursor where it was — so the window shows
+    /// the parent folder while the history believes it shows the child, and
+    /// `Back` has nowhere to go from the first entry.
     fn push(&mut self, location: Location) {
-        if self.items.last() == Some(&location) {
+        if self
+            .items
+            .get(self.index)
+            .is_some_and(|here| *here == location)
+        {
             return;
         }
         self.items.truncate(self.index + 1);
@@ -428,6 +453,10 @@ struct Window {
     /// Likewise the watch: dropping this detaches the source and releases the
     /// kernel watches. `None` when inotify refused an instance.
     _live: Option<Rc<Live>>,
+    /// The right-click menu. Parented to `top`, so it goes with the window; held
+    /// because a popover with no other owner is freed as soon as the call that
+    /// built it returns.
+    _popup: Rc<Popup>,
 }
 
 /// Where the first window should start.
@@ -483,6 +512,10 @@ fn navigate(ctx: &Ctx, location: Location, record: bool) {
     }
     ctx.path.set_label(&location.display());
     ctx.banner.set_visible(false);
+    // A menu left open over the folder being left would offer rows for rows that
+    // are about to be replaced, and points at a widget that may not survive the
+    // repaint.
+    ctx.popup.hide();
     // Results describe a query, not this folder, so they leave when the folder
     // does. `reset` rather than `clear`: the listing coming on screen is the
     // thing that replaces them, and reporting `Cleared` here would paint over it.
@@ -1326,6 +1359,19 @@ fn wire_handlers(panel: &Rc<Panel>, view: &Rc<View>, columns: &Rc<Columns>, ctx:
         let ctx = ctx.clone();
         move || sync_ops(&ctx)
     });
+    // One subscriber for both presentations, so that a right-click answers with the
+    // same menu wherever it lands. The row was selected before the press was
+    // reported — the view does that for itself, the panes in
+    // [`super::columns::build`] — so the menu is built from the selection like
+    // every other command is.
+    let on_context = {
+        let ctx = ctx.clone();
+        move |widget: &gtk::Widget, target: popup::Target, x: f64, y: f64| {
+            show_context_menu(&ctx, widget, target, x, y);
+        }
+    };
+    view.on_context(on_context.clone());
+    columns.on_context(on_context);
 }
 
 /// The window actions and their accelerators. Split in three because each part
@@ -1335,6 +1381,7 @@ fn wire_actions(app: &gtk::Application, window: &gtk::ApplicationWindow, ctx: &C
     let mut actions = nav_actions(ctx);
     actions.extend(view_actions(app, ctx));
     actions.extend(op_actions(ctx));
+    actions.extend(context_actions(ctx));
     for action in &actions {
         ActionMapExt::add_action(window, action.as_ref());
     }
@@ -1779,11 +1826,90 @@ fn sync_paste(ctx: &Ctx) {
     let Some(window) = ctx.window.upgrade() else {
         return;
     };
-    let can = {
-        let state = ctx.shared.state.borrow();
-        !state.clipboard.is_empty() && state.current.as_ref().is_some_and(Location::is_real)
+    enable(&window, "paste", can_paste(ctx));
+}
+
+/// Whether Paste would have anything to do here: something on the clipboard, and a
+/// real folder to put it in. One answer for the action's sensitivity and for
+/// whether the context menu offers the row at all.
+fn can_paste(ctx: &Ctx) -> bool {
+    let state = ctx.shared.state.borrow();
+    !state.clipboard.is_empty() && state.current.as_ref().is_some_and(Location::is_real)
+}
+
+/// The two commands the context menu needs that nothing else had reason to have.
+///
+/// `open` is the menu's version of pressing Enter: the other rows are commands
+/// that already have an action, and a menu that could not enter a folder would be
+/// a menu of edits only. `context-menu` is the keyboard's and the test harness's
+/// way of opening the same popover without a pointer to follow.
+fn context_actions(ctx: &Ctx) -> Vec<Rc<gio::SimpleAction>> {
+    let open = gio::SimpleAction::new("open", None);
+    open.connect_activate({
+        let ctx = ctx.clone();
+        move |_action, _parameter| {
+            // Exactly one row, which is also what the menu offers Open for.
+            let picked = targets(&ctx);
+            let [entry] = picked.as_slice() else {
+                return;
+            };
+            activate_entry(&ctx, entry);
+        }
+    });
+
+    let menu = gio::SimpleAction::new("context-menu", None);
+    menu.connect_activate({
+        let ctx = ctx.clone();
+        move |_action, _parameter| {
+            let Some(window) = ctx.window.upgrade() else {
+                return;
+            };
+            // No pointer, so the menu points at the focused row instead. The rows
+            // are the ones for the folder on screen, which is what a keyboard user
+            // standing in a folder means by "the menu here".
+            ctx.popup.hide();
+            ctx.popup.show(&window, &menu_rows(&ctx, true), None);
+        }
+    });
+
+    vec![Rc::new(open), Rc::new(menu)]
+}
+
+/// The rows for a menu opened without a press, from the state the window is in.
+fn menu_rows(ctx: &Ctx, in_current: bool) -> Vec<popup::Command> {
+    let picked = targets(ctx);
+    let scope = popup::Scope {
+        in_current,
+        extracting: extract_target(ctx).is_some(),
+        pastable: can_paste(ctx),
     };
-    enable(&window, "paste", can);
+    popup::rows_for(&picked, scope)
+}
+
+/// Open the menu over a press. `widget` and the coordinates are the press itself,
+/// so the menu appears under the pointer rather than at some default spot.
+///
+/// A press off the rows asks for the folder's menu even when rows are still
+/// selected: the user clicked the folder, and a menu of row commands there would
+/// answer a question that was not asked.
+fn show_context_menu(ctx: &Ctx, widget: &gtk::Widget, target: popup::Target, x: f64, y: f64) {
+    let Some(window) = ctx.window.upgrade() else {
+        return;
+    };
+    let picked = target.position().map_or_else(Vec::new, |_| targets(ctx));
+    let scope = popup::Scope {
+        in_current: target.in_current(),
+        // Asked of the window rather than of the rows: the answer is the same
+        // whenever the menu would have a row to unpack, and the action's own
+        // sensitivity is what stops a stale answer from doing anything.
+        extracting: extract_target(ctx).is_some(),
+        pastable: can_paste(ctx),
+    };
+    ctx.popup.show(
+        &window,
+        &popup::rows_for(&picked, scope),
+        Some((widget, x, y)),
+    );
 }
 
 /// The keyboard. Set on the application rather than the window, so a shortcut
@@ -1826,6 +1952,10 @@ fn install_accels(app: &gtk::Application) {
     // plain `Return` activates a row, which is the one thing a file manager can
     // never give up.
     app.set_accels_for_action("win.properties", &["<Alt>Return"]);
+    // The Menu key, and the chord for keyboards without one. Both go to the same
+    // action the pointer uses, so the keyboard gets the same menu rather than a
+    // shorter list chosen because it was cheaper to build.
+    app.set_accels_for_action("win.context-menu", &["Menu", "<Shift>F10"]);
     for mode in [ViewMode::Grid, ViewMode::List, ViewMode::Columns] {
         app.set_accels_for_action(
             &format!("win.mode::{}", mode_name(mode)),
@@ -1970,6 +2100,24 @@ mod tests {
         history.push(location("a"));
         assert_eq!(history.items.len(), 1);
         assert!(!history.can_back());
+    }
+
+    // Going up and back and up again, which is the shape the up button makes a
+    // user walk: the parent is recorded, the child is returned to, and the parent
+    // is visited a second time. The second visit must move the cursor back to the
+    // entry that is already there rather than being ignored, because a cursor left
+    // behind reports the wrong window for the history and strands `Back`.
+    #[test]
+    fn returning_to_a_folder_that_is_still_recorded_rejoins_it() {
+        let mut history = History::default();
+        history.push(location("child"));
+        history.push(location("parent"));
+        history.go_back();
+        assert_eq!(history.items.get(history.index), Some(&location("child")));
+        history.push(location("parent"));
+        assert_eq!(history.items.len(), 2);
+        assert_eq!(history.index, 1);
+        assert_eq!(history.go_back(), Some(location("child")));
     }
 
     #[test]
