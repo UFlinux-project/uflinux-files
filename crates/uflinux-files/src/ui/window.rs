@@ -34,6 +34,7 @@ use ufm_core::paths;
 use ufm_core::sort::SortKey;
 use ufm_vfs::{Cancel, FsHints, Readers};
 
+use super::columns::Columns;
 use super::job::{Event, Handle, Queue};
 use super::panel::{Panel, Place, Usage};
 use super::row::Row;
@@ -71,6 +72,7 @@ pub fn open(app: &gtk::Application, urls: &[String]) {
     let panel = Rc::new(Panel::new());
     let view = Rc::new(View::new(key));
     view.set_mode(mode);
+    let columns = Rc::new(Columns::new(Arc::clone(&readers), key, prefs.show_hidden));
     let (banner, banner_label) = banner_bar();
     let path = path_label(&start);
 
@@ -80,10 +82,24 @@ pub fn open(app: &gtk::Application, urls: &[String]) {
         readers,
     });
 
+    // The presentations that are not the grid/list stack. Columns is a sibling
+    // of the view rather than a child of it, because it keeps one model per
+    // folder instead of one model for the window.
+    let modes = gtk::Stack::new();
+    modes.add_named(view.widget(), Some("view"));
+    modes.add_named(columns.widget(), Some("columns"));
+    modes.set_hexpand(true);
+    modes.set_vexpand(true);
+    if mode == ViewMode::Columns {
+        modes.set_visible_child_name("columns");
+    }
+
     let ctx = Ctx {
         window: window.downgrade(),
         panel: Rc::downgrade(&panel),
         view: Rc::downgrade(&view),
+        columns: Rc::clone(&columns),
+        modes,
         path,
         banner,
         banner_label,
@@ -105,12 +121,13 @@ pub fn open(app: &gtk::Application, urls: &[String]) {
         }
     };
     *ctx.handle.borrow_mut() = Some(queue.handle());
+    ctx.columns.set_handle(queue.handle());
 
     let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
     content.append(&ctx.banner);
     let split = gtk::Paned::new(gtk::Orientation::Horizontal);
     split.set_start_child(Some(panel.widget()));
-    split.set_end_child(Some(view.widget()));
+    split.set_end_child(Some(&ctx.modes));
     split.set_shrink_start_child(false);
     split.set_position(220);
     content.append(&split);
@@ -120,18 +137,7 @@ pub fn open(app: &gtk::Application, urls: &[String]) {
 
     panel.set_places(places(&shared));
     panel.set_usage(usages(&shared));
-    panel.on_open({
-        let ctx = ctx.clone();
-        move |place| navigate(&ctx, place.location(), true)
-    });
-    view.on_activate({
-        let ctx = ctx.clone();
-        move |row| activate(&ctx, row)
-    });
-    view.install_headers({
-        let ctx = ctx.clone();
-        move |sort| resort(&ctx, sort)
-    });
+    wire_handlers(&panel, &view, &columns, &ctx);
 
     wire_actions(app, &window, &ctx);
     window.connect_close_request({
@@ -162,6 +168,7 @@ pub fn open(app: &gtk::Application, urls: &[String]) {
             top: window,
             _panel: panel,
             _view: view,
+            _columns: columns,
             _shared: shared,
             _queue: queue,
         });
@@ -175,6 +182,12 @@ struct Ctx {
     window: glib::WeakRef<gtk::ApplicationWindow>,
     panel: Weak<Panel>,
     view: Weak<View>,
+    /// Strong rather than weak: the columns widget owns the listings its panes
+    /// cached, and the handlers that write into it hold this same `Rc`. The
+    /// cycle is broken by the window, which is what drops the last one.
+    columns: Rc<Columns>,
+    /// Grid/list against columns. The view keeps its own stack inside this one.
+    modes: gtk::Stack,
     path: gtk::Label,
     banner: gtk::Box,
     banner_label: gtk::Label,
@@ -286,6 +299,7 @@ struct Window {
     top: gtk::ApplicationWindow,
     _panel: Rc<Panel>,
     _view: Rc<View>,
+    _columns: Rc<Columns>,
     _shared: Rc<Shared>,
     /// Removing the fd source is what stops the wake-ups; the field owns it.
     _queue: Queue,
@@ -347,6 +361,11 @@ fn navigate(ctx: &Ctx, location: Location, record: bool) {
     ctx.path.set_label(&location.display());
     ctx.banner.set_visible(false);
     view.set_entries(Vec::new());
+    // Only while columns are on screen: building a chain reads every folder on
+    // the path, and in grid mode that is work for panes nobody can see.
+    if columns_on(ctx) {
+        ctx.columns.show_chain(&location);
+    }
     if let Some(panel) = ctx.panel.upgrade() {
         match place_for(&location) {
             Some(place) => panel.select(&place),
@@ -421,6 +440,10 @@ impl ufm_vfs::ListingSink for Sink {
 
 /// Put one delivered event on screen.
 fn apply(ctx: &Ctx, event: Event) {
+    // First for the columns, which match events against their own panes rather
+    // than against the window's current folder: a parent column's listing is not
+    // for the folder in the title bar, and the check below would drop it.
+    ctx.columns.apply(&event);
     let Some(view) = ctx.view.upgrade() else {
         return;
     };
@@ -467,6 +490,7 @@ fn resort(ctx: &Ctx, key: SortKey) {
         return;
     };
     view.resort(key);
+    ctx.columns.resort(key);
     let current = ctx.shared.state.borrow().current.clone();
     if let Some(location) = current {
         ctx.shared.prefs.borrow_mut().set_sort_for(&location, key);
@@ -476,24 +500,46 @@ fn resort(ctx: &Ctx, key: SortKey) {
 
 /// React to the user opening a row.
 fn activate(ctx: &Ctx, row: &Row) {
-    let (location, navigable, name) = row.with(|entry| {
-        (
-            entry.location.clone(),
-            entry.navigable(),
-            entry.name.clone(),
-        )
-    });
-    if navigable {
-        navigate(ctx, location, true);
+    let entry = row.entry();
+    activate_entry(ctx, &entry);
+}
+
+/// Open one entry. Takes an [`Entry`] rather than a row so that the column
+/// panes, whose rows are their own widgets, can share the path.
+fn activate_entry(ctx: &Ctx, entry: &Entry) {
+    if entry.navigable() {
+        navigate(ctx, entry.location.clone(), true);
         return;
     }
-    let uri = location.as_path().map_or_else(
-        || location.to_string().into(),
+    let uri = entry.location.as_path().map_or_else(
+        || entry.location.to_string().into(),
         |path| gio::File::for_path(path).uri(),
     );
     if let Err(error) = gio::AppInfo::launch_default_for_uri(&uri, None::<&gio::AppLaunchContext>) {
-        show_banner(ctx, &format!("Cannot open {name}: {error}"));
+        show_banner(ctx, &format!("Cannot open {}: {error}", entry.name));
     }
+}
+
+/// Go to the folder above the one on screen, from the toolbar or from the
+/// keyboard in a column pane.
+fn go_up(ctx: &Ctx) {
+    let target = ctx
+        .shared
+        .state
+        .borrow()
+        .current
+        .as_ref()
+        .and_then(Location::parent);
+    if let Some(location) = target {
+        navigate(ctx, location, true);
+    }
+}
+
+/// Whether the columns are what the user is looking at right now.
+fn columns_on(ctx: &Ctx) -> bool {
+    ctx.modes
+        .visible_child_name()
+        .is_some_and(|name| name == "columns")
 }
 
 /// Narrow the listing to the rows whose name contains `query`, ignoring case.
@@ -643,7 +689,11 @@ fn folder_filter(ctx: &Ctx) -> gtk::SearchEntry {
             };
             ctx.shared.state.borrow_mut().query = text;
             if let Some(view) = ctx.view.upgrade() {
-                view.set_entries(filtered);
+                view.set_entries(filtered.clone());
+            }
+            let current = ctx.shared.state.borrow().current.clone();
+            if let Some(location) = current {
+                ctx.columns.set_filter(&location, &filtered);
             }
         }
     });
@@ -654,7 +704,11 @@ fn folder_filter(ctx: &Ctx) -> gtk::SearchEntry {
             let shown = ctx.shared.state.borrow().shown.clone();
             ctx.shared.state.borrow_mut().query.clear();
             if let Some(view) = ctx.view.upgrade() {
-                view.set_entries(shown);
+                view.set_entries(shown.clone());
+            }
+            let current = ctx.shared.state.borrow().current.clone();
+            if let Some(location) = current {
+                ctx.columns.set_filter(&location, &shown);
             }
         }
     });
@@ -701,6 +755,34 @@ fn mode_named(name: &str) -> Option<ViewMode> {
     }
 }
 
+/// Say what each component does when the user acts on it. Every one of these
+/// handlers outlives the call that installed it, so each takes a clone of the
+/// context and reaches the component it writes to through a weak reference.
+fn wire_handlers(panel: &Rc<Panel>, view: &Rc<View>, columns: &Rc<Columns>, ctx: &Ctx) {
+    panel.on_open({
+        let ctx = ctx.clone();
+        move |place| navigate(&ctx, place.location(), true)
+    });
+    view.on_activate({
+        let ctx = ctx.clone();
+        move |row| activate(&ctx, row)
+    });
+    view.install_headers({
+        let ctx = ctx.clone();
+        move |sort| resort(&ctx, sort)
+    });
+    // The columns report an `Entry` rather than a row: a pane's rows are its own
+    // widgets, and the entry underneath them is the part the window understands.
+    columns.on_open({
+        let ctx = ctx.clone();
+        move |entry| activate_entry(&ctx, entry)
+    });
+    columns.on_up({
+        let ctx = ctx.clone();
+        move || go_up(&ctx)
+    });
+}
+
 /// The window actions and their accelerators. Split in three because each part
 /// is a coherent set — moving, displaying, and the extras — and one function
 /// holding all of them is longer than it is deep.
@@ -741,24 +823,17 @@ fn nav_actions(ctx: &Ctx) -> Vec<Rc<gio::SimpleAction>> {
     let up = gio::SimpleAction::new("up", None);
     up.connect_activate({
         let ctx = ctx.clone();
-        move |_action, _parameter| {
-            let target = ctx
-                .shared
-                .state
-                .borrow()
-                .current
-                .as_ref()
-                .and_then(Location::parent);
-            if let Some(location) = target {
-                navigate(&ctx, location, true);
-            }
-        }
+        move |_action, _parameter| go_up(&ctx)
     });
 
     let refresh = gio::SimpleAction::new("refresh", None);
     refresh.connect_activate({
         let ctx = ctx.clone();
         move |_action, _parameter| {
+            // The cached parent columns first, then the folder itself, which is
+            // what `navigate` re-reads. Without the first half a refresh would
+            // leave a stale column on screen next to a fresh one.
+            ctx.columns.reload();
             let current = ctx.shared.state.borrow().current.clone();
             if let Some(location) = current {
                 navigate(&ctx, location, false);
@@ -795,8 +870,21 @@ fn view_actions(app: &gtk::Application, ctx: &Ctx) -> Vec<Rc<gio::SimpleAction>>
             let Some(mode) = mode_named(&name) else {
                 return;
             };
+            let columns = mode == ViewMode::Columns;
+            let was_columns = columns_on(&ctx);
             if let Some(view) = ctx.view.upgrade() {
                 view.set_mode(mode);
+            }
+            ctx.modes
+                .set_visible_child_name(if columns { "columns" } else { "view" });
+            // Coming back to columns after a while, or arriving here for the
+            // first time: the chain has to be built, and any pane that was
+            // dropped while hidden has to come back.
+            if columns && !was_columns {
+                let current = ctx.shared.state.borrow().current.clone();
+                if let Some(location) = current {
+                    ctx.columns.show_chain(&location);
+                }
             }
             action.set_state(&name.to_variant());
             let current = ctx.shared.state.borrow().current.clone();
@@ -821,6 +909,8 @@ fn view_actions(app: &gtk::Application, ctx: &Ctx) -> Vec<Rc<gio::SimpleAction>>
             let show = value.and_then(glib::Variant::get::<bool>).unwrap_or(false);
             ctx.shared.prefs.borrow_mut().show_hidden = show;
             action.set_state(&show.to_variant());
+            // Cached panes were read under the other rule.
+            ctx.columns.set_show_hidden(show);
             let current = ctx.shared.state.borrow().current.clone();
             if let Some(location) = current {
                 navigate(&ctx, location, false);

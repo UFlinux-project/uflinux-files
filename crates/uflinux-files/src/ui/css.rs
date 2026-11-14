@@ -73,6 +73,9 @@ label.ufm-banner {
 box.ufm-pane {
     border-right: 1px solid alpha(currentColor, 0.12);
 }
+box.ufm-columns {
+    background-color: alpha(currentColor, 0.02);
+}
 ";
 
 /// Install the stylesheet for the current display.
@@ -119,6 +122,7 @@ mod tests {
             "ufm-crumb",
             "ufm-banner",
             "ufm-pane",
+            "ufm-columns",
             "ufm-grid",
             "ufm-list",
             "ufm-row",

@@ -450,7 +450,10 @@ fn fire(handlers: &Activators, row: &Row) {
 }
 
 /// Grid and columns mode: icon above a wrapped name, centred.
-fn grid_factory(icon_size: Rc<Cell<i32>>) -> gtk::SignalListItemFactory {
+///
+/// Shared with the column panes so that a folder looks the same in the grid and
+/// in a Miller column, and so there is one factory to keep correct.
+pub(super) fn grid_factory(icon_size: Rc<Cell<i32>>) -> gtk::SignalListItemFactory {
     let factory = gtk::SignalListItemFactory::new();
     let size = Rc::clone(&icon_size);
     factory.connect_setup(move |_factory, object| {

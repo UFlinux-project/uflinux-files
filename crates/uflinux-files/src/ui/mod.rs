@@ -10,15 +10,16 @@
 //! not need.
 //!
 //! Everything in this directory runs on the main thread. Reading a directory is
-//! the one thing that must not, so [`view`] receives listings that
-//! [`super::runner`] produced elsewhere and only ever splices them into the
-//! model.
+//! the one thing that must not, so [`view`] and [`columns`] receive listings
+//! that a worker thread produced elsewhere (see [`job`]) and only ever splice
+//! them into the model.
 
 // The window, and the modules that follow it, are what make these live. Until
 // `ui()` builds a window, nothing here is reachable from `main`, and a warning
 // per public item would be noise about work in progress rather than about code.
 #![allow(dead_code)]
 
+mod columns;
 mod css;
 mod job;
 mod panel;
