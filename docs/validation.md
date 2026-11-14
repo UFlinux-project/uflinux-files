@@ -65,18 +65,51 @@ there loses the user's window, not just the file.
 ## Mounts
 
 `tests/mount-fixture.sh` cannot be a unit test, because the thing being tested is a
-process boundary. It asserts:
+process boundary. It runs against the built binary and the built helper, and skips
+rather than fails wherever it cannot mount, so it needs a container that can:
 
-- the mount table matches what was attempted, including after a failure;
-- unmounting leaves no stale entry and no leftover directory;
-- **no credential ever appears in `/proc/*/cmdline`** for any child spawned;
-- a stale mountpoint is swept by `--sweep-mounts` and a live one is not.
+```sh
+podman run --rm --cap-add=CAP_SYS_ADMIN --device /dev/fuse \
+    -v "$PWD":/src:z -w /src -e CARGO_TARGET_DIR=/tmp/t IMAGE \
+    sh -c 'cargo build -p uflinux-files -p uflinux-files-mount &&
+           sh tests/mount-fixture.sh /tmp/t/debug/uflinux-files \
+                                     /tmp/t/debug/uflinux-files-mount'
+```
+
+The helper resolves `mount` and `umount` from a fixed list of directories and ignores
+`$PATH`, which is the point of it and also why the fixture installs a shim over
+`/usr/bin/mount` rather than putting one earlier in the path. The shim records the argv
+it was handed and then mounts `tmpfs` whatever it was asked for: what is being certified
+is the helper's checks and the exact words it passes on, not that a server answers. The
+fixture asserts:
+
+- the argv handed to `mount(8)` is the one the plan described, word for word and in
+  position, and a mount the helper reports really appears in `/proc/self/mountinfo`;
+- a failing mount exits 1 and leaves an empty directory and no kernel entry;
+- **no credential ever appears in `/proc/*/cmdline`** for any child spawned — scanned
+  from a loop while the mount child is alive, not after it exits, because the exposure
+  being ruled out is the window in which the child runs;
+- `pass=`, a group-readable password file, a symlink mount point, and a mount point
+  belonging to somebody else are each refused before anything runs, and mounting over a
+  live mount says so instead of hiding the old one;
+- unmounting detaches, and doing it again is a no-op rather than an error;
+- a stale mountpoint is swept by `--sweep-mounts` and a live one is not, that the
+  report's claims all actually happened, that the table on disk then matches what is
+  mounted, that a non-empty orphan is reported but kept, and that `--idle-after` detaches
+  an idle FUSE share with no privilege escalation and takes its mount point with it.
+
+The stale mount is real: `sshfs` against a local `sshd`, then `kill -9` on the daemon,
+which leaves the kernel entry and makes the mount point answer `ENOTCONN`. That is the
+state a sweep exists to notice and the reason this file cannot be faked with a synthetic
+mount table.
 
 What this does **not** certify: that a real SMB server accepts the options, or that a
 real `davfs2` setuid helper works with the group and config on the target image. Those
 are open items in the plan and need the installed image, not a fixture. `sshfs` is
 tested against a real `sshd` on localhost, which proves the plumbing and not the
-server.
+server. The privileged detach path goes through the helper directly rather than through
+`pkexec`, because `pkexec` does not run in the test container; the unit tests cover the
+argv `pkexec` would be handed.
 
 ## UI
 
