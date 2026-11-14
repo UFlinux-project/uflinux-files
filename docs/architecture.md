@@ -78,11 +78,34 @@ rows immediately instead of after the last one. `Cancel` is a flag the reader
 checks between batches; leaving a folder mid-read is the common case, not an
 error.
 
-`DirCache` holds at most 64 directories and 20 000 entries for 30 seconds. It is
-not yet wired into `Readers`, so a folder is read again on every visit; what it
-will serve is the column chain, where the same directory is read on every
-navigation that passes through it. See `docs/validation.md` for how that gap is
-tracked.
+`DirCache` sits inside `LocalReader` and holds at most 64 directories and 20 000
+entries for 30 seconds, which is what makes Back repaint rather than re-walk. A hit
+is served as one sorted listing and no batches, because batching exists to paint
+something while `readdir` is still running and there is no `readdir` on this path;
+the count a caller gets back is the number of rows handed over either way, so
+nothing upstream has to know a hit happened. What is stored is exactly what the view
+was given — filtered, sorted, and stored only after the listing has been handed over,
+so a read cancelled part way through leaves nothing behind. An empty folder is cached
+too: it is the folder the user just emptied.
+
+The key is the path plus the view state that changes the answer — sort field,
+direction, folders-first, hidden, and the filter text — because a listing sorted by
+size is not a listing sorted by name and showing the wrong rows is worse than
+reading twice. Only a real directory can be a key at all: an archive location's path
+names its *container*, so every folder inside one archive would collide, and
+rewriting the container emits no inotify event to notice.
+
+Correctness rests on invalidation rather than on short lifetimes, so every path that
+means "look again" forgets first. The unit of that is `invalidate_around`, which drops
+the folder's own listing, its parents', and everything below it. The parents matter
+because of the shape of the window: a file created in `src` makes the `projects`
+column stale, not the `src` column, whose rows the window re-reads anyway — and a
+caller holding one path cannot say which column a change shows up in. So a watch event
+invalidates each reported path, a finished file operation invalidates each folder it
+reported (including the source of a move, which is nowhere on screen and so gets no
+re-read to do it), a mount invalidates its mount point's neighbourhood, a sweep
+invalidates what it detached, and the reload button drops the whole cache. Navigation
+deliberately does not: that is the point.
 
 ## Live updates
 
@@ -114,6 +137,11 @@ A change that arrives while a listing is already on its way is only noted, and
 answered once that listing lands. Without that rule a program writing forty files
 cancels forty reads and walks the folder forty times; with it the burst costs one
 walk, and the listing that was already coming usually answers it for free.
+
+Every re-read that a watch event triggers drops the cache for the reported paths
+first. A re-read served from the cache shows the very rows the event was reported in
+order to get rid of, and a column that is not re-read at all still has to forget what
+it remembered, or the next visit to it paints a folder as it was before the change.
 
 ## Archives
 

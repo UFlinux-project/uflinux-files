@@ -213,6 +213,20 @@ impl DirCache {
         self.remove_if(|k| k.path.starts_with(path));
     }
 
+    /// Drop the listing for `path`, for its parents, and for everything below it
+    /// — the answer to "something changed at or inside this folder".
+    ///
+    /// [`DirCache::invalidate_subtree`] reaches down the tree and misses the
+    /// columns above it, which are the ones a Miller-column view keeps open
+    /// beside the folder being worked in: a file created in `src` makes the
+    /// `projects` column stale, not the `src` column, whose rows the window
+    /// re-reads anyway. The folder itself is included so a caller never has to
+    /// work out whether the path it holds names the changed folder or one of its
+    /// parents; both readings of the same event drop the same set of listings.
+    pub fn invalidate_around(&self, path: &Path) {
+        self.remove_if(|k| path.starts_with(&k.path) || k.path.starts_with(path));
+    }
+
     fn remove_if(&self, reject: impl Fn(&Key) -> bool) {
         let mut store = self.lock();
         let doomed: Vec<Key> = store
@@ -435,6 +449,29 @@ mod tests {
         cache.invalidate_subtree(&root);
         assert_eq!(cache.len(), 1, "only the unrelated directory survives");
         assert!(hit(&cache, &dir_at("unrelated")).is_some());
+    }
+
+    #[test]
+    fn an_around_invalidation_reaches_parents_and_children() {
+        let root = dir_at("around");
+        let parent = root.parent().unwrap_or(root.as_path()).to_path_buf();
+        let child = root.join("inner");
+        let other = dir_at("unrelated");
+        let cache = DirCache::new();
+        for dir in [&root, &parent, &child, &other] {
+            cache.store(
+                &Location::file(dir),
+                SortKey::default(),
+                false,
+                None,
+                listing(dir, &["a"]),
+            );
+        }
+        assert_eq!(cache.len(), 4);
+
+        cache.invalidate_around(&root);
+        assert_eq!(cache.len(), 1, "only the unrelated directory survives");
+        assert!(hit(&cache, &other).is_some());
     }
 
     #[test]

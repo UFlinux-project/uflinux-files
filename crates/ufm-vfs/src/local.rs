@@ -24,9 +24,10 @@ use ufm_core::location::Location;
 use ufm_core::paths;
 use ufm_core::sort::{SortKey, filter_entries, sort_entries};
 
+use crate::cache::DirCache;
 use crate::cancel::Cancel;
 use crate::fsinfo::{FsHints, FsInfo};
-use crate::{CHUNK, DirReader, ListingSink};
+use crate::{CHUNK, CachedListing, DirReader, ListingSink};
 
 /// Extensions that the views treat as enterable containers. The archive reader
 /// decides what it can actually open; this list only decides what gets a
@@ -36,11 +37,18 @@ const ARCHIVE_EXTENSIONS: &[&str] = &[
     "deb", "odt", "ods", "odp", "epub", "docx", "xlsx", "pptx", "apkapp", "war", "ear", "whl",
 ];
 
-/// Reads a real directory. Cheap to construct and share; the only state is the
-/// filesystem-capability cache.
+/// Reads a real directory. Cheap to construct and share; the state is the
+/// filesystem-capability cache and the listing cache.
+///
+/// The listing cache is what makes Back instant. Without it the button re-reads
+/// the directory, re-stats every entry and re-sorts, so the one action the user
+/// expects to cost nothing costs a full walk — and on a mounted share a round
+/// trip. See [`DirCache`] for the budget, and for why correctness rests on
+/// invalidation rather than on short lifetimes.
 #[derive(Default)]
 pub struct LocalReader {
     fsinfo: FsInfo,
+    cache: DirCache,
 }
 
 impl LocalReader {
@@ -57,6 +65,30 @@ impl LocalReader {
     #[must_use]
     pub fn hints(&self, path: &Path) -> FsHints {
         self.fsinfo.hints(path)
+    }
+
+    /// Forget what is cached about one folder: its own listing, the listings of
+    /// its parents, and the listings below it.
+    ///
+    /// Called by whoever knows the folder changed: a watch event, a file
+    /// operation that reported it. Without it a re-read would be served from the
+    /// cache and show the very rows the caller was trying to get rid of, so every
+    /// path that means "look again" has to come through here first. The parents
+    /// are included because a caller cannot say which column a change shows up
+    /// in — see [`DirCache::invalidate_around`].
+    pub fn invalidate_around(&self, path: &Path) {
+        self.cache.invalidate_around(path);
+    }
+
+    /// Forget every cached listing. This is what a reload button means.
+    pub fn clear_listings(&self) {
+        self.cache.clear();
+    }
+
+    /// Entries held across all cached listings, for the memory bench.
+    #[must_use]
+    pub fn cached_entries(&self) -> usize {
+        self.cache.entry_total()
     }
 
     /// Read `path` into `all`, reporting every [`CHUNK`] entries. Returns the
@@ -193,10 +225,23 @@ impl DirReader for LocalReader {
             .ok_or_else(|| Error::InvalidLocation(format!("{location}: not a local path")))?;
         cancel.ensure_active()?;
 
+        // A listing the same request produced before, painted again without a
+        // walk. A hit arrives as one batch rather than in chunks: the entries are
+        // already in memory, so chunking them would only delay the moment the
+        // view holds the whole folder.
+        if let Some(listing) = self.cache.get(location, key, show_hidden, query) {
+            return Ok(replay(listing, sink));
+        }
+
         let mut all = Vec::new();
         let total = self.collect(path, &mut all, cancel, sink)?;
         if total == 0 && all.is_empty() {
             sink.sorted(&[]);
+            // An empty folder is worth caching too: it is the folder the user just
+            // emptied, and the one where a re-read costs most in proportion to
+            // what comes back.
+            self.cache
+                .store(location, key, show_hidden, query, Vec::new());
             return Ok(0);
         }
 
@@ -204,6 +249,11 @@ impl DirReader for LocalReader {
         sort_entries(&mut all, key);
         let count = all.len();
         sink.sorted(&all);
+        // Stored after the listing has been handed over, so a read that was
+        // cancelled part way through — which returns early, with an error — cannot
+        // leave a partial folder behind. What is stored is exactly what the view
+        // was given, which is what lets a hit repaint without re-sorting.
+        self.cache.store(location, key, show_hidden, query, all);
         Ok(count)
     }
 
@@ -280,6 +330,22 @@ fn select(all: &[Entry], indices: &[usize]) -> Vec<Entry> {
         .filter_map(|i| all.get(*i))
         .cloned()
         .collect()
+}
+
+/// Hand a cached listing over as if it had just been read.
+///
+/// No batches, just the one sorted call — the same shape an empty folder already
+/// uses. The reason for batching is to paint something while `readdir` is still
+/// running, and there is no `readdir` here: the entries are already in memory,
+/// already filtered and already sorted. Appending them as a batch would have the
+/// view add rows it is about to throw away, since the sorted call replaces the
+/// model. The returned count is the number of rows handed over, which is what a
+/// read of the same folder reports, so a caller cannot tell a hit from a miss by
+/// the number.
+fn replay(listing: CachedListing, sink: &mut dyn ListingSink) -> usize {
+    let count = listing.entries.len();
+    sink.sorted(&listing.entries);
+    count
 }
 
 /// Map metadata to a kind. A directory on a different device than its parent is
@@ -576,6 +642,168 @@ mod tests {
         assert!(!find("link").flags.contains(EntryFlags::BROKEN));
         assert!(find("broken").flags.contains(EntryFlags::BROKEN));
         assert!(find(".dotfile").flags.contains(EntryFlags::HIDDEN));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_second_read_of_the_same_folder_is_served_from_memory() {
+        // The whole point of the cache: the second visit must not walk the
+        // directory again. A walk reports chunks, so a silent sink proves the
+        // listing came out of the cache rather than off the disk.
+        #[derive(Default)]
+        struct Tally {
+            batches: usize,
+            sorted: usize,
+        }
+
+        impl ListingSink for Tally {
+            fn batch(&mut self, _entries: &[Entry]) {
+                self.batches += 1;
+            }
+            fn sorted(&mut self, entries: &[Entry]) {
+                self.sorted = entries.len();
+            }
+        }
+
+        let dir = fixture("replay");
+        let reader = LocalReader::new();
+        let location = Location::file(&dir);
+        let cancel = Cancel::default();
+
+        let mut first = Tally::default();
+        let a = reader
+            .read_streaming(
+                &location,
+                SortKey::default(),
+                false,
+                None,
+                &cancel,
+                &mut first,
+            )
+            .unwrap();
+        assert!(first.batches > 0, "a real read reports chunks");
+        assert_eq!(reader.cached_entries(), a);
+
+        let mut second = Tally::default();
+        let b = reader
+            .read_streaming(
+                &location,
+                SortKey::default(),
+                false,
+                None,
+                &cancel,
+                &mut second,
+            )
+            .unwrap();
+        assert_eq!(a, b, "the caller cannot tell a hit from a miss");
+        assert_eq!(second.batches, 0, "a hit arrives as one listing");
+        assert_eq!(second.sorted, a);
+
+        // A file created in between is invisible until the folder is forgotten,
+        // which is what makes invalidation the load-bearing part of this design.
+        fs::write(dir.join("later.txt"), b"x").unwrap();
+        let stale = read(&reader, &dir, false, None);
+        assert!(!stale.iter().any(|e| e.name == "later.txt"));
+
+        reader.invalidate_around(&dir);
+        assert_eq!(reader.cached_entries(), 0);
+        let fresh = read(&reader, &dir, false, None);
+        assert!(fresh.iter().any(|e| e.name == "later.txt"));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_changed_view_state_is_not_served_from_the_previous_one() {
+        #[derive(Default)]
+        struct Blank;
+
+        impl ListingSink for Blank {
+            fn batch(&mut self, _entries: &[Entry]) {}
+            fn sorted(&mut self, _entries: &[Entry]) {}
+        }
+
+        let dir = fixture("view-state");
+        let reader = LocalReader::new();
+        let location = Location::file(&dir);
+
+        let plain = read(&reader, &dir, false, None).len();
+        assert_eq!(reader.cached_entries(), plain, "one listing is held");
+
+        // Hidden rows, a reversed order and a filter each describe a different
+        // listing, and serving the wrong one would show the wrong rows. So each
+        // has to be stored beside the first rather than answered from it.
+        for (key, hidden, query) in [
+            (SortKey::default().reversed(), false, None),
+            (SortKey::default(), true, None),
+            (SortKey::default(), false, Some("img")),
+        ] {
+            let held = reader.cached_entries();
+            reader
+                .read_streaming(
+                    &location,
+                    key,
+                    hidden,
+                    query,
+                    &Cancel::default(),
+                    &mut Blank,
+                )
+                .unwrap();
+            assert!(
+                reader.cached_entries() > held,
+                "{key:?} hidden={hidden} query={query:?} stored nothing"
+            );
+        }
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_cancelled_read_leaves_nothing_cached() {
+        #[derive(Default)]
+        struct Blank;
+
+        impl ListingSink for Blank {
+            fn batch(&mut self, _entries: &[Entry]) {}
+            fn sorted(&mut self, _entries: &[Entry]) {}
+        }
+
+        let dir = fixture("cancel-cache");
+        let reader = LocalReader::new();
+        let cancel = Cancel::default();
+        cancel.cancel();
+        let err = reader
+            .read_streaming(
+                &Location::file(&dir),
+                SortKey::default(),
+                false,
+                None,
+                &cancel,
+                &mut Blank,
+            )
+            .unwrap_err();
+        assert!(err.is_cancelled(), "{err}");
+        assert_eq!(reader.cached_entries(), 0, "nothing was stored");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn an_empty_folder_is_cached_like_any_other() {
+        // An empty folder has no entries to count, so the check is behavioural:
+        // a file created after the first read stays invisible until the folder is
+        // forgotten. The empty listing is the folder the user just emptied, and
+        // caching it is what makes revisiting it instant.
+        let dir = std::env::temp_dir().join(format!("ufm-local-empty-{}", paths::uid()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let reader = LocalReader::new();
+        assert!(read(&reader, &dir, false, None).is_empty());
+
+        fs::write(dir.join("new.txt"), b"x").unwrap();
+        assert!(
+            read(&reader, &dir, false, None).is_empty(),
+            "served from the cache, as a non-empty folder would be"
+        );
+        reader.invalidate_around(&dir);
+        assert_eq!(read(&reader, &dir, false, None).len(), 1);
         fs::remove_dir_all(&dir).unwrap();
     }
 

@@ -27,6 +27,8 @@ pub use cancel::Cancel;
 pub use fsinfo::FsHints;
 pub use local::LocalReader;
 
+use std::path::Path;
+
 use ufm_core::entry::Entry;
 use ufm_core::error::Result;
 use ufm_core::location::Location;
@@ -142,6 +144,43 @@ impl Readers {
 
     pub fn metadata(&self, location: &Location) -> Result<Entry> {
         self.for_location(location).metadata(location)
+    }
+
+    /// Forget what is cached about one directory: its listing, its parents' and
+    /// everything below it.
+    ///
+    /// Always the local reader's cache: an archive listing is never cached, since
+    /// a container's contents change when the file is rewritten and there is no
+    /// event to notice. So this reaches the one cache there is, whichever reader
+    /// would have served `location`.
+    pub fn invalidate_around(&self, path: &Path) {
+        self.local().invalidate_around(path);
+    }
+
+    /// Forget every cached listing, which is what a reload means: the caller wants
+    /// the folder as it is now, not as the last visit remembered it.
+    pub fn clear_listings(&self) {
+        self.local().clear_listings();
+    }
+
+    /// Forget the cached filesystem capabilities, after a mount or an unmount.
+    ///
+    /// These are the two events that change what the filesystem behind a path
+    /// *is*: a mount point that was an empty folder on tmpfs becomes a share with
+    /// different free space and different trash support, and a detach takes it
+    /// back. The whole table goes rather than the entry for one path, because a
+    /// sweep can empty a directory a scan had seen as a mount point, and because
+    /// mounts are rare enough that re-probing every device costs nothing next to
+    /// being wrong — the sidebar's free space and the trash badge both come from
+    /// here.
+    pub fn clear_fs_cache(&self) {
+        self.local().clear_fs_cache();
+    }
+
+    /// Entries held across all cached listings, for the memory bench.
+    #[must_use]
+    pub fn cached_entries(&self) -> usize {
+        self.local().cached_entries()
     }
 }
 

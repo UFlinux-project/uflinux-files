@@ -718,9 +718,18 @@ fn changed(shared: &Rc<Shared>, ctx: &Ctx, paths: &[PathBuf], overflowed: bool) 
     // why a reported path is taken at face value rather than checked for still
     // existing. An overflow says nothing about which folder moved, so every pane is
     // re-read, which is the same pair the reload button runs.
+    //
+    // The listings go first, in every branch. A re-read that is served from the
+    // cache shows the rows the event was reported in order to get rid of, and a
+    // column that is not re-read here still has to forget what it remembered, or
+    // the next visit to it shows a folder that no longer exists as it was.
     if overflowed {
+        shared.readers.clear_listings();
         ctx.columns.reload();
     } else {
+        for path in paths {
+            shared.readers.invalidate_around(path);
+        }
         for pane in ctx.columns.pane_locations().iter().filter(|pane| {
             pane.as_path()
                 .is_some_and(|path| Some(path) != here && reported(path))
@@ -769,6 +778,16 @@ fn operated(ctx: &Ctx, outcome: ops::Outcome) {
         .changed
         .iter()
         .any(|folder| here.is_some_and(|location| location.is_within(folder)));
+    // Whatever the operation touched has to be forgotten before anything is
+    // re-read, and for the folders it touched that are not on screen at all —
+    // the source of a move, a directory that was deleted outright — there will be
+    // no re-read to do it. `invalidate_around` covers the parent columns a paste
+    // empties as well as the folder it fills.
+    for folder in &outcome.changed {
+        if let Some(path) = folder.as_path() {
+            ctx.shared.readers.invalidate_around(path);
+        }
+    }
     if changed_here || changed_above {
         ctx.columns.reload();
     }
@@ -878,6 +897,10 @@ fn mounted(ctx: &Ctx, report: Report) {
         let mut state = ctx.shared.state.borrow_mut();
         state.runner.reload();
     }
+    // Before the sidebar is repainted: free space and the trash badge come from
+    // the cached filesystem capabilities, and a mount point that has just become a
+    // share has both of them wrong until they are probed again.
+    ctx.shared.readers.clear_fs_cache();
     if let Some(panel) = ctx.panel.upgrade() {
         panel.set_places(places(&ctx.shared));
         panel.set_usage(usages(&ctx.shared));
@@ -897,6 +920,17 @@ fn mounted(ctx: &Ctx, report: Report) {
             label: record.share.label(),
         })
     });
+    // A mount point is a folder that was there before the share was. If this
+    // window had looked at it — the empty folder in the sidebar, or the parent it
+    // sits in — the listing it remembered says "empty", and navigating in would
+    // repaint that rather than the share. The whole neighbourhood goes, because a
+    // parent column is what a sidebar user is looking at while the mount appears.
+    // `Place::location` returns a location by value, so it is bound rather than
+    // borrowed from: the path inside it would otherwise not outlive the call.
+    let mount = target.as_ref().map(Place::location);
+    if let Some(path) = mount.as_ref().and_then(Location::as_path) {
+        ctx.shared.readers.invalidate_around(path);
+    }
     match target {
         Some(place) => navigate(ctx, place.location(), true),
         // Connected but the record is not where it should be: the mount happened,
@@ -1301,6 +1335,12 @@ fn nav_actions(ctx: &Ctx) -> Vec<Rc<gio::SimpleAction>> {
             // The cached parent columns first, then the folder itself, which is
             // what `navigate` re-reads. Without the first half a refresh would
             // leave a stale column on screen next to a fresh one.
+            //
+            // Everything is forgotten rather than just the folders on screen: the
+            // point of the button is that the user distrusts what the window
+            // remembers, and a re-read that answers from the cache would prove
+            // them right in the worst way.
+            ctx.shared.readers.clear_listings();
             ctx.columns.reload();
             let current = ctx.shared.state.borrow().current.clone();
             if let Some(location) = current {
@@ -1689,7 +1729,17 @@ fn sweep_on_idle(shared: Weak<Shared>) {
         };
         // The window is not the place to report a mount it failed to release: a
         // banner would interrupt reading for something the user cannot act on.
-        let _ = shared.state.borrow_mut().runner.auto_unmount();
+        // What it does have to do is forget the listings that were read through a
+        // share that has just gone away: a cached folder on a detached mount is a
+        // folder whose rows no longer exist, and the next visit would paint them.
+        if let Ok(sweep) = shared.state.borrow_mut().runner.auto_unmount()
+            && !sweep.removed().is_empty()
+        {
+            shared.readers.clear_fs_cache();
+            for item in sweep.removed() {
+                shared.readers.invalidate_around(&item.path);
+            }
+        }
         glib::ControlFlow::Continue
     });
 }

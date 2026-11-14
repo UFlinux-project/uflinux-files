@@ -12,9 +12,10 @@
 //! Panes are cached and reused. Rebuilding a chain keeps every pane that is
 //! still in it, with its rows, so moving deeper or back up costs a read of the
 //! one folder that was not already on screen. This matters more here than in the
-//! other modes: [`ufm_vfs::LocalReader`] keeps no cache of its own, so a pane
-//! that threw its listing away would walk the directory again on every arrow
-//! key.
+//! other modes: a chain is up to [`MAX_PANES`] folders deep, and a pane that threw
+//! its listing away would walk its directory again on every arrow key. The
+//! reader underneath caches listings too, so a pane that *has* been rebuilt is
+//! repainted from memory rather than off the disk — see [`ufm_vfs::DirCache`].
 //!
 //! The deepest pane is filled by the window rather than by this widget. The
 //! window already reads the folder it navigated to for the grid and list views,

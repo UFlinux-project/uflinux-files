@@ -41,6 +41,10 @@ the model over D-Bus and never opens a window.
   terminal appears without reloading. Watching is capped at what a window can see,
   and a window whose watches the kernel refused simply behaves the way it did
   before: it updates when asked to.
+- **Back is instant**: the last 64 folders are kept in memory, so revisiting one
+  repaints instead of walking the directory again — the same path a mounted share
+  would otherwise pay a round trip for. Whatever changes a folder drops its entry,
+  which is why watching and caching are the same feature seen from two sides.
 
 ## Layout
 

@@ -24,10 +24,15 @@ below is a consequence of a decision already made elsewhere, not a wish:
 
 Measured on the reference machine, release build, three sessions, full fixtures, cairo
 renderer (see [The renderer is most of a window](#the-renderer-is-most-of-a-window)):
-provider 3.1, cold window 44.2, warm window 44.1, 5k columns 48.5, `uflinux-searchd`
-idle 4.8 and 4.9 answering a query, desktop model 3.0 MiB. Every row is inside its
+provider 3.7, cold window 50.6, warm window 50.6, 5k columns 54.8, `uflinux-searchd`
+idle 5.1 and 5.2 answering a query, desktop model 3.7 MiB. Every row is inside its
 budget with room for the thumbnail cache and the widgets a real desktop has that the
-bench does not build.
+bench does not build. The window rows are the ones to read against the directory
+cache: the bench walks a five-thousand-entry folder and then revisits folders on the
+way back, so those listings are resident in the numbers above, and the spread between
+the three sessions is wider than the cache's own ceiling. The provider reads
+directories but never shows one, so it holds no listings at all and its figure moves
+with how the container was started rather than with anything in this crate.
 
 Latency, same machine:
 
@@ -61,8 +66,12 @@ its own cache statistics, which is what `Status` answers with — a daemon that 
 say how much it is holding is a daemon you have to restart to find out.
 
 **The directory cache is capped at 64 directories / 20 000 entries / 30 s.** A cache
-with no eviction policy is a memory leak with a good reputation; the TTL is short
-because a stale folder listing is worse than a fast one.
+with no eviction policy is a memory leak with a good reputation. An entry is a name, a
+location and a dozen fixed fields, roughly 300 bytes, so the ceiling is about 6 MB of
+heap — the file manager and the desktop provider can both be resident on a 2 GB machine
+without either noticing. Freshness comes from invalidation rather than from the TTL: a
+watch event, a finished file operation, a mount or a reload each drop what they
+invalidate, so the 30 s is only the worst case for a folder whose watch was lost.
 
 **The archive TOC cache holds 8 containers.** A TOC is the one structure worth keeping
 — rebuilding it means re-reading the whole archive — and eight is more than anyone has

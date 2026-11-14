@@ -31,7 +31,7 @@ error type is named in the signature does not need an essay per method.
 | Area | The property under test |
 | --- | --- |
 | `ufm-core` | `Location` round-trips, including a `!` inside an archive path and a `..` that is a legal Linux component; traversal out of an archive is rejected; atomic writes leave no partial file; config migration from an older `version`. |
-| `ufm-vfs` | streaming reads publish in bounded slices; the cache respects all three caps; a cancelled read stops within one chunk; the watcher's overflow path reports the directories it dropped. |
+| `ufm-vfs` | streaming reads publish in bounded slices and a cancelled read stops within one chunk; a second read of one folder is served from memory and reports no chunks at all; a changed sort order, hidden setting or filter is a miss rather than the wrong rows; a cancelled read stores nothing, an emptied folder is still a listing; the cache respects all three caps; invalidation reaches a folder, its parents and its children; the watcher's overflow path reports the directories it dropped. |
 | `ufm-archive` | `.tar.gz` is a tar and `.gz` alone is a one-member container; a corrupt archive degrades to an error row rather than a panic, and a truncated one never lists a member it cannot read whole; a `../` member cannot escape the extract directory; a zip-in-tar navigates two levels. |
 | `ufm-mount` | the mount table survives a kill mid-write; a `Share` renders for display without its password; every backend's argv is checked for the absence of the secret; `SecretUse` matches what the real program expects. |
 | `ufm-index` | a commit that returned is visible after reopening the index; `hidden` filtering works with scoring on; the n-gram field finds a prefix the tokenised field cannot; a re-crawl replaces rather than accumulates. |
@@ -162,6 +162,18 @@ a window rather than focusing an open one; and the indexer answers `Status` on t
 The prompt is driven through the accessibility tree, by the `press` command of the probe,
 which activates a node by name — the same controller path a mouse click takes.
 
+The live-refresh checks double as the cache's end-to-end check, and that is the reason
+they are load-bearing rather than incidental. A listing is now remembered between
+visits, so a folder that gains a file and then shows it could be showing either a fresh
+read or a cached listing that happened to be dropped for some other reason. What makes
+the check mean something is that the write comes from the shell and nothing else
+happens: no action is activated, no navigation happens, and the only thing that could
+have invalidated the entry is the watch event itself. The unit tests cover the other
+half — that a hit really is a hit, that a different view state is a miss, that a
+cancelled read stores nothing, and that invalidation reaches a folder's parents as well
+as its children — but the pairing of the two, a cache that is both fast and honest, is
+only visible with a real folder changing under a real window.
+
 The two live-refresh checks are the only ones that assert on the absence of a command.
 Every other check either activates an action or waits for one; these write to the
 fixture from the shell and then wait, touching nothing, because the claim being tested is
@@ -259,8 +271,3 @@ catches.
   them beyond mounting what is already mounted.
 - Copy/move conflict resolution across devices, and the properties dialog: they do not
   exist yet, so there is nothing to certify. Their tests land with them.
-- `DirCache`. The type is written and tested on its own, but nothing reads through it,
-  so no check here depends on a cached listing being right or being thrown away. Wiring
-  it into `Readers` is a change to the read path and needs its own checks: a cache that
-  is quietly wrong shows a file that was deleted an hour ago, which is worse than reading
-  the folder twice.
