@@ -6,10 +6,10 @@
 
 mod cli;
 
-// The window reads mounts but does not yet make them: `mount`, `unmount`,
-// `reconnect`, `remember` and `forget` are the API the "Connect to a server"
-// dialog will call, and `Report` is what that dialog reports back. Delete this
-// attribute when the dialog lands, so a method nobody ever wanted warns again.
+// The connect dialog calls `mount` and `forget`. `unmount` and `reconnect` are
+// still waiting for the buttons that will call them, in the sidebar's mount
+// rows; until then this keeps the two honest rather than deleting a capability
+// the mount table already models.
 #[allow(dead_code)]
 mod runner;
 mod ui;

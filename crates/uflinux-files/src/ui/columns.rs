@@ -220,9 +220,11 @@ impl Columns {
     /// the user has scrolled past will ask again if it becomes relevant.
     pub fn apply(&self, event: &Event) {
         match event {
-            // Columns paint a folder in one go. A partial listing would show a
-            // column half full and then jump when the read finished.
-            Event::Batch { .. } => {}
+            // Columns paint a folder in one go, so a partial listing would show a
+            // column half full and then jump when the read finished. A share that
+            // finished connecting is the window's call — it owns the history and
+            // the current location — so the columns repaint when it navigates.
+            Event::Batch { .. } | Event::Mounted { .. } => {}
             Event::Finished {
                 location, entries, ..
             } => {

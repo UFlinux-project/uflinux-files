@@ -25,9 +25,11 @@ use ufm_core::entry::Entry;
 use ufm_core::location::Location;
 use ufm_vfs::FsHints;
 
-/// Something a worker wants the main thread to know. Every variant names the
-/// folder it was read from, because a worker cannot know whether the user has
-/// navigated away since the chunk it produced was queued.
+use crate::runner::Report;
+
+/// Something a worker wants the main thread to know. The listing variants each
+/// name the folder they were read from, because a worker cannot know whether the
+/// user has navigated away since the chunk it produced was queued.
 #[derive(Debug)]
 pub enum Event {
     /// A chunk of a listing that is still being read, in read order.
@@ -43,6 +45,12 @@ pub enum Event {
     },
     /// The read failed. The message is for the banner, so it is already worded.
     Failed { location: Location, message: String },
+    /// A network share was connected, or failed to. The one variant that is not
+    /// about a listing: mounting runs off-thread because the backend helper
+    /// blocks, so its result has to reach the main loop the same way a listing
+    /// does. The [`Report`] carries the share id, which is what lets the window
+    /// re-read the mount table and move into the new mount point.
+    Mounted { report: Report },
 }
 
 /// Closes a file descriptor when the last owner drops it, so a worker that
@@ -94,15 +102,7 @@ impl Queue {
     /// `on_event` is called once per queued event, oldest first, and only for
     /// events that were queued since the last wake-up.
     pub fn new(mut on_event: impl FnMut(Event) + 'static) -> io::Result<Self> {
-        let mut fds = [NO_FD; 2];
-        // SAFETY: `fds` is two `c_int`s and `pipe2` writes both on success.
-        let ok = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_NONBLOCK | libc::O_CLOEXEC) };
-        if ok != 0 {
-            return Err(io::Error::last_os_error());
-        }
-        let read = Arc::new(Fd(fds[0]));
-        let write = Arc::new(Fd(fds[1]));
-        let out: Arc<Mutex<Vec<Event>>> = Arc::new(Mutex::new(Vec::new()));
+        let (read, write, out) = pipe()?;
         let watched = Arc::clone(&out);
         let watched_fd = Arc::clone(&read);
         let source = unix_fd_add_local(read.0, glib::IOCondition::IN, move |_fd, _condition| {
@@ -123,6 +123,25 @@ impl Queue {
             read,
             write,
             source: Some(source),
+        })
+    }
+
+    /// A queue with no fd source attached, for tests that only care about the
+    /// pipe and the mutex.
+    ///
+    /// Attaching a source claims the thread's ownership of the default main
+    /// context, and the widget tests hand that to one thread for the whole run —
+    /// so a test on a harness thread of its own could not attach one at all. The
+    /// source is what turns a write into a callback, and these tests never run a
+    /// main loop to receive it.
+    #[cfg(test)]
+    fn without_source() -> io::Result<Self> {
+        let (read, write, out) = pipe()?;
+        Ok(Self {
+            out,
+            read,
+            write,
+            source: None,
         })
     }
 
@@ -149,6 +168,28 @@ impl Drop for Queue {
 /// What an unset descriptor looks like. `pipe2` fills both slots on success.
 const NO_FD: RawFd = -1;
 
+/// The three parts a queue is built from: the read end, the write end, and the
+/// event list both sides share.
+type Parts = (Arc<Fd>, Arc<Fd>, Arc<Mutex<Vec<Event>>>);
+
+/// The self-pipe and the shared event list, without any main-loop source.
+///
+/// Split out from [`Queue::new`] so that a test can build a queue on a thread
+/// that does not own the default main context.
+fn pipe() -> io::Result<Parts> {
+    let mut fds = [NO_FD; 2];
+    // SAFETY: `fds` is two `c_int`s and `pipe2` writes both on success.
+    let ok = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_NONBLOCK | libc::O_CLOEXEC) };
+    if ok != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok((
+        Arc::new(Fd(fds[0])),
+        Arc::new(Fd(fds[1])),
+        Arc::new(Mutex::new(Vec::new())),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -165,7 +206,7 @@ mod tests {
         // The queue is dropped straight away, which closes the read end; the
         // write must still not panic, because a worker racing a window close is
         // the common case rather than an edge case.
-        let queue = Queue::new(|_| {}).expect("a pipe can be made");
+        let queue = Queue::without_source().expect("a pipe can be made");
         let handle = queue.handle();
         handle.send(event());
         drop(queue);
@@ -174,7 +215,7 @@ mod tests {
 
     #[test]
     fn events_queue_in_order_until_someone_reads_them() {
-        let queue = Queue::new(|_| {}).expect("a pipe can be made");
+        let queue = Queue::without_source().expect("a pipe can be made");
         let handle = queue.handle();
         handle.send(event());
         handle.send(event());

@@ -176,6 +176,25 @@ impl Runner {
         self.observer.reload();
     }
 
+    /// Re-read `mounts.json` from disk, and the kernel's table with it.
+    ///
+    /// The connect dialog mounts on a worker thread, which owns its own runner
+    /// and writes the record it created to disk. This is how the window's runner
+    /// finds out about it: without it the sidebar would keep showing the shares
+    /// that were there when the window opened, and ejecting the new one would
+    /// look like it had never connected.
+    ///
+    /// The file wins over memory, which is why a damaged file is ignored rather
+    /// than propagated: a half-written read must not throw away the records this
+    /// runner already had.
+    pub fn reload(&mut self) {
+        if let Ok(table) = MountTable::try_load_at(&self.layout.config_dir, &self.layout.mount_root)
+        {
+            self.table = table;
+        }
+        self.observer.reload();
+    }
+
     /// Note that a share carried traffic, which is what stops an idle auto-unmount
     /// from dropping a share someone is using. Called when a listing is read
     /// through a mount point, not when a window is merely open.

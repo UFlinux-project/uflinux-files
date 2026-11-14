@@ -34,6 +34,9 @@ gdk-pixbuf.workspace = true
 # `pipe2`, `write` and `close` for the listing queue, which cannot use a GLib
 # channel because glib 0.21 has none.
 libc.workspace = true
+# Percent-encoding for the connect dialog, which builds an address for
+# `Share::parse` and so has to escape what that parser will decode.
+percent-encoding.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 gtk4-layer-shell = { workspace = true, optional = true }

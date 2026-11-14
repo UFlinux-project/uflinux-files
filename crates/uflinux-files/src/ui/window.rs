@@ -35,11 +35,12 @@ use ufm_core::sort::SortKey;
 use ufm_vfs::{Cancel, FsHints, Readers};
 
 use super::columns::Columns;
+use super::connect;
 use super::job::{Event, Handle, Queue};
 use super::panel::{Panel, Place, Usage};
 use super::row::Row;
 use super::view::View;
-use crate::runner::{Layout, Runner};
+use crate::runner::{Layout, Report, Runner};
 
 // The windows this process has open. A window leaves the list when it is
 // closed, which is what frees its widgets and the listing they hold.
@@ -481,6 +482,46 @@ fn apply(ctx: &Ctx, event: Event) {
             }
             show_banner(ctx, &format!("{}: {message}", location.display()));
         }
+        Event::Mounted { report } => mounted(ctx, report),
+    }
+}
+
+/// A share the connect dialog asked for has been attempted, on a worker.
+///
+/// The window's own runner knows nothing about it — the worker owned a runner of
+/// its own and wrote the record to disk — so the first thing this does is re-read
+/// that file. Without it the sidebar would go on listing the shares that were
+/// there when the window opened, and a share that had just connected would look
+/// like it never had.
+fn mounted(ctx: &Ctx, report: Report) {
+    {
+        let mut state = ctx.shared.state.borrow_mut();
+        state.runner.reload();
+    }
+    if let Some(panel) = ctx.panel.upgrade() {
+        panel.set_places(places(&ctx.shared));
+        panel.set_usage(usages(&ctx.shared));
+    }
+    if !report.ok {
+        show_banner(ctx, &report.message);
+        return;
+    }
+    // Step into the share that just appeared, which is what a user who typed an
+    // address expects to see — and which is the success message, so no banner is
+    // needed for it. The id is the record's, so the mount point comes from the
+    // table that was just re-read rather than from anything the worker kept.
+    let target = report.id.as_deref().and_then(|id| {
+        let state = ctx.shared.state.borrow();
+        state.runner.table().get(id).map(|record| Place::Mount {
+            id: record.id.clone(),
+            label: record.share.label(),
+        })
+    });
+    match target {
+        Some(place) => navigate(ctx, place.location(), true),
+        // Connected but the record is not where it should be: the mount happened,
+        // and the only way to say so is in words.
+        None => show_banner(ctx, &report.message),
     }
 }
 
@@ -660,6 +701,14 @@ fn header(ctx: &Ctx, menu: &gio::Menu) -> gtk::HeaderBar {
     refresh.set_tooltip_text(Some("Reload this folder"));
     bar.pack_start(&refresh);
 
+    // Connect belongs on the bar rather than only in the menu: a share that is
+    // hard to reach is a share nobody connects to, and the menu is three clicks
+    // deep for something a network folder needs once per session.
+    let connect = gtk::Button::from_icon_name("network-server-symbolic");
+    connect.set_action_name(Some("win.connect"));
+    connect.set_tooltip_text(Some("Connect to a server"));
+    bar.pack_start(&connect);
+
     let search = folder_filter(ctx);
     *ctx.search.borrow_mut() = Some(search.clone());
     let modes = gtk::MenuButton::builder()
@@ -728,11 +777,14 @@ fn menu() -> gio::Menu {
     }
     let show = gio::Menu::new();
     show.append(Some("Show hidden files"), Some("win.hidden"));
+    let network = gio::Menu::new();
+    network.append(Some("Connect to Server…"), Some("win.connect"));
     let window = gio::Menu::new();
     window.append(Some("Search this folder"), Some("win.search"));
     window.append(Some("New window"), Some("win.new-window"));
     menu.append_section(None, &view);
     menu.append_section(None, &show);
+    menu.append_section(None, &network);
     menu.append_section(None, &window);
     menu
 }
@@ -935,11 +987,27 @@ fn view_actions(app: &gtk::Application, ctx: &Ctx) -> Vec<Rc<gio::SimpleAction>>
         move |_action, _parameter| open(&app, &[])
     });
 
+    // The dialog needs the window to be transient for and the queue to report
+    // through, both of which a handler can only reach by upgrading — the point of
+    // `Ctx` being cheap to clone rather than of passing widgets around.
+    let connect_server = gio::SimpleAction::new("connect", None);
+    connect_server.connect_activate({
+        let ctx = ctx.clone();
+        move |_action, _parameter| {
+            let (Some(window), Some(handle)) = (ctx.window.upgrade(), ctx.handle.borrow().clone())
+            else {
+                return;
+            };
+            connect::open(&window, &handle);
+        }
+    });
+
     vec![
         Rc::new(mode),
         Rc::new(hidden),
         Rc::new(search),
         Rc::new(new_window),
+        Rc::new(connect_server),
     ]
 }
 
@@ -953,6 +1021,10 @@ fn install_accels(app: &gtk::Application) {
     app.set_accels_for_action("win.hidden", &["<Ctrl>H"]);
     app.set_accels_for_action("win.search", &["<Ctrl>F"]);
     app.set_accels_for_action("win.new-window", &["<Ctrl>N"]);
+    // `<Ctrl>K` rather than `<Ctrl>L`: the location bar took that one, and a
+    // keyboard shortcut for connecting is the difference between trying a share
+    // and giving up on it.
+    app.set_accels_for_action("win.connect", &["<Ctrl>K"]);
     for mode in [ViewMode::Grid, ViewMode::List, ViewMode::Columns] {
         app.set_accels_for_action(
             &format!("win.mode::{}", mode_name(mode)),
