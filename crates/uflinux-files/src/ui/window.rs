@@ -16,7 +16,9 @@
 //! a cycle: `Panel` would own the closure that owns the `Panel`, and closing the
 //! window would free nothing.
 
+use std::cell::Cell;
 use std::cell::RefCell;
+use std::path::{Path, PathBuf};
 use std::rc::{Rc, Weak};
 use std::sync::Arc;
 use std::thread;
@@ -43,6 +45,7 @@ use super::panel::{Panel, Place, Usage};
 use super::row::Row;
 use super::search::{Found, Outcome, Search};
 use super::view::View;
+use super::watch::Live;
 use crate::runner::{Layout, Report, Runner};
 
 // The windows this process has open. A window leaves the list when it is
@@ -88,6 +91,8 @@ pub fn open(app: &gtk::Application, urls: &[String]) {
         prefs: RefCell::new(prefs),
         state: RefCell::new(State::new(&start)),
         readers,
+        missed: Cell::new(false),
+        reading: Cell::new(false),
     });
 
     // The presentations that are not the grid/list stack. Columns is a sibling
@@ -115,6 +120,9 @@ pub fn open(app: &gtk::Application, urls: &[String]) {
         find,
         shared: Rc::clone(&shared),
         handle: Rc::new(RefCell::new(None)),
+        // Filled in right after the queue, because the answer to a change is a
+        // re-read and a re-read needs somewhere to report to.
+        live: Rc::new(RefCell::new(None)),
     };
 
     let queue = match Queue::new({
@@ -131,6 +139,7 @@ pub fn open(app: &gtk::Application, urls: &[String]) {
     };
     *ctx.handle.borrow_mut() = Some(queue.handle());
     ctx.columns.set_handle(queue.handle());
+    let live = watch_for(&ctx);
     wire_find(&ctx);
 
     let content = build_content(&ctx, &panel, &view);
@@ -173,6 +182,7 @@ pub fn open(app: &gtk::Application, urls: &[String]) {
             _columns: columns,
             _shared: shared,
             _queue: queue,
+            _live: live,
         });
     });
 }
@@ -235,6 +245,15 @@ struct Ctx {
     shared: Rc<Shared>,
     /// Filled in once the queue exists, which is after the handlers are built.
     handle: Rc<RefCell<Option<Handle>>>,
+    /// The folders this window has on screen, watched. `None` when the kernel
+    /// refused an inotify instance, which leaves the window refreshing on
+    /// navigation alone exactly as it did before there were watches.
+    ///
+    /// `Rc` because it is filled in after the handlers are built, and shared rather
+    /// than copied like [`Ctx::handle`]. Weak inside, because the source that wakes
+    /// this window up is owned by the main loop: a strong reference here would be
+    /// held by a callback the watcher itself keeps alive.
+    live: Rc<RefCell<Option<Weak<Live>>>>,
 }
 
 /// State shared by every handler in one window.
@@ -242,6 +261,22 @@ struct Shared {
     prefs: RefCell<Preferences>,
     state: RefCell<State>,
     readers: Arc<Readers>,
+    /// Whether the kernel reported a change to the folder on screen while a
+    /// listing for it was already on its way from a worker.
+    ///
+    /// The reason this exists is the ordering. A listing is read on a worker, so
+    /// the window cannot simply re-read on every event: a change arriving while a
+    /// read is in flight would cancel it and start another, and a program writing
+    /// ten files would cost ten walks of the folder instead of one. Such a change
+    /// is noted here instead, and answered by the event that closes the read —
+    /// which is also where the flag is cleared, so a burst of writes costs one
+    /// extra walk rather than one per write.
+    missed: Cell<bool>,
+    /// Whether a listing for the folder on screen is on its way from a worker.
+    ///
+    /// While one is, a change reported by the watcher is only recorded rather than
+    /// acted on, for the reason above. Cleared by the event that answers the read.
+    reading: Cell<bool>,
 }
 
 impl Shared {
@@ -361,6 +396,9 @@ struct Window {
     _shared: Rc<Shared>,
     /// Removing the fd source is what stops the wake-ups; the field owns it.
     _queue: Queue,
+    /// Likewise the watch: dropping this detaches the source and releases the
+    /// kernel watches. `None` when inotify refused an instance.
+    _live: Option<Rc<Live>>,
 }
 
 /// Where the first window should start.
@@ -379,13 +417,7 @@ fn navigate(ctx: &Ctx, location: Location, record: bool) {
     let Some(view) = ctx.view.upgrade() else {
         return;
     };
-    let readers = Arc::clone(&ctx.shared.readers);
-    let key = view.sort_key();
-    let show_hidden = ctx.shared.prefs.borrow().show_hidden;
     let cancel = Cancel::new();
-    let Some(handle) = ctx.handle.borrow().clone() else {
-        return;
-    };
 
     {
         let mut state = ctx.shared.state.borrow_mut();
@@ -401,6 +433,9 @@ fn navigate(ctx: &Ctx, location: Location, record: bool) {
         state.shown = Vec::new();
         state.results = None;
         state.query.clear();
+        // A change noted against the folder being left says nothing about the one
+        // arriving, whose listing is being read right now.
+        ctx.shared.missed.set(false);
         // A listing read through a mount counts as using it, so auto-unmount
         // does not cut a share the user is still looking at.
         let used = state
@@ -438,6 +473,60 @@ fn navigate(ctx: &Ctx, location: Location, record: bool) {
     }
     sync_buttons(ctx);
 
+    spawn_read(ctx, location, cancel, &view);
+    sync_watches(ctx);
+}
+
+/// Re-read the folder on screen because the kernel said it changed.
+///
+/// Not [`navigate`], which does four things a change made by another program must
+/// not: it empties the view first, so the window would flash blank on every save
+/// in an editor; it drops the in-folder filter, so a query typed by the user would
+/// disappear under them; it resets the index bar, which is showing results the
+/// folder has nothing to do with; and it repaints the path label and the sidebar
+/// selection, which have not changed. What is left is the read itself, which is
+/// [`spawn_read`], and the leaf column, which has to be told to expect the listing
+/// the window is about to deliver.
+fn reread(ctx: &Ctx, location: Location) {
+    let Some(view) = ctx.view.upgrade() else {
+        return;
+    };
+    let cancel = Cancel::new();
+    {
+        let mut state = ctx.shared.state.borrow_mut();
+        // The user moved on between the event and now. The read that is in flight
+        // is the one answering where they went, and cancelling it would leave the
+        // window showing nothing.
+        if state.current.as_ref() != Some(&location) {
+            return;
+        }
+        if let Some(old) = state.cancel.replace(cancel.clone()) {
+            old.cancel();
+        }
+    }
+    ctx.columns.expect_leaf();
+    spawn_read(ctx, location, cancel, &view);
+    // Re-declaring the watches is what picks up a folder that was deleted and
+    // created again: deleting a directory makes the kernel retire its watch, and
+    // this is the moment the window has just learned the directory is back.
+    sync_watches(ctx);
+}
+
+/// Read `location` on a worker and report the listing through the queue.
+///
+/// The caller owns the bookkeeping: `location` has to be the window's current
+/// folder and `cancel` has to be the flag in `State`, because [`apply`] drops
+/// events whose location the window no longer shows.
+fn spawn_read(ctx: &Ctx, location: Location, cancel: Cancel, view: &View) {
+    let Some(handle) = ctx.handle.borrow().clone() else {
+        return;
+    };
+    let readers = Arc::clone(&ctx.shared.readers);
+    let key = view.sort_key();
+    let show_hidden = ctx.shared.prefs.borrow().show_hidden;
+    // From here until the event answering this read, a change reported by the
+    // watcher is only recorded. See [`Shared::missed`].
+    ctx.shared.reading.set(true);
     let token = cancel.clone();
     // Taken before the location moves into the worker, for the one message that
     // is written after the spawn.
@@ -471,9 +560,35 @@ fn navigate(ctx: &Ctx, location: Location, record: bool) {
     if spawned.is_err() {
         // Out of threads. The window stays on the folder it had, which is
         // confusing but recoverable, so say which folder was not read.
+        ctx.shared.reading.set(false);
         view.set_entries(Vec::new());
         show_banner(ctx, &format!("{display}: cannot start a reader."));
     }
+}
+
+/// Keep the watched set in step with what this window has on screen.
+///
+/// A window whose watcher could not be created skips this and behaves the way it
+/// did before live updates existed: the listing changes when the user asks.
+fn sync_watches(ctx: &Ctx) {
+    let Some(live) = ctx.live.borrow().as_ref().and_then(Weak::upgrade) else {
+        return;
+    };
+    let current = ctx.shared.state.borrow().current.clone();
+    live.sync(current.as_ref(), &ctx.columns.pane_locations());
+}
+
+/// Start watching this window's folders, or explain why nothing will be watched.
+///
+/// Built after the queue rather than with the rest of the window because the
+/// answer to a change is a re-read, and a re-read that cannot report back is a
+/// directory walk nobody will ever look at.
+fn watch_for(ctx: &Ctx) -> Option<Rc<Live>> {
+    let shared = Rc::clone(&ctx.shared);
+    let weak = ctx.clone();
+    let live = Live::new(move |paths, overflowed| changed(&shared, &weak, paths, overflowed))?;
+    *ctx.live.borrow_mut() = Some(Rc::downgrade(&live));
+    Some(live)
 }
 
 /// The worker's sink: batches go out as they are read, the sorted listing is
@@ -548,19 +663,82 @@ fn apply(ctx: &Ctx, event: Event) {
             // Everything above still happens, because a folder that read cleanly
             // is not an error even when its rows are not what is visible.
             if ctx.find.is_open() {
+                settled(ctx);
                 return;
             }
             view.set_entries(filtered);
+            settled(ctx);
         }
         Event::Failed { location, message } => {
             if !ctx.shared.state.borrow().shows(&location) {
                 return;
             }
+            settled(ctx);
             show_banner(ctx, &format!("{}: {message}", location.display()));
         }
         Event::Mounted { report } => mounted(ctx, report),
         Event::Operation { outcome } => operated(ctx, outcome),
     }
+}
+
+/// The listing that was on its way has arrived, so a change the watcher reported
+/// while it was can be answered now.
+///
+/// One re-read per round, whatever accumulated: a program that wrote forty files
+/// has already been answered by the listing that just landed, and the change it
+/// triggered is either in that listing or is a change to something the window is
+/// not showing.
+fn settled(ctx: &Ctx) {
+    ctx.shared.reading.set(false);
+    if !ctx.shared.missed.replace(false) {
+        return;
+    }
+    let Some(location) = ctx.shared.state.borrow().current.clone() else {
+        return;
+    };
+    reread(ctx, location);
+}
+
+/// The kernel says one of this window's folders changed.
+///
+/// `paths` are the folders that went quiet long enough to re-read, `overflowed`\
+/// says the kernel dropped events and nothing can be trusted. Both are already
+/// debounced and coalesced by the watcher; what is left to decide is which half of
+/// the window to re-read, and when.
+fn changed(shared: &Rc<Shared>, ctx: &Ctx, paths: &[PathBuf], overflowed: bool) {
+    let current = shared.state.borrow().current.clone();
+    let here = current.as_ref().and_then(Location::as_path);
+    let reported = |path: &Path| paths.iter().any(|p| p == path);
+    // The folder in the title bar. Its rows belong to the view, so the window
+    // re-reads it; the leaf column is told to expect that listing rather than
+    // walking the same directory a second time.
+    let touched_here = overflowed || here.is_some_and(reported);
+    // A column beside it: the rows on screen are unaffected, so only that pane is
+    // re-read. Deletions arrive as `IN_DELETE_SELF` for the folder itself, which is
+    // why a reported path is taken at face value rather than checked for still
+    // existing. An overflow says nothing about which folder moved, so every pane is
+    // re-read, which is the same pair the reload button runs.
+    if overflowed {
+        ctx.columns.reload();
+    } else {
+        for pane in ctx.columns.pane_locations().iter().filter(|pane| {
+            pane.as_path()
+                .is_some_and(|path| Some(path) != here && reported(path))
+        }) {
+            ctx.columns.reload_one(pane);
+        }
+    }
+    let Some(location) = current.filter(|_| touched_here) else {
+        return;
+    };
+    if shared.reading.get() {
+        // A listing for this folder is already on its way, and it may or may not
+        // contain the change. Note it and let the event answering that read decide,
+        // which is what keeps a burst of writes at one directory walk.
+        shared.missed.set(true);
+        return;
+    }
+    reread(ctx, location);
 }
 
 /// A file operation finished on a worker.

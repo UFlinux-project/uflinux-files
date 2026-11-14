@@ -155,11 +155,21 @@ folder the prompt suggested, the listing picks it up without being told to, and 
 the prompt closes it; `Describe` reports `extract` disabled on an ordinary folder, a
 second window opened on a real `.tar` reports it enabled, activating it leaves a folder
 beside the container holding the members, and the window that asked for it says so in
-its banner; the search action opens a field and the field takes typed text; a
+its banner; a file created and then deleted by the shell appears and disappears in the
+listing on its own; the search action opens a field and the field takes typed text; a
 second invocation opens a `Computer` window in the running instance; `--new-window` opens
 a window rather than focusing an open one; and the indexer answers `Status` on the bus.
 The prompt is driven through the accessibility tree, by the `press` command of the probe,
 which activates a node by name — the same controller path a mouse click takes.
+
+The two live-refresh checks are the only ones that assert on the absence of a command.
+Every other check either activates an action or waits for one; these write to the
+fixture from the shell and then wait, touching nothing, because the claim being tested is
+reload and no navigation were needed. Activating the window's own `refresh` action before
+looking would make the check pass with watching removed entirely, and would be testing the
+reload button instead. Both directions are checked: a directory that gained an entry and
+one that lost it, since the watcher reports those through different events and only the
+second can arrive after the kernel has already dropped the watch.
 
 The extraction checks are the first to act on a window other than the one the script
 started. `GTK` exports every window an application owns, so the archive window is
@@ -249,3 +259,8 @@ catches.
   them beyond mounting what is already mounted.
 - Copy/move conflict resolution across devices, and the properties dialog: they do not
   exist yet, so there is nothing to certify. Their tests land with them.
+- `DirCache`. The type is written and tested on its own, but nothing reads through it,
+  so no check here depends on a cached listing being right or being thrown away. Wiring
+  it into `Readers` is a change to the read path and needs its own checks: a cache that
+  is quietly wrong shows a file that was deleted an hour ago, which is worse than reading
+  the folder twice.

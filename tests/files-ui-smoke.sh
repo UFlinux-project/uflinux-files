@@ -365,6 +365,31 @@ else
     fail "the window says what it extracted, in the folder it landed in"
 fi
 
+# --- a change made by another program appears on its own -----------------------------
+# The first window is still standing on `$TARGET`, so a file written there by the shell
+# is a change this program did not make and cannot have anticipated. Nothing here
+# touches the window: no reload, no navigation. The watcher has a debounce, so the
+# wait is generous; what is being asserted is that the listing notices at all, which
+# is the difference between a live folder and a photograph of one.
+touch "$TARGET/live.txt"
+if wait_named "live.txt"; then
+    ok "a file created outside the program appears in the listing"
+else
+    fail "a file created outside the program appears in the listing (no live.txt)"
+fi
+rm -f "$TARGET/live.txt"
+i=0
+while [ "$i" -lt 50 ] && printf '%s\n' "$DUMP" | grep -qF "$(printf '\tlive.txt\t')"; do
+    refresh
+    i=$((i + 1))
+    sleep 0.2
+done
+if printf '%s\n' "$DUMP" | grep -qF "$(printf '\tlive.txt\t')"; then
+    fail "a file deleted outside the program disappears from the listing"
+else
+    ok "a file deleted outside the program disappears from the listing"
+fi
+
 # --- the search bar -----------------------------------------------------------------
 # The bar opens and the field takes text. Whether it finds anything depends on the
 # indexer, which is checked separately below; the field accepting input is the UI's job.

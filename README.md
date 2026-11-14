@@ -36,6 +36,11 @@ the model over D-Bus and never opens a window.
 - **Desktop icons**: this program owns the model — what is on the desktop, where
   each icon sits, what happens when one is double-clicked — and
   `uflinux-desktop` draws it, so there is no second full-screen GTK process.
+- **Live folders**: the folder on screen and the columns beside it are watched, so
+  a file saved in an editor, a download that finished, or a folder deleted from a
+  terminal appears without reloading. Watching is capped at what a window can see,
+  and a window whose watches the kernel refused simply behaves the way it did
+  before: it updates when asked to.
 
 ## Layout
 

@@ -170,6 +170,31 @@ impl Watcher {
         });
     }
 
+    /// Make the watch set exactly `paths`.
+    ///
+    /// For a view whose watched set is whatever happens to be on screen, which
+    /// changes as a whole rather than one directory at a time. Watches that are
+    /// in both sets are left alone rather than removed and re-added: a watch that
+    /// is briefly gone misses whatever happened in that instant, and the point of
+    /// this method is to keep up with a listing without losing events.
+    ///
+    /// Directories past [`MAX_WATCHES`](Self::MAX_WATCHES) are not watched, same
+    /// as [`watch`](Self::watch), so the set can end up smaller than asked.
+    pub fn sync(&self, paths: &[PathBuf]) {
+        let wanted: HashSet<&PathBuf> = paths.iter().collect();
+        let stale: Vec<PathBuf> = self
+            .watched()
+            .into_iter()
+            .filter(|path| !wanted.contains(path))
+            .collect();
+        for path in stale {
+            self.unwatch(&path);
+        }
+        for path in paths {
+            self.watch(path);
+        }
+    }
+
     /// Stop watching `path` and drop any pending change for it.
     pub fn unwatch(&self, path: &Path) {
         let mut state = self.state();
@@ -543,6 +568,46 @@ mod tests {
             "{} watches, the cap is {}",
             watcher.watched().len(),
             Watcher::MAX_WATCHES
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn syncing_replaces_the_whole_set() {
+        let keep = scratch("sync-keep");
+        let gone = scratch("sync-gone");
+        let fresh = scratch("sync-fresh");
+        let watcher = Watcher::new().unwrap();
+        watcher.watch(&keep);
+        watcher.watch(&gone);
+
+        watcher.sync(&[keep.clone(), fresh.clone()]);
+
+        let mut want = vec![keep.clone(), fresh.clone()];
+        want.sort();
+        let mut got = watcher.watched();
+        got.sort();
+        assert_eq!(got, want, "the set becomes exactly what was asked for");
+        std::fs::remove_dir_all(&keep).unwrap();
+        std::fs::remove_dir_all(&gone).unwrap();
+        std::fs::remove_dir_all(&fresh).unwrap();
+    }
+
+    #[test]
+    fn syncing_with_a_directory_that_cannot_be_watched_keeps_the_rest() {
+        let dir = scratch("sync-missing");
+        let watcher = Watcher::new().unwrap();
+        watcher.watch(&dir);
+
+        watcher.sync(&[
+            dir.clone(),
+            PathBuf::from("/definitely-not-a-directory-ufm-sync"),
+        ]);
+
+        assert_eq!(
+            watcher.watched(),
+            vec![dir.clone()],
+            "a directory the kernel refuses is left out rather than failing the set"
         );
         std::fs::remove_dir_all(&dir).unwrap();
     }

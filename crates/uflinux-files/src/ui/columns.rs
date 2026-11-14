@@ -204,6 +204,38 @@ impl Columns {
         }
     }
 
+    /// Re-read one pane, found by the folder it shows.
+    ///
+    /// For a change reported by the watcher in a parent column: the folders next
+    /// to it on screen are not implicated, and re-reading a chain of five small
+    /// folders because one of them moved is five directory walks where one would
+    /// do. The deepest pane is fair game here, unlike in [`Columns::reload`],
+    /// because the caller is the one that decided this folder changed and the
+    /// window's own read is not in flight for it.
+    pub fn reload_one(&self, location: &Location) {
+        let Some(pane) = self.pane_for(location) else {
+            return;
+        };
+        *pane.waiting.borrow_mut() = Some(pane.location.clone());
+        start(&self.inner, &pane);
+    }
+
+    /// Mark the deepest pane as waiting for the folder in the title bar, so that
+    /// the next listing the window reads paints it as well.
+    ///
+    /// For a change made outside this program in the folder on screen: the window
+    /// re-reads that folder for its own rows, and without this the pane holding
+    /// the same rows keeps painting the listing that just went stale.
+    /// [`Columns::reload`] skips this pane for the opposite reason — on a reload
+    /// the window is re-reading the folder anyway, and starting a second read of
+    /// one directory would race the first. This asks for no read at all.
+    pub fn expect_leaf(&self) {
+        let panes = self.inner.panes.borrow();
+        if let Some(pane) = panes.last() {
+            *pane.waiting.borrow_mut() = Some(pane.location.clone());
+        }
+    }
+
     /// Re-order the rows already on screen, from the cached listing. The cache
     /// is rewritten too: a pane that painted a new order and kept the old one
     /// would jump back the next time its rows were replaced, which is what
@@ -834,6 +866,63 @@ mod tests {
             });
             let widget = columns.pane_widgets().pop().expect("the leaf pane");
             assert_eq!(widget.tooltip_text().as_deref(), Some("Permission denied"));
+        });
+    }
+
+    /// Every pane of a settled chain: each one has been given a listing, so none
+    /// of them is waiting. Returns the panes' folders, which is what `done` needs.
+    fn settle(columns: &Columns) -> Vec<Location> {
+        let locations = columns.pane_locations();
+        for location in &locations {
+            columns.apply(&done(
+                &location.as_path().expect("a folder").display().to_string(),
+                vec![file("a"), file("b")],
+            ));
+        }
+        locations
+    }
+
+    fn waiting(columns: &Columns, index: usize) -> bool {
+        pane_at(index, columns).waiting.borrow().is_some()
+    }
+
+    #[test]
+    fn the_leaf_waits_for_a_listing_the_window_is_reading() {
+        tk::ui(|| {
+            let columns = columns();
+            columns.show_chain(&location("/home/u"));
+            settle(&columns);
+            assert!(!waiting(&columns, 2));
+            // The window re-reads the folder in its title bar for its own rows; the
+            // leaf holds those same rows and has to be told to expect them.
+            columns.expect_leaf();
+            assert!(waiting(&columns, 2));
+            // Marking is not reading: the pane keeps painting what it had, so the
+            // column does not blink empty while the window's read is on its way.
+            assert_eq!(columns.pane_len(2), 2);
+            columns.apply(&done("/home/u", vec![file("a")]));
+            assert_eq!(columns.pane_len(2), 1);
+            assert!(!waiting(&columns, 2));
+        });
+    }
+
+    #[test]
+    fn one_pane_can_be_re_read_without_the_others() {
+        tk::ui(|| {
+            let columns = columns();
+            columns.show_chain(&location("/home/u"));
+            settle(&columns);
+            // A change reported for one parent column must not implicate its
+            // neighbours: only the pane showing that folder is marked.
+            columns.reload_one(&location("/home"));
+            assert!(waiting(&columns, 1));
+            assert!(!waiting(&columns, 0));
+            assert!(!waiting(&columns, 2));
+            // A folder that is not a pane here is not this chain's business, and
+            // must not leave a pane waiting for a listing that will never come.
+            columns.reload_one(&location("/tmp"));
+            assert!(!waiting(&columns, 0));
+            assert!(!waiting(&columns, 2));
         });
     }
 

@@ -29,6 +29,7 @@ mod panel;
 mod row;
 mod search;
 mod view;
+mod watch;
 mod window;
 
 #[cfg(test)]

@@ -78,12 +78,42 @@ rows immediately instead of after the last one. `Cancel` is a flag the reader
 checks between batches; leaving a folder mid-read is the common case, not an
 error.
 
-`DirCache` holds at most 64 directories and 20 000 entries for 30 seconds, and
-is invalidated by the inotify watcher rather than by polling. The watcher coalesces
-events with a 300 ms debounce and caps itself at 16 watches; past the cap the
-overflowing directories are reported as needing a rescan instead of being
-watched, which keeps the descriptor count bounded on a machine where a home
-directory has hundreds of thousands of them.
+`DirCache` holds at most 64 directories and 20 000 entries for 30 seconds. It is
+not yet wired into `Readers`, so a folder is read again on every visit; what it
+will serve is the column chain, where the same directory is read on every
+navigation that passes through it. See `docs/validation.md` for how that gap is
+tracked.
+
+## Live updates
+
+A listing read once is a photograph: a file saved in an editor, a download that
+finished, a folder deleted from a terminal, none of it appears until the user
+navigates or reloads. `ufm_vfs::watch::Watcher` is the inotify layer — one thread,
+a 300 ms debounce, coalesced per directory, capped at 16 watches — and the UI, the
+provider and the indexer each drive their own instance of it.
+
+A window watches what it shows: the folder in the title bar plus the column chain,
+which is at most seven paths. The set is recomputed on every navigation rather than
+accumulated, because watching a home directory recursively costs one kernel watch
+per subfolder, which on a large tree is more memory than the listing itself.
+Recomputing is also what re-acquires a watch the kernel dropped on its own: deleting
+a directory retires its watch, so the set is re-declared after a live re-read as
+well, which is how a folder that was deleted and created again becomes live once
+more rather than staying dead until the user leaves it.
+
+What happens on an event depends on which half of the window the folder is. A
+parent column re-reads itself alone; re-reading a chain of five small folders
+because one of them moved is four directory walks wasted. The folder in the title
+bar is re-read by the window, through a path that deliberately does not go via
+navigation: navigation empties the view first, so a window would flash blank on
+every save in an editor, and it drops the filter the user typed and resets the index
+bar. The column holding those same rows is told to expect the listing rather than
+reading the directory a second time.
+
+A change that arrives while a listing is already on its way is only noted, and
+answered once that listing lands. Without that rule a program writing forty files
+cancels forty reads and walks the folder forty times; with it the burst costs one
+walk, and the listing that was already coming usually answers it for free.
 
 ## Archives
 
