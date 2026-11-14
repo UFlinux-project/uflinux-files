@@ -20,6 +20,7 @@
 use std::cell::Cell;
 use std::path::PathBuf;
 use std::thread;
+use std::time::{Duration, SystemTime};
 
 use gio::prelude::*;
 use gtk::prelude::*;
@@ -46,6 +47,14 @@ const META_FLAGS: gio::FileCopyFlags = gio::FileCopyFlags::ALL_METADATA;
 /// The attributes an enumeration has to return for the recursion to work: the
 /// name to recurse on, and the type to decide whether to.
 const ENUMERATE: &str = "standard::name,standard::type";
+
+/// The attributes a collision needs: what the row is, how big, and when it last
+/// changed. Nothing else is worth a `stat` before a prompt opens.
+const SIDE_ATTRIBUTES: &str = "standard::type,standard::size,time::modified";
+
+/// The one attribute name [`side_of`] reads a timestamp from, so the list above
+/// and the read below cannot drift apart.
+const TIME_MODIFIED: &str = "time::modified";
 
 /// The name the new-folder dialog offers before any counter is added.
 const UNTITLED: &str = "Untitled folder";
@@ -127,8 +136,104 @@ impl Clipboard {
 pub struct Step {
     /// Where it reads from.
     pub from: Location,
-    /// Where it writes to. Already unique, so running a step cannot overwrite.
+    /// Where it writes to. Unique unless the user answered a [`Conflict`] by
+    /// replacing, in which case it is the taken name and `replace` says so.
     pub to: Location,
+    /// Whether a row already at `to` is to be thrown away to make room. Set only
+    /// by an answer to a collision, which is the only way this program comes to
+    /// destroy a file it did not put there.
+    pub replace: bool,
+}
+
+impl Step {
+    /// A step that writes where nothing is in the way.
+    #[must_use]
+    pub fn new(from: Location, to: Location) -> Self {
+        Self {
+            from,
+            to,
+            replace: false,
+        }
+    }
+}
+
+/// A row whose name the target folder already has, and everything the prompt
+/// needs to describe the two rows that want the same name.
+///
+/// Recorded by [`plan`] rather than resolved there. Whether a collision should
+/// become `report (2).pdf` or throw the old file away is a question about what
+/// the user meant, and a file manager that guesses wrong in one direction fills
+/// the disk with copies while guessing wrong in the other loses a file.
+#[derive(Debug, Clone)]
+pub struct Conflict {
+    /// Which entry of [`Plan::steps`] this is about. The index rather than a copy
+    /// of the step is what lets an answer put the step back in the order the user
+    /// picked the rows in.
+    pub at: usize,
+    /// The name both rows want.
+    pub name: String,
+    /// The folder being pasted into.
+    pub into: Location,
+    /// The row that would arrive, from the listing the paste was asked for.
+    pub incoming: Side,
+    /// The row already on disk, when a `stat` for it came back. Read from the
+    /// filesystem rather than from a listing: a listing can be seconds old, and a
+    /// prompt that describes a file which is already gone is worse than one that
+    /// says nothing about it.
+    pub existing: Option<Side>,
+    /// How many further collisions this paste will run into after this one. The
+    /// prompt turns that into a "apply to the rest" answer, and a prompt that
+    /// offers to answer questions there are no longer is would be lying about
+    /// the batch.
+    pub more: usize,
+}
+
+/// One side of a collision, in the three terms a person actually compares: what
+/// kind of row it is, how full, and when it last changed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Side {
+    /// Whether it is a folder rather than a file.
+    pub folder: bool,
+    /// Bytes for a file, entries for a folder.
+    pub size: u64,
+    /// When it last changed, when the filesystem says.
+    pub modified: Option<SystemTime>,
+}
+
+impl Side {
+    /// Describe the row a listing reports.
+    #[must_use]
+    pub fn of(entry: &Entry) -> Self {
+        Self {
+            folder: entry.kind.is_dir(),
+            size: if entry.kind.is_dir() {
+                u64::from(entry.child_count.unwrap_or(0))
+            } else {
+                entry.size
+            },
+            modified: entry.modified,
+        }
+    }
+}
+
+/// An answer to one collision. `*All` variants answer the rest of the batch
+/// without asking again; see [`resolve`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Choose {
+    /// Throw the row already there away and put this one in its place.
+    Replace,
+    /// Put this one beside it, under the free name [`plan`] already worked out.
+    Rename,
+    /// Leave the folder alone as far as this row goes.
+    Skip,
+    /// Replace, and answer the rows behind this one the same way.
+    ReplaceAll,
+    /// Rename, and answer the rows behind this one the same way.
+    RenameAll,
+    /// Skip, and answer the rows behind this one the same way.
+    SkipAll,
+    /// Abandon the whole paste.
+    Cancel,
 }
 
 impl Step {
@@ -159,13 +264,22 @@ pub enum RenamePlan {
     Refused(String),
 }
 
-/// A paste worked out in advance: what will happen, and what will not.
+/// A paste worked out in advance: what will happen, what will not, and what the
+/// user has not answered yet.
+///
+/// A plan straight out of [`plan`] may still carry [`Plan::conflicts`], which
+/// means its steps are written under names nobody has agreed to. [`resolve`] is
+/// what clears them; [`paste`] resolves an unanswered plan by renaming, so a
+/// caller with no prompt gets the behaviour this program had before there was
+/// one rather than an overwrite.
 #[derive(Debug, Default)]
 pub struct Plan {
     /// The steps to run, in the order the user picked them.
     pub steps: Vec<Step>,
     /// Rows that will not be touched, each already worded for the banner.
     pub skipped: Vec<String>,
+    /// Collisions waiting for an answer, in the order their steps appear.
+    pub conflicts: Vec<Conflict>,
 }
 
 impl Plan {
@@ -246,6 +360,11 @@ impl Outcome {
 ///
 /// Pure apart from the existence checks, which are one `stat` per candidate name
 /// and are what makes the resulting [`Step`]s safe to run in any order.
+///
+/// A row whose name the folder already has is planned under a free name *and*
+/// recorded as a collision. The step is the answer a file manager may give
+/// without asking; the record is what lets it ask instead. Call [`resolve`] to
+/// turn a plan with conflicts into one that is safe to run as answered.
 #[must_use]
 pub fn plan(sources: &[Entry], folder: &Location, transfer: Transfer) -> Plan {
     let mut plan = Plan::default();
@@ -289,12 +408,172 @@ pub fn plan(sources: &[Entry], folder: &Location, transfer: Transfer) -> Plan {
                 .push(format!("{}: cannot be used as a name.", source.name));
             continue;
         };
+        // One `stat` per row, and the answer decides everything below: a free
+        // name needs no decision from anyone, a taken one needs both a fallback
+        // and a record of what is standing there.
+        let taken = exists(&base);
+        if taken {
+            plan.conflicts.push(Conflict {
+                at: plan.steps.len(),
+                name: source.name.clone(),
+                into: folder.clone(),
+                incoming: Side::of(source),
+                existing: side_of(&base),
+                more: 0,
+            });
+        }
         plan.steps.push(Step {
             from: from.clone(),
-            to: accept(&base, exists),
+            // The rename answer, which is also the answer a plan with no prompt
+            // gets. Computed even for a conflict so that answering `Rename` costs
+            // nothing beyond moving the step back into place.
+            to: if taken {
+                accept(&base, exists)
+            } else {
+                base.clone()
+            },
+            replace: false,
         });
     }
+    // Filled in at the end rather than per row: a collision can only say how
+    // many others follow it once the whole batch has been walked.
+    let total = plan.conflicts.len();
+    for (index, conflict) in plan.conflicts.iter_mut().enumerate() {
+        conflict.more = total - index - 1;
+    }
     plan
+}
+
+/// Apply the user's answers to the collisions in `plan`, in the order its steps
+/// run.
+///
+/// The answers arrive through a callback rather than as a list for two reasons:
+/// a prompt can be opened only for the collisions that are still worth asking
+/// about — a standing `Replace all` answer means the rows behind it are never
+/// shown — and the order the questions get asked is the order the work happens,
+/// which is the one thing a paste may not get wrong.
+///
+/// The result has no conflicts left, so [`paste`] will run it as answered. A
+/// [`Choose::Cancel`] abandons the whole paste rather than the one row: a user
+/// who cancels a prompt about the third file did not ask for a partial copy.
+#[must_use]
+pub fn resolve(mut plan: Plan, mut answer: impl FnMut(&Conflict) -> Choose) -> Plan {
+    if plan.conflicts.is_empty() {
+        return plan;
+    }
+    let conflicts = std::mem::take(&mut plan.conflicts);
+    let steps = std::mem::take(&mut plan.steps);
+    // How many rows the paste was going to write, for the message a cancel
+    // reports. `steps` is moved out of the plan below, so the number is taken
+    // before that happens.
+    let total = steps.len();
+    let mut kept: Vec<Step> = Vec::with_capacity(total);
+    // The reasons carried over from planning, with the rows the user declined
+    // added to them: a skipped row is reported exactly like a row the folder
+    // refused, because from the banner's point of view it is the same thing.
+    let mut skipped = std::mem::take(&mut plan.skipped);
+    // Where in `conflicts` the next step's collision would be. The list is built
+    // in step order, so one cursor is enough.
+    let mut next = 0_usize;
+    // A `*All` answer leaves a standing answer for the collisions behind it, so
+    // that answering once really does answer for the batch.
+    let mut standing: Option<Choose> = None;
+    for (index, mut step) in steps.into_iter().enumerate() {
+        if conflicts
+            .get(next)
+            .is_none_or(|conflict| conflict.at != index)
+        {
+            kept.push(step);
+            continue;
+        }
+        let conflict = conflicts[next].clone();
+        next += 1;
+        let choose = standing.unwrap_or_else(|| answer(&conflict));
+        standing = match choose {
+            Choose::ReplaceAll => Some(Choose::Replace),
+            Choose::RenameAll => Some(Choose::Rename),
+            Choose::SkipAll => Some(Choose::Skip),
+            _ => None,
+        };
+        match choose {
+            Choose::Replace | Choose::ReplaceAll => {
+                // The taken name, not the free one the plan was built with: this
+                // answer says the row already there is the one that goes.
+                if let Ok(joined) = conflict.into.join(&conflict.name) {
+                    step.to = joined;
+                }
+                step.replace = true;
+                kept.push(step);
+            }
+            Choose::Rename | Choose::RenameAll => kept.push(step),
+            Choose::Skip | Choose::SkipAll => {
+                skipped.push(format!("{}: not pasted.", conflict.name));
+            }
+            Choose::Cancel => {
+                skipped.push(format!(
+                    "Paste of {} into {} cancelled.",
+                    count(total),
+                    conflict.into.display()
+                ));
+                plan.steps.clear();
+                plan.skipped = skipped;
+                return plan;
+            }
+        }
+    }
+    plan.steps = kept;
+    plan.skipped = skipped;
+    plan
+}
+
+/// Describe the row already sitting at `location`, for the prompt that has to
+/// compare two of them.
+///
+/// Read from the filesystem rather than from the listing on screen: a listing is
+/// as old as the last time the folder was read, and a prompt that offers to
+/// replace a file which is no longer there describes a file the user cannot see.
+fn side_of(location: &Location) -> Option<Side> {
+    let info = file(location)?
+        .query_info(SIDE_ATTRIBUTES, gio::FileQueryInfoFlags::NONE, NO_CANCEL)
+        .ok()?;
+    let folder = info.file_type() == gio::FileType::Directory;
+    Some(Side {
+        folder,
+        size: if folder {
+            0
+        } else {
+            u64::try_from(info.size()).unwrap_or(0)
+        },
+        // Read as a string rather than as a number. `time::modified` is a
+        // `UINT64` attribute, so `attribute_int64` trips a type assertion and
+        // answers zero, and `attribute_status` is not a usable presence test —
+        // it reports `Unset` for attributes a plain `stat` clearly filled in.
+        // A value that is there prints as a number; one that is not prints as
+        // nothing at all, which is the distinction the prompt cares about.
+        modified: info
+            .attribute_as_string(TIME_MODIFIED)
+            .and_then(|reported| reported.parse::<i64>().ok())
+            .map(epoch_seconds),
+    })
+}
+
+/// A whole-second timestamp from the `time::modified` attribute, which `GIO`
+/// reports as seconds around the epoch and a filesystem may report as a number
+/// too large or too small to be a date at all.
+///
+/// Whole seconds is all the prompt compares: two rows modified in the same minute
+/// are indistinguishable to a person deciding which one to keep. A clock so far
+/// off the epoch that `SystemTime` cannot name it is reported as the epoch, which
+/// reads as a file from 1970 — an honest answer to a filesystem lying about time.
+#[must_use]
+fn epoch_seconds(seconds: i64) -> SystemTime {
+    let span = Duration::from_secs(seconds.unsigned_abs());
+    let shifted = if seconds < 0 {
+        SystemTime::UNIX_EPOCH.checked_sub(span)
+    } else {
+        SystemTime::UNIX_EPOCH.checked_add(span)
+    };
+    shifted.unwrap_or(SystemTime::UNIX_EPOCH)
 }
 
 /// `base`, or a free name beside it when `base` is taken.
@@ -378,17 +657,28 @@ fn file(location: &Location) -> Option<gio::File> {
 }
 
 /// Run one planned step.
+///
+/// A step answering a collision by replacing runs with `OVERWRITE`, which is what
+/// lets `GIO` do the destroying: replacing a file is a rename or a copy onto an
+/// existing name, and both are atomic where the filesystem supports them. A step
+/// that did not come from a collision never passes the flag, so nothing this
+/// program plans on its own can overwrite anything.
 fn run(step: &Step, transfer: Transfer) -> Result<(), String> {
     let from = file(&step.from).ok_or("not a file on disk")?;
     let to = file(&step.to).ok_or("not a file on disk")?;
+    let flags = if step.replace {
+        COPY_FLAGS | gio::FileCopyFlags::OVERWRITE
+    } else {
+        COPY_FLAGS
+    };
     let result = if transfer == Transfer::Move {
         // `g_file_move` renames where it can and falls back to copy-then-delete
         // where it cannot, across filesystems and for directories included.
-        from.move_(&to, gio::FileCopyFlags::NONE, NO_CANCEL, None)
+        from.move_(&to, flags, NO_CANCEL, None)
     } else if is_directory(&from) {
-        copy_tree(&from, &to)
+        copy_tree(&from, &to, step.replace)
     } else {
-        copy_file(&from, &to)
+        copy_file(&from, &to, flags)
     };
     result.map_err(|error| error.to_string())
 }
@@ -403,8 +693,12 @@ fn is_directory(file: &gio::File) -> bool {
 /// Two calls, and the second is allowed to fail: a copy that lost its timestamps
 /// is still the copy that was asked for, and reporting it as a failure would
 /// invite the user to try again and end up with two files.
-fn copy_file(from: &gio::File, to: &gio::File) -> Result<(), glib::Error> {
-    from.copy(to, COPY_FLAGS, NO_CANCEL, None)?;
+fn copy_file(
+    from: &gio::File,
+    to: &gio::File,
+    flags: gio::FileCopyFlags,
+) -> Result<(), glib::Error> {
+    from.copy(to, flags, NO_CANCEL, None)?;
     from.copy_attributes(to, META_FLAGS, NO_CANCEL).ok();
     Ok(())
 }
@@ -415,16 +709,33 @@ fn copy_file(from: &gio::File, to: &gio::File) -> Result<(), glib::Error> {
 /// bounded by the worker's stack: a frame here is a handful of locals, so a 256
 /// KiB stack lasts a few thousand levels, and no filesystem the reader can list
 /// comes close.
-fn copy_tree(from: &gio::File, to: &gio::File) -> Result<(), glib::Error> {
-    to.make_directory(NO_CANCEL)?;
+///
+/// `merge` says that a target which already exists is not a failure but the point:
+/// replacing a folder means writing into the folder that is already there, so an
+/// existing directory is walked into rather than complained about, and the files
+/// inside it are overwritten one at a time. Without that, replacing a folder would
+/// fail on its own name and leave the old contents mixed with the new.
+fn copy_tree(from: &gio::File, to: &gio::File, merge: bool) -> Result<(), glib::Error> {
+    match to.make_directory(NO_CANCEL) {
+        Ok(()) => {}
+        // Replacing a folder means merging into what is there, so the only error
+        // worth passing on is one that is not "it already exists".
+        Err(error) if merge && error.matches(gio::IOErrorEnum::Exists) => {}
+        Err(error) => return Err(error),
+    }
     from.copy_attributes(to, META_FLAGS, NO_CANCEL).ok();
+    let flags = if merge {
+        COPY_FLAGS | gio::FileCopyFlags::OVERWRITE
+    } else {
+        COPY_FLAGS
+    };
     for name in child_names(from)? {
         let child = from.child(&name);
         let target = to.child(&name);
         if is_directory(&child) {
-            copy_tree(&child, &target)?;
+            copy_tree(&child, &target, merge)?;
         } else {
-            copy_file(&child, &target)?;
+            copy_file(&child, &target, flags)?;
         }
     }
     Ok(())
@@ -548,7 +859,15 @@ pub fn discard(handle: &Handle, entries: &[Entry], permanent: bool) {
 
 /// Run a planned paste. `transfer` comes from the clipboard the plan came from.
 pub fn paste(handle: &Handle, plan: Plan, transfer: Transfer) {
-    let Plan { steps, skipped } = plan;
+    // Resolving here rather than running an unanswered plan is what keeps the
+    // two callers of this function honest: a window that asked has nothing left
+    // to resolve and passes straight through, and a caller with no way to ask
+    // gets the rename fallback rather than an overwrite it never promised.
+    let Plan {
+        steps,
+        skipped,
+        conflicts: _,
+    } = resolve(plan, |_| Choose::Rename);
     if steps.is_empty() {
         let message = if skipped.is_empty() {
             "Nothing to paste.".to_string()
@@ -1160,6 +1479,7 @@ mod tests {
         copy_tree(
             &gio::File::for_path(from.path()),
             &gio::File::for_path(&target),
+            false,
         )
         .expect("a folder should copy");
         assert_eq!(
@@ -1210,11 +1530,11 @@ mod tests {
         tree(root.path());
         let queue = Queue::without_source().expect("a pipe can be made");
         let plan = Plan {
-            steps: vec![Step {
-                from: Location::file(root.path().join("notes.txt")),
-                to: Location::file(root.path().join("copied.txt")),
-            }],
-            skipped: Vec::new(),
+            steps: vec![Step::new(
+                Location::file(root.path().join("notes.txt")),
+                Location::file(root.path().join("copied.txt")),
+            )],
+            ..Plan::default()
         };
         paste(&queue.handle(), plan, Transfer::Move);
         let outcome = operated(&queue);
@@ -1235,11 +1555,11 @@ mod tests {
         tree(from.path());
         let queue = Queue::without_source().expect("a pipe can be made");
         let plan = Plan {
-            steps: vec![Step {
-                from: Location::file(from.path()),
-                to: Location::file(to.path().join("moved")),
-            }],
-            skipped: Vec::new(),
+            steps: vec![Step::new(
+                Location::file(from.path()),
+                Location::file(to.path().join("moved")),
+            )],
+            ..Plan::default()
         };
         paste(&queue.handle(), plan, Transfer::Copy);
         let outcome = operated(&queue);
@@ -1289,6 +1609,317 @@ mod tests {
         assert!(!outcome.ok);
         assert_eq!(outcome.message, "Nothing to paste.");
         assert!(outcome.changed.is_empty());
+    }
+
+    /// Two rows from different folders, pasted into a folder that already holds
+    /// both names: the smallest batch with two collisions.
+    fn collisions(root: &std::path::Path) -> (Vec<Entry>, Location) {
+        for name in ["x", "y", "dest"] {
+            fs::create_dir_all(root.join(name)).expect("a folder to paste into");
+        }
+        fs::write(root.join("x").join("notes.txt"), b"first").expect("a row to paste");
+        fs::write(root.join("y").join("todo.txt"), b"second").expect("a row to paste");
+        fs::write(root.join("dest").join("notes.txt"), b"old").expect("a row in the way");
+        fs::write(root.join("dest").join("todo.txt"), b"older").expect("a second row in the way");
+        (
+            vec![
+                file(&root.join("x"), "notes.txt"),
+                file(&root.join("y"), "todo.txt"),
+            ],
+            Location::file(root.join("dest")),
+        )
+    }
+
+    #[test]
+    fn a_collision_records_both_sides_and_counts_the_ones_behind_it() {
+        let root = tempfile::tempdir().expect("a folder to collide in");
+        let (sources, into) = collisions(root.path());
+        let planned = plan(&sources, &into, Transfer::Copy);
+        assert_eq!(planned.steps.len(), 2, "both rows are still planned");
+        assert_eq!(planned.conflicts.len(), 2);
+        // The first prompt can promise to answer one more collision; the last has
+        // nothing left to promise.
+        assert_eq!(planned.conflicts[0].more, 1);
+        assert_eq!(planned.conflicts[1].more, 0);
+        assert_eq!(planned.conflicts[0].at, 0);
+        assert_eq!(planned.conflicts[1].at, 1);
+        assert_eq!(planned.conflicts[0].name, "notes.txt");
+        assert_eq!(planned.conflicts[0].into, into);
+        assert_eq!(
+            planned.conflicts[0].incoming,
+            Side {
+                folder: false,
+                // The test listing says zero bytes; what matters is that the
+                // incoming side is the row as listed, not a fresh `stat`.
+                size: 0,
+                modified: None,
+            },
+            "the incoming row is the one the listing reported"
+        );
+        let existing = planned.conflicts[0]
+            .existing
+            .as_ref()
+            .expect("the row in the way can be read");
+        assert!(!existing.folder);
+        assert_eq!(
+            existing.size, 3,
+            "the bytes actually on disk, not the listing"
+        );
+        assert!(
+            existing.modified.is_some(),
+            "a file just written has a modification time"
+        );
+        // Without an answer the plan keeps the fallback name, so a caller with no
+        // prompt still cannot overwrite anything.
+        assert_eq!(
+            planned.steps[0].to,
+            Location::file(root.path().join("dest").join("notes (2).txt"))
+        );
+        assert!(!planned.steps[0].replace);
+    }
+
+    #[test]
+    fn a_row_that_cannot_be_read_leaves_the_prompt_without_an_existing_side() {
+        let root = tempfile::tempdir().expect("a folder to stat in");
+        assert!(side_of(&Location::file(root.path().join("absent"))).is_none());
+        fs::create_dir(root.path().join("box")).expect("a folder");
+        let dir = side_of(&Location::file(root.path().join("box"))).expect("a folder can be read");
+        assert!(dir.folder);
+        assert_eq!(
+            dir.size, 0,
+            "a folder is counted by the prompt in another way"
+        );
+        fs::write(root.path().join("plain"), b"0123456789").expect("a file");
+        let plain = side_of(&Location::file(root.path().join("plain"))).expect("a file");
+        assert!(!plain.folder);
+        assert_eq!(plain.size, 10);
+    }
+
+    #[test]
+    fn a_timestamp_before_the_epoch_is_still_a_time() {
+        let zero = epoch_seconds(0);
+        assert_eq!(zero, SystemTime::UNIX_EPOCH);
+        let later = epoch_seconds(3_600);
+        assert!(later > zero);
+        assert_eq!(
+            later
+                .duration_since(zero)
+                .expect("an hour after the epoch")
+                .as_secs(),
+            3_600
+        );
+        // Filesystems with a clock set to before 1970 report negative seconds, and
+        // a prompt that dropped them would say nothing about the row.
+        let earlier = epoch_seconds(-3_600);
+        assert!(earlier < zero);
+        assert!(
+            epoch_seconds(i64::MAX) >= zero,
+            "a clock too far ahead is still shown as a date"
+        );
+        assert!(
+            epoch_seconds(i64::MIN) <= zero,
+            "the extremes of what a filesystem can report never stop the prompt"
+        );
+    }
+
+    #[test]
+    fn answering_replace_writes_over_the_row_already_there() {
+        let root = tempfile::tempdir().expect("a folder to overwrite in");
+        let (sources, into) = collisions(root.path());
+        let answered = resolve(plan(&sources[..1], &into, Transfer::Copy), |_| {
+            Choose::Replace
+        });
+        assert!(answered.conflicts.is_empty(), "the plan is safe to run");
+        assert_eq!(answered.steps.len(), 1);
+        assert_eq!(
+            answered.steps[0].to,
+            Location::file(root.path().join("dest").join("notes.txt")),
+            "replace takes the taken name back"
+        );
+        assert!(answered.steps[0].replace);
+        let queue = Queue::without_source().expect("a pipe can be made");
+        paste(&queue.handle(), answered, Transfer::Copy);
+        let outcome = operated(&queue);
+        assert!(outcome.ok, "{}", outcome.message);
+        assert_eq!(
+            fs::read(root.path().join("dest").join("notes.txt")).expect("the row that was written"),
+            b"first",
+            "the old bytes are the ones that went"
+        );
+        assert!(
+            !root.path().join("dest").join("notes (2).txt").exists(),
+            "replacing does not also leave a copy behind"
+        );
+    }
+
+    #[test]
+    fn answering_rename_keeps_both_rows() {
+        let root = tempfile::tempdir().expect("a folder to keep both in");
+        let (sources, into) = collisions(root.path());
+        let answered = resolve(plan(&sources[..1], &into, Transfer::Copy), |_| {
+            Choose::Rename
+        });
+        assert!(!answered.steps[0].replace);
+        assert_eq!(
+            answered.steps[0].to,
+            Location::file(root.path().join("dest").join("notes (2).txt"))
+        );
+        let queue = Queue::without_source().expect("a pipe can be made");
+        paste(&queue.handle(), answered, Transfer::Copy);
+        let outcome = operated(&queue);
+        assert!(outcome.ok, "{}", outcome.message);
+        assert_eq!(
+            fs::read(root.path().join("dest").join("notes.txt")).expect("the old row"),
+            b"old"
+        );
+        assert_eq!(
+            fs::read(root.path().join("dest").join("notes (2).txt")).expect("the new row"),
+            b"first"
+        );
+    }
+
+    #[test]
+    fn answering_skip_leaves_the_folder_alone_and_says_so() {
+        let root = tempfile::tempdir().expect("a folder to skip into");
+        let (sources, into) = collisions(root.path());
+        let answered = resolve(plan(&sources, &into, Transfer::Copy), |_| Choose::Skip);
+        assert!(answered.steps.is_empty(), "nothing was agreed to write");
+        assert_eq!(answered.skipped.len(), 2, "one reason per row declined");
+        assert!(
+            answered.skipped[0].contains("not pasted"),
+            "{}",
+            answered.skipped[0]
+        );
+        assert_eq!(
+            fs::read(root.path().join("dest").join("notes.txt")).expect("the row left alone"),
+            b"old"
+        );
+    }
+
+    #[test]
+    fn a_standing_answer_answers_the_rows_behind_it_without_asking_again() {
+        let root = tempfile::tempdir().expect("a folder to answer once in");
+        let (sources, into) = collisions(root.path());
+        let asked = std::cell::Cell::new(0_usize);
+        let answered = resolve(plan(&sources, &into, Transfer::Copy), |_| {
+            asked.set(asked.get() + 1);
+            Choose::ReplaceAll
+        });
+        assert_eq!(asked.get(), 1, "one question for a batch answer");
+        assert_eq!(answered.steps.len(), 2, "both rows were still written");
+        assert!(
+            answered.steps.iter().all(|step| step.replace),
+            "the standing answer applies to the rows behind the one asked"
+        );
+    }
+
+    #[test]
+    fn a_standing_rename_leaves_the_fallback_names_in_place() {
+        let root = tempfile::tempdir().expect("a folder to rename all in");
+        let (sources, into) = collisions(root.path());
+        let answered = resolve(plan(&sources, &into, Transfer::Copy), |_| Choose::RenameAll);
+        assert_eq!(answered.steps.len(), 2);
+        assert!(
+            answered.steps.iter().all(|step| !step.replace),
+            "a rename promises nothing about the row already there"
+        );
+        let names: Vec<&str> = answered
+            .steps
+            .iter()
+            .map(|step| step.to.file_name().unwrap_or(""))
+            .collect();
+        assert_eq!(
+            names,
+            vec!["notes (2).txt", "todo (2).txt"],
+            "both rows take a free name beside the folder"
+        );
+    }
+
+    #[test]
+    fn cancelling_abandons_the_whole_paste_and_says_how_much() {
+        let root = tempfile::tempdir().expect("a folder to cancel in");
+        let (sources, into) = collisions(root.path());
+        let answered = resolve(plan(&sources, &into, Transfer::Copy), |_| Choose::Cancel);
+        assert!(answered.steps.is_empty(), "a cancel is not a partial paste");
+        assert_eq!(answered.skipped.len(), 1, "one message for the whole batch");
+        assert!(
+            answered.skipped[0].contains("Paste of 2 items"),
+            "{}",
+            answered.skipped[0]
+        );
+        assert!(
+            answered.skipped[0].contains("cancelled"),
+            "{}",
+            answered.skipped[0]
+        );
+        assert_eq!(
+            fs::read(root.path().join("dest").join("notes.txt")).expect("nothing was written"),
+            b"old"
+        );
+    }
+
+    #[test]
+    fn a_paste_nobody_asked_about_renames_rather_than_overwrites() {
+        let root = tempfile::tempdir().expect("a folder nobody asked in");
+        let (sources, into) = collisions(root.path());
+        let queue = Queue::without_source().expect("a pipe can be made");
+        // The plan goes in straight from `plan`, conflicts and all.
+        paste(
+            &queue.handle(),
+            plan(&sources, &into, Transfer::Copy),
+            Transfer::Copy,
+        );
+        let outcome = operated(&queue);
+        assert!(outcome.ok, "{}", outcome.message);
+        assert_eq!(
+            fs::read(root.path().join("dest").join("notes.txt")).expect("the old row"),
+            b"old",
+            "a paste that never asked must not destroy anything"
+        );
+        assert!(root.path().join("dest").join("notes (2).txt").exists());
+        assert!(root.path().join("dest").join("todo (2).txt").exists());
+    }
+
+    #[test]
+    fn replacing_a_folder_merges_into_the_one_already_there() {
+        let root = tempfile::tempdir().expect("a folder to merge into");
+        let from = root.path().join("src");
+        let into = root.path().join("into");
+        fs::create_dir_all(from.join("box").join("deep")).expect("a source folder");
+        fs::write(from.join("box").join("notes.txt"), b"new").expect("a source file");
+        fs::write(from.join("box").join("deep").join("inner.txt"), b"nested")
+            .expect("a nested file");
+        fs::create_dir_all(into.join("box")).expect("a destination folder");
+        fs::write(into.join("box").join("keep.txt"), b"keep").expect("a file to keep");
+        fs::write(into.join("box").join("notes.txt"), b"old").expect("a file to lose");
+        let answered = resolve(
+            plan(
+                &[folder(&from, "box")],
+                &Location::file(&into),
+                Transfer::Copy,
+            ),
+            |_| Choose::Replace,
+        );
+        assert!(answered.steps[0].replace);
+        let queue = Queue::without_source().expect("a pipe can be made");
+        paste(&queue.handle(), answered, Transfer::Copy);
+        let outcome = operated(&queue);
+        assert!(outcome.ok, "{}", outcome.message);
+        let box_path = into.join("box");
+        assert_eq!(
+            fs::read(box_path.join("notes.txt")).expect("the replaced file"),
+            b"new",
+            "the file that was in the way is the one that went"
+        );
+        assert_eq!(
+            fs::read(box_path.join("keep.txt")).expect("the untouched file"),
+            b"keep",
+            "merging does not empty the folder it merges into"
+        );
+        assert_eq!(
+            fs::read(box_path.join("deep").join("inner.txt")).expect("the nested file"),
+            b"nested"
+        );
     }
 
     /// The first operation event a worker reported, waiting for it to arrive.

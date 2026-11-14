@@ -32,7 +32,10 @@ the model over D-Bus and never opens a window.
   delete, on `<Ctrl>C`/`<Ctrl>X`/`<Ctrl>V`, `F2`, `<Ctrl><Shift>N`, `Delete`
   and `<Shift>Delete`. Each one runs on a worker and reports when it is done,
   so a large folder never freezes the window; a paste that cannot place one row
-  skips that row with a reason instead of abandoning the rest.
+  skips that row with a reason instead of abandoning the rest. Pasting onto a
+  name the folder already has asks rather than guessing, showing both rows and
+  offering replace, rename or skip for the whole batch; replacing a folder merges
+  into the one already there.
 - **Desktop icons**: this program owns the model — what is on the desktop, where
   each icon sits, what happens when one is double-clicked — and
   `uflinux-desktop` draws it, so there is no second full-screen GTK process.

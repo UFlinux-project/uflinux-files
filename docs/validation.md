@@ -152,7 +152,10 @@ entries and counts them; the list mode swaps in a tree table with the four headi
 columns mode renders one pane per path level; `Describe` reports `paste` disabled while
 the clipboard is empty; the `new-folder` action opens a prompt, its button creates the
 folder the prompt suggested, the listing picks it up without being told to, and answering
-the prompt closes it; `Describe` reports `extract` disabled on an ordinary folder, a
+the prompt closes it; copying a folder and pasting it where a folder of that name already
+lives opens a prompt that names both sides, and answering it `Skip` leaves the disk alone
+while answering it `Replace` merges the incoming folder into the one already standing
+there; `Describe` reports `extract` disabled on an ordinary folder, a
 second window opened on a real `.tar` reports it enabled, activating it leaves a folder
 beside the container holding the members, and the window that asked for it says so in
 its banner; a file created and then deleted by the shell appears and disappears in the
@@ -161,6 +164,24 @@ second invocation opens a `Computer` window in the running instance; `--new-wind
 a window rather than focusing an open one; and the indexer answers `Status` on the bus.
 The prompt is driven through the accessibility tree, by the `press` command of the probe,
 which activates a node by name — the same controller path a mouse click takes.
+
+The collision checks are the ones that had to be built up rather than read off, for two
+reasons worth knowing before adding to them. The first is that a selection has to be made
+without a mouse: a row answers `Action` and `Component` but not `Selection`, because
+selection belongs to the container, so the probe gained a `select` command that finds a
+node by name, works out its index among its parent's children, and calls
+`Atspi.Selection.select_child` on the parent `table` or `list`. That drives the
+application's real selection rather than a look-alike, which matters because
+`Describe copy` reports the action enabled whether or not anything is selected —
+sensitivity simply cannot be the assertion here. The second is that activating `paste` on
+a folder with a collision does not return until the prompt is answered, since the prompt
+runs its own `GLib` main-context loop; the harness backgrounds the activation and drives
+the prompt from the shell. What the checks then assert is the effect rather than the
+widget: the prompt names both sides of the collision, answering `Replace` changes the
+bytes on disk and answering `Skip` leaves them alone, and the window closes either way.
+The unit tests cover the answers the harness cannot reach — a standing replace-all, a
+standing rename-all, a cancel that abandons the whole batch, a folder that merges rather
+than fails — because those are decisions about a plan, and a plan does not need a screen.
 
 The live-refresh checks double as the cache's end-to-end check, and that is the reason
 they are load-bearing rather than incidental. A listing is now remembered between
@@ -269,5 +290,9 @@ catches.
 - Physical HDR, VRR and GPU behaviour: separate hardware validation.
 - Wireless and DHCP: ConnMan owns those, and the file manager has no opinion about
   them beyond mounting what is already mounted.
-- Copy/move conflict resolution across devices, and the properties dialog: they do not
-  exist yet, so there is nothing to certify. Their tests land with them.
+- The properties dialog: it does not exist yet, so there is nothing to certify. Its
+  tests land with it.
+- Replacing across devices, and a trash that lives on another filesystem than the
+  row being discarded: both need a second mounted filesystem in the fixture, which
+  the container has no way to offer honestly. The conflict prompt itself is the same
+  code either way, and is covered below.

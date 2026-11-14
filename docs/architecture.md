@@ -222,11 +222,38 @@ an operation refreshes the folder it changed and reports through the same banner
 a failed read uses. Nothing about an operation blocks the interface, and no
 operation needs a thread of its own beyond the one running it.
 
-What is deliberately not there yet: there is no conflict dialog, so a paste
-either takes a free name or grows a counter and never asks about replacing; there
-is no progress reporting, so a large copy reports once at the end; and there is
-no undo. Those are the next step, and all three want a job record that a single
-operation does not need. Extracting an archive shares all three gaps, and shares
+A taken name is a question rather than a decision. The plan records one
+collision per row whose name the destination already has, holding both sides of
+it — what is being pasted, and what `stat` says is standing there — along with
+how many collisions sit behind it, which is what lets the prompt offer "apply to
+the rest" instead of asking the same question six times. `resolve` turns the plan
+into an answered one: replace points the step at the name it displaces and marks
+it, skip drops the step and leaves a line for the banner, cancel empties the plan
+and says how much was lost. A standing answer — replace all, rename all, skip
+all — is remembered by kind, so the rows behind the one that was asked about are
+never asked about again. Replacing a folder merges into the one already there
+rather than failing, because a folder that refuses to accept a paste is the
+result nobody wanted.
+
+The prompt itself lives in its own module and blocks on the `GLib` main context
+rather than on a thread, which is how `gtk_dialog_run` worked and what keeps the
+interface repainting while the question is open; the window's visibility is the
+loop's second exit, so closing the folder out from under a prompt abandons the
+paste instead of hanging on it. One consequence matters for anything that drives
+the interface from outside: activating `paste` on a folder with a collision does
+not return until the prompt is answered.
+
+Reading the existing side has one trap worth recording. `time::modified` is a
+`UINT64` attribute, so `attribute_int64` trips a type assertion inside `GLib` and
+answers zero, and `attribute_status` is no use as a presence test — it reports
+`Unset` for attributes a plain `stat` clearly filled in. The timestamp is read as
+a string and parsed, which leaves exactly two answers: a number, or nothing at
+all. A row that could not be read at all is shown as a folder with no size rather
+than as an empty one.
+
+What is deliberately not there yet: there is no progress reporting, so a large
+copy reports once at the end; and there is no undo. Both want a job record that a
+single operation does not need. Extracting an archive shares both gaps, and shares
 the reason: the command reports once, when it is over.
 
 ## Search

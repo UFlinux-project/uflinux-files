@@ -69,8 +69,15 @@ export WAYLAND_DISPLAY WLR_BACKENDS WLR_RENDERER
 # machine's real files. The tree under it is what the window is pointed at.
 HOME=$ROOT/home
 XDG_DATA_HOME=$HOME/.local/share
-mkdir -p "$HOME" "$XDG_DATA_HOME" "$ROOT/tree/alpha/one" "$ROOT/tree/alpha/two"
-: >"$ROOT/tree/alpha/one/note.txt"
+mkdir -p "$HOME" "$XDG_DATA_HOME" "$ROOT/tree/alpha/one" "$ROOT/tree/alpha/two" \
+    "$ROOT/tree/one"
+# A folder called `one` beside the one the window opens on, holding a file of its
+# own. The collision checks below copy `alpha/one` onto `tree/one`, which is the
+# only way to reach the conflict prompt from a fixture; what each side holds is
+# what lets those checks tell a merge from an overwrite. The window still opens on
+# a folder of two entries, so the count the status line has to say is unchanged.
+printf kept >"$ROOT/tree/one/keep.txt"
+printf new >"$ROOT/tree/alpha/one/arrived.txt"
 export HOME XDG_DATA_HOME
 # The path the window opens on. Two entries, so the status line has a number to say.
 TARGET=$ROOT/tree/alpha
@@ -315,6 +322,83 @@ if printf '%s\n' "$DUMP" | grep -qF "$(printf 'frame\tNew Folder\t')"; then
 else
     ok "answering the prompt closes it"
 fi
+
+# --- pasting onto a name that is taken ------------------------------------------------
+# The collision prompt, reached the way a user reaches it: copy a folder, go up one
+# level, and paste it where a folder of that name already lives. Two things make this
+# harder to drive than the name prompt above, and both are worth knowing before
+# adding to it.
+#
+# The first is the selection. There is no click to give, and a row answers `Action`
+# and `Component` but not `Selection` — selection belongs to the container — so the
+# probe's `select` command finds the row by name and asks the grid holding it. That
+# drives the application's real selection, which matters because `Describe copy`
+# reports the action enabled whether or not anything is selected: sensitivity cannot
+# be the assertion here, and the effect has to be.
+#
+# The second is that activating `paste` does not return while the prompt is open; the
+# prompt runs its own main-context loop, which is how a dialog used to work and what
+# keeps the rest of the interface repainting. So the activation is backgrounded and
+# the prompt is answered from here. The job's pid is kept rather than waiting for
+# every background job, because `labwc` and the application are background jobs too
+# and outlive this section.
+if ! python3 "$A11Y" select one >/dev/null 2>&1; then
+    fail "a row can be selected through the accessibility tree"
+else
+    ok "a row can be selected through the accessibility tree"
+fi
+act copy "[]" "[]"
+act up "[]" "[]"
+sleep 1
+# Skip first, so the tree the replace run then changes is still the untouched one.
+act paste "[]" "[]" &
+PASTE=$!
+has_frame "Replace this folder?" "pasting onto a taken name asks rather than renaming"
+refresh
+if printf '%s\n' "$DUMP" | grep -qF "is already in"; then
+    ok "the prompt names the folder the two rows would land in"
+else
+    fail "the prompt names the folder the two rows would land in"
+fi
+python3 "$A11Y" press Skip >/dev/null 2>&1 || true
+wait "$PASTE" || :
+if [ ! -e "$ROOT/tree/one/arrived.txt" ]; then
+    ok "answering Skip leaves the folder already there alone"
+else
+    fail "answering Skip leaves the folder already there alone (it merged anyway)"
+fi
+refresh
+if printf '%s\n' "$DUMP" | grep -qF "$(printf 'frame\tReplace this folder?\t')"; then
+    fail "answering the collision prompt closes it"
+else
+    ok "answering the collision prompt closes it"
+fi
+
+# The same question again, this time answered the other way. The clipboard survives a
+# skipped paste for the same reason it survives a completed one: a copy can be pasted
+# more than once. What is asserted now is the shape of a merged folder rather than
+# just that something was written — the incoming file has to arrive *and* the file
+# that was already there has to still be there, which is the difference between
+# merging and replacing a folder wholesale.
+act paste "[]" "[]" &
+PASTE=$!
+has_frame "Replace this folder?" "a skipped paste leaves the clipboard for another one"
+python3 "$A11Y" press Replace >/dev/null 2>&1 || true
+wait "$PASTE" || :
+i=0
+while [ "$i" -lt 50 ] && [ ! -f "$ROOT/tree/one/arrived.txt" ]; do
+    i=$((i + 1))
+    sleep 0.2
+done
+if [ -f "$ROOT/tree/one/arrived.txt" ] && [ -f "$ROOT/tree/one/keep.txt" ]; then
+    ok "answering Replace merges into the folder already there"
+else
+    fail "answering Replace merges into the folder already there (arrived: $([ -f "$ROOT/tree/one/arrived.txt" ] && echo y || echo n), kept: $([ -f "$ROOT/tree/one/keep.txt" ] && echo y || echo n))"
+fi
+
+# Back to the folder the script opened the window on, which the checks below assume.
+act back "[]" "[]"
+has_frame "$TARGET" "Back returns to the folder the window came from"
 
 # --- extracting an archive -----------------------------------------------------
 # The one write the archive browser offers. Checked against a real container

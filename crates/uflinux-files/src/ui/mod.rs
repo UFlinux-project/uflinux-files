@@ -20,6 +20,7 @@
 #![allow(dead_code)]
 
 mod columns;
+mod conflict;
 mod connect;
 mod css;
 mod extract;

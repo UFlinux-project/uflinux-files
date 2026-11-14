@@ -37,8 +37,9 @@ from gi.repository import Atspi  # noqa: E402
 
 # The states the smoke test distinguishes between. A header button that is
 # insensitive is how the program says "there is nowhere further to go back to",
-# which is a fact worth asserting; the rest of the state set is noise here.
-STATES = ("visible", "showing", "sensitive", "focusable")
+# which is a fact worth asserting; `selected` is how a test confirms a row it
+# asked to select actually took; the rest of the state set is noise here.
+STATES = ("visible", "showing", "sensitive", "focusable", "selected")
 
 # Stop rather than hang if the tree is deeper or wider than expected. A window
 # with a folder of ten thousand entries would otherwise walk for minutes.
@@ -201,6 +202,52 @@ def press(wanted):
     return 0
 
 
+def select(wanted):
+    """Select the first selectable node named WANTED.
+
+    This is how a test picks a row before asking the window to copy it. The
+    selection lives on the container — a grid cell or a tree-table row answers
+    `Action` and `Component` but not `Selection` — so the walk keeps the path it
+    took to reach a node and hands that to `select_at`, which finds the row and
+    the container that holds it. Breadth-first, so the shallowest node with the
+    name wins: the row itself rather than the label inside it.
+    """
+    queue = [(app, []) for app in apps()]
+    while queue:
+        acc, trail = queue.pop(0)
+        for position, child in enumerate(children(acc)):
+            step = trail + [(acc, position)]
+            if name(child) == wanted:
+                answer = select_at(step)
+                if answer is not None:
+                    return answer
+            queue.append((child, step))
+    print("no node named %s" % wanted)
+    return 2
+
+
+def select_at(trail):
+    """Select the node at the end of TRAIL, a list of (parent, index) pairs.
+
+    The trail is walked from the node upwards, and the first container that
+    answers `Selection` gets the call — which is the grid or the tree table
+    rather than the cell, and the index is the row's position inside it. Returns
+    `None` when nothing on the way up holds a selection, so a label in a banner
+    that merely repeats a folder's name is skipped and the search continues; a
+    container that answers but refuses is a real failure and is reported.
+    """
+    for parent, index in reversed(trail):
+        iface = Atspi.Accessible.get_selection_iface(parent)
+        if iface is None:
+            continue
+        if not Atspi.Selection.select_child(iface, index):
+            print("selection refused at index %d" % index)
+            return 5
+        return 0
+    print("no Selection interface above the node")
+    return 3
+
+
 def main(argv):
     Atspi.init()
     command = argv[0] if argv else "dump"
@@ -212,7 +259,12 @@ def main(argv):
         return read_entry()
     if command == "press":
         return press(argv[1])
-    print("usage: files-ui-a11y.py [dump | type TEXT | entry | press NAME]", file=sys.stderr)
+    if command == "select":
+        return select(argv[1])
+    print(
+        "usage: files-ui-a11y.py [dump | type TEXT | entry | press NAME | select NAME]",
+        file=sys.stderr,
+    )
     return 64
 
 

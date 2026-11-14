@@ -37,6 +37,7 @@ use ufm_core::sort::SortKey;
 use ufm_vfs::{Cancel, FsHints, Readers};
 
 use super::columns::Columns;
+use super::conflict;
 use super::connect;
 use super::extract;
 use super::job::{Event, Handle, Queue};
@@ -1543,7 +1544,7 @@ fn op_actions(ctx: &Ctx) -> Vec<Rc<gio::SimpleAction>> {
     paste.connect_activate({
         let ctx = ctx.clone();
         move |_action, _parameter| {
-            let Some(handle) = ctx.handle.borrow().clone() else {
+            let Some((window, handle)) = sink_for(&ctx) else {
                 return;
             };
             let Some(folder) = target_folder(&ctx) else {
@@ -1556,7 +1557,10 @@ fn op_actions(ctx: &Ctx) -> Vec<Rc<gio::SimpleAction>> {
                 let state = ctx.shared.state.borrow();
                 (state.clipboard.plan(&folder), state.clipboard.transfer())
             };
-            ops::paste(&handle, plan, transfer);
+            // Not `ops::paste`: a plan that ran into a name the folder already
+            // has has to ask before it writes anything, and the window is the
+            // only thing here that can show the question.
+            conflict::paste(&window, &handle, plan, transfer);
         }
     });
 
