@@ -25,6 +25,7 @@ mod css;
 mod job;
 mod panel;
 mod row;
+mod search;
 mod view;
 mod window;
 

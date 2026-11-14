@@ -39,6 +39,7 @@ use super::connect;
 use super::job::{Event, Handle, Queue};
 use super::panel::{Panel, Place, Usage};
 use super::row::Row;
+use super::search::{Found, Outcome, Search};
 use super::view::View;
 use crate::runner::{Layout, Report, Runner};
 
@@ -76,6 +77,10 @@ pub fn open(app: &gtk::Application, urls: &[String]) {
     let columns = Rc::new(Columns::new(Arc::clone(&readers), key, prefs.show_hidden));
     let (banner, banner_label) = banner_bar();
     let path = path_label(&start);
+    // The bar starts out knowing the same folder the window will open on and
+    // with the same rule about dotfiles, so that its first query cannot return a
+    // dotfile the view would have hidden.
+    let find = Search::new(&prefs.search_scope, prefs.search_content, prefs.show_hidden);
 
     let shared = Rc::new(Shared {
         prefs: RefCell::new(prefs),
@@ -105,6 +110,7 @@ pub fn open(app: &gtk::Application, urls: &[String]) {
         banner,
         banner_label,
         search: Rc::new(RefCell::new(None)),
+        find,
         shared: Rc::clone(&shared),
         handle: Rc::new(RefCell::new(None)),
     };
@@ -123,16 +129,9 @@ pub fn open(app: &gtk::Application, urls: &[String]) {
     };
     *ctx.handle.borrow_mut() = Some(queue.handle());
     ctx.columns.set_handle(queue.handle());
+    wire_find(&ctx);
 
-    let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    content.append(&ctx.banner);
-    let split = gtk::Paned::new(gtk::Orientation::Horizontal);
-    split.set_start_child(Some(panel.widget()));
-    split.set_end_child(Some(&ctx.modes));
-    split.set_shrink_start_child(false);
-    split.set_position(220);
-    content.append(&split);
-    content.append(&status_bar(&view));
+    let content = build_content(&ctx, &panel, &view);
     window.set_child(Some(&content));
     window.set_titlebar(Some(&header(&ctx, &menu())));
 
@@ -176,6 +175,41 @@ pub fn open(app: &gtk::Application, urls: &[String]) {
     });
 }
 
+/// Say what the window should do about an answer from the index.
+///
+/// Registered here rather than in `wire_handlers` because the bar reports to the
+/// window rather than to a widget: the answer replaces the listing, which is the
+/// window's own state, and the columns have to be told to stand aside.
+fn wire_find(ctx: &Ctx) {
+    ctx.find.on_reply({
+        let ctx = ctx.clone();
+        move |outcome| match outcome {
+            Outcome::Cleared => restored(&ctx),
+            Outcome::Found(page) => found(&ctx, page),
+            Outcome::Failed(message) => show_banner(&ctx, &message),
+        }
+    });
+}
+
+/// The window's body: the error strip, the search bar, the sidebar beside the
+/// presentations, and the status line.
+fn build_content(ctx: &Ctx, panel: &Panel, view: &View) -> gtk::Box {
+    let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    content.append(&ctx.banner);
+    // Under the header rather than in it: the bar carries a scope selector and a
+    // status line, which is too wide for a header bar and too tall for a
+    // toolbar. It is hidden until asked for, so it costs nothing otherwise.
+    content.append(ctx.find.widget());
+    let split = gtk::Paned::new(gtk::Orientation::Horizontal);
+    split.set_start_child(Some(panel.widget()));
+    split.set_end_child(Some(&ctx.modes));
+    split.set_shrink_start_child(false);
+    split.set_position(220);
+    content.append(&split);
+    content.append(&status_bar(view));
+    content
+}
+
 /// Everything a handler touches, by value or weakly. Handlers cannot borrow the
 /// components, because they outlive the call that installed them.
 #[derive(Clone)]
@@ -193,6 +227,9 @@ struct Ctx {
     banner: gtk::Box,
     banner_label: gtk::Label,
     search: Rc<RefCell<Option<gtk::SearchEntry>>>,
+    /// The bar that asks the index, as opposed to the filter above, which only
+    /// narrows what this window already read.
+    find: Search,
     shared: Rc<Shared>,
     /// Filled in once the queue exists, which is after the handlers are built.
     handle: Rc<RefCell<Option<Handle>>>,
@@ -222,8 +259,20 @@ struct State {
     /// The listing as read, before the search filter. Kept so that deleting a
     /// character from the query restores rows instead of asking the disk again.
     shown: Vec<Entry>,
+    /// Index results standing in for the listing, or `None` while the folder
+    /// itself is on screen. Kept apart from `shown` so that putting the search
+    /// bar away can bring the folder back without reading it again.
+    results: Option<Vec<Entry>>,
     query: String,
     runner: Runner,
+}
+
+impl State {
+    /// What the in-folder filter narrows: the results when there are results,
+    /// and the folder otherwise.
+    fn base(&self) -> &[Entry] {
+        self.results.as_deref().unwrap_or(&self.shown)
+    }
 }
 
 impl State {
@@ -237,6 +286,7 @@ impl State {
             history,
             cancel: None,
             shown: Vec::new(),
+            results: None,
             query: String::new(),
             runner,
         }
@@ -342,6 +392,7 @@ fn navigate(ctx: &Ctx, location: Location, record: bool) {
         }
         state.current = Some(location.clone());
         state.shown = Vec::new();
+        state.results = None;
         state.query.clear();
         // A listing read through a mount counts as using it, so auto-unmount
         // does not cut a share the user is still looking at.
@@ -361,6 +412,11 @@ fn navigate(ctx: &Ctx, location: Location, record: bool) {
     }
     ctx.path.set_label(&location.display());
     ctx.banner.set_visible(false);
+    // Results describe a query, not this folder, so they leave when the folder
+    // does. `reset` rather than `clear`: the listing coming on screen is the
+    // thing that replaces them, and reporting `Cleared` here would paint over it.
+    ctx.find.reset();
+    ctx.find.set_folder(location.as_path());
     view.set_entries(Vec::new());
     // Only while columns are on screen: building a chain reads every folder on
     // the path, and in grid mode that is work for panes nobody can see.
@@ -453,6 +509,11 @@ fn apply(ctx: &Ctx, event: Event) {
             if !ctx.shared.state.borrow().shows(&location) {
                 return; // the user moved on while this was read
             }
+            // The store currently holds result rows, and appending folder rows
+            // under them would mix two unrelated listings.
+            if ctx.find.is_open() {
+                return;
+            }
             view.push_batch(&entries);
         }
         Event::Finished {
@@ -469,12 +530,20 @@ fn apply(ctx: &Ctx, event: Event) {
             };
             let filtered = filter(&entries, &query);
             ctx.shared.state.borrow_mut().shown = entries;
-            view.set_entries(filtered);
             ctx.banner.set_visible(false);
             let _ = hints;
             if let Some(panel) = ctx.panel.upgrade() {
                 panel.set_usage(usages(&ctx.shared));
             }
+            // Index results are on screen rather than this folder's listing, so
+            // the rows go into `shown` and wait there: the folder is still the
+            // folder, and putting the bar away should show it without a re-read.
+            // Everything above still happens, because a folder that read cleanly
+            // is not an error even when its rows are not what is visible.
+            if ctx.find.is_open() {
+                return;
+            }
+            view.set_entries(filtered);
         }
         Event::Failed { location, message } => {
             if !ctx.shared.state.borrow().shows(&location) {
@@ -483,6 +552,58 @@ fn apply(ctx: &Ctx, event: Event) {
             show_banner(ctx, &format!("{}: {message}", location.display()));
         }
         Event::Mounted { report } => mounted(ctx, report),
+    }
+}
+
+/// Put one page of index results on screen, in place of the folder.
+///
+/// The rows go into the same view the folder uses, so opening a row, sorting,
+/// and the in-folder filter all work on them without knowing where they came
+/// from. The columns are dropped rather than updated: matches from all over the
+/// disk are not a chain of folders, and a pane each would be a pane per match.
+/// The flat presentations are also what a ranked list wants, so the stack is
+/// switched to one for as long as the results are up.
+fn found(ctx: &Ctx, page: Found) {
+    let Some(view) = ctx.view.upgrade() else {
+        return;
+    };
+    let filtered = filter(&page.entries, &ctx.shared.state.borrow().query);
+    ctx.shared.state.borrow_mut().results = Some(page.entries);
+    ctx.columns.forget();
+    ctx.modes.set_visible_child_name("view");
+    view.set_entries(filtered);
+    ctx.path.set_label(&page.status);
+}
+
+/// The bar was dismissed, so the folder it was standing in front of comes back —
+/// from memory rather than from disk, since the listing was kept for exactly this.
+fn restored(ctx: &Ctx) {
+    let Some(view) = ctx.view.upgrade() else {
+        return;
+    };
+    let (shown, query, current) = {
+        let mut state = ctx.shared.state.borrow_mut();
+        state.results = None;
+        (
+            state.shown.clone(),
+            state.query.clone(),
+            state.current.clone(),
+        )
+    };
+    view.set_entries(filter(&shown, &query));
+    let Some(location) = current else {
+        return;
+    };
+    ctx.path.set_label(&location.display());
+    let mode = ctx.shared.prefs.borrow().view_mode_for(&location);
+    ctx.modes
+        .set_visible_child_name(if mode == ViewMode::Columns {
+            "columns"
+        } else {
+            "view"
+        });
+    if mode == ViewMode::Columns {
+        ctx.columns.show_chain(&location);
     }
 }
 
@@ -734,7 +855,7 @@ fn folder_filter(ctx: &Ctx) -> gtk::SearchEntry {
             let text = entry.text().to_string();
             let filtered = {
                 let state = ctx.shared.state.borrow();
-                filter(&state.shown, &text)
+                filter(state.base(), &text)
             };
             ctx.shared.state.borrow_mut().query = text;
             if let Some(view) = ctx.view.upgrade() {
@@ -750,7 +871,7 @@ fn folder_filter(ctx: &Ctx) -> gtk::SearchEntry {
         let ctx = ctx.clone();
         move |entry| {
             entry.set_visible(false);
-            let shown = ctx.shared.state.borrow().shown.clone();
+            let shown = ctx.shared.state.borrow().base().to_vec();
             ctx.shared.state.borrow_mut().query.clear();
             if let Some(view) = ctx.view.upgrade() {
                 view.set_entries(shown.clone());
@@ -781,6 +902,7 @@ fn menu() -> gio::Menu {
     network.append(Some("Connect to Server…"), Some("win.connect"));
     let window = gio::Menu::new();
     window.append(Some("Search this folder"), Some("win.search"));
+    window.append(Some("Search files and apps"), Some("win.find"));
     window.append(Some("New window"), Some("win.new-window"));
     menu.append_section(None, &view);
     menu.append_section(None, &show);
@@ -901,8 +1023,67 @@ fn nav_actions(ctx: &Ctx) -> Vec<Rc<gio::SimpleAction>> {
     ]
 }
 
-/// What the window shows, and the two commands that are neither.
+/// What the window shows, and the two commands that are neither. The mode action
+/// is in [`mode_action`] and the two search commands in [`search_actions`].
 fn view_actions(app: &gtk::Application, ctx: &Ctx) -> Vec<Rc<gio::SimpleAction>> {
+    let mut actions = vec![mode_action(ctx)];
+    actions.extend(search_actions(ctx));
+
+    let hidden = gio::SimpleAction::new_stateful(
+        "hidden",
+        Some(glib::VariantTy::BOOLEAN),
+        &ctx.shared.prefs.borrow().show_hidden.to_variant(),
+    );
+    hidden.connect_change_state({
+        let ctx = ctx.clone();
+        move |action, value| {
+            let show = value.and_then(glib::Variant::get::<bool>).unwrap_or(false);
+            ctx.shared.prefs.borrow_mut().show_hidden = show;
+            action.set_state(&show.to_variant());
+            // Cached panes were read under the other rule.
+            ctx.columns.set_show_hidden(show);
+            // And so was the last page of results, which is why the bar gets the
+            // switch too rather than being left to disagree with the view.
+            ctx.find.set_show_hidden(show);
+            let current = ctx.shared.state.borrow().current.clone();
+            if let Some(location) = current {
+                navigate(&ctx, location, false);
+            }
+        }
+    });
+
+    let new_window = gio::SimpleAction::new("new-window", None);
+    new_window.connect_activate({
+        let app = app.clone();
+        move |_action, _parameter| open(&app, &[])
+    });
+
+    // The dialog needs the window to be transient for and the queue to report
+    // through, both of which a handler can only reach by upgrading — the point of
+    // `Ctx` being cheap to clone rather than of passing widgets around.
+    let connect_server = gio::SimpleAction::new("connect", None);
+    connect_server.connect_activate({
+        let ctx = ctx.clone();
+        move |_action, _parameter| {
+            let (Some(window), Some(handle)) = (ctx.window.upgrade(), ctx.handle.borrow().clone())
+            else {
+                return;
+            };
+            connect::open(&window, &handle);
+        }
+    });
+
+    actions.extend([
+        Rc::new(hidden),
+        Rc::new(new_window),
+        Rc::new(connect_server),
+    ]);
+    actions
+}
+
+/// The three presentations, as one stateful action so GTK can draw a radio group
+/// without three separate actions.
+fn mode_action(ctx: &Ctx) -> Rc<gio::SimpleAction> {
     let mode = gio::SimpleAction::new_stateful(
         "mode",
         Some(glib::VariantTy::STRING),
@@ -949,31 +1130,19 @@ fn view_actions(app: &gtk::Application, ctx: &Ctx) -> Vec<Rc<gio::SimpleAction>>
             }
         }
     });
+    Rc::new(mode)
+}
 
-    let hidden = gio::SimpleAction::new_stateful(
-        "hidden",
-        Some(glib::VariantTy::BOOLEAN),
-        &ctx.shared.prefs.borrow().show_hidden.to_variant(),
-    );
-    hidden.connect_change_state({
-        let ctx = ctx.clone();
-        move |action, value| {
-            let show = value.and_then(glib::Variant::get::<bool>).unwrap_or(false);
-            ctx.shared.prefs.borrow_mut().show_hidden = show;
-            action.set_state(&show.to_variant());
-            // Cached panes were read under the other rule.
-            ctx.columns.set_show_hidden(show);
-            let current = ctx.shared.state.borrow().current.clone();
-            if let Some(location) = current {
-                navigate(&ctx, location, false);
-            }
-        }
-    });
-
-    let search = gio::SimpleAction::new("search", None);
-    search.connect_activate({
+/// The two search commands. The filter is free and instant but cannot see
+/// outside the folder; the bar costs a round trip and finds the file that is
+/// three folders down. Opening one hides the other, because the two do not
+/// compose — index results are already a narrowed set.
+fn search_actions(ctx: &Ctx) -> Vec<Rc<gio::SimpleAction>> {
+    let filter = gio::SimpleAction::new("search", None);
+    filter.connect_activate({
         let ctx = ctx.clone();
         move |_action, _parameter| {
+            ctx.find.clear();
             if let Some(entry) = ctx.search.borrow().as_ref() {
                 entry.set_visible(true);
                 entry.grab_focus();
@@ -981,34 +1150,18 @@ fn view_actions(app: &gtk::Application, ctx: &Ctx) -> Vec<Rc<gio::SimpleAction>>
         }
     });
 
-    let new_window = gio::SimpleAction::new("new-window", None);
-    new_window.connect_activate({
-        let app = app.clone();
-        move |_action, _parameter| open(&app, &[])
-    });
-
-    // The dialog needs the window to be transient for and the queue to report
-    // through, both of which a handler can only reach by upgrading — the point of
-    // `Ctx` being cheap to clone rather than of passing widgets around.
-    let connect_server = gio::SimpleAction::new("connect", None);
-    connect_server.connect_activate({
+    let find = gio::SimpleAction::new("find", None);
+    find.connect_activate({
         let ctx = ctx.clone();
         move |_action, _parameter| {
-            let (Some(window), Some(handle)) = (ctx.window.upgrade(), ctx.handle.borrow().clone())
-            else {
-                return;
-            };
-            connect::open(&window, &handle);
+            ctx.find.show();
+            if let Some(entry) = ctx.search.borrow().as_ref() {
+                entry.set_visible(false);
+            }
         }
     });
 
-    vec![
-        Rc::new(mode),
-        Rc::new(hidden),
-        Rc::new(search),
-        Rc::new(new_window),
-        Rc::new(connect_server),
-    ]
+    vec![Rc::new(filter), Rc::new(find)]
 }
 
 /// The keyboard. Set on the application rather than the window, so a shortcut
@@ -1020,6 +1173,9 @@ fn install_accels(app: &gtk::Application) {
     app.set_accels_for_action("win.refresh", &["F5"]);
     app.set_accels_for_action("win.hidden", &["<Ctrl>H"]);
     app.set_accels_for_action("win.search", &["<Ctrl>F"]);
+    // `<Ctrl>F` is the filter, which is the one a user reaching for search in a
+    // folder wants. The index is the wider thing, so it gets the wider chord.
+    app.set_accels_for_action("win.find", &["<Ctrl><Shift>F"]);
     app.set_accels_for_action("win.new-window", &["<Ctrl>N"]);
     // `<Ctrl>K` rather than `<Ctrl>L`: the location bar took that one, and a
     // keyboard shortcut for connecting is the difference between trying a share
@@ -1084,7 +1240,7 @@ fn banner_bar() -> (gtk::Box, gtk::Label) {
 
 /// The status bar: the view's own item count, the only number that can agree
 /// with what the user sees selected.
-fn status_bar(view: &Rc<View>) -> gtk::Box {
+fn status_bar(view: &View) -> gtk::Box {
     let box_ = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     box_.set_margin_start(6);
     box_.set_margin_end(6);

@@ -243,12 +243,44 @@ body text is the point of an application search, and entries under
 
 ## The UI side
 
-`Ctrl+F`, 120 ms debounce, with a scope selector — current folder, home,
-everywhere, applications. Results stream into a `search://<id>` virtual folder
-200 at a time, so the first page appears before the last one is ranked, and
-sorting toggles between relevance and mtime without a new query when the page
-already holds everything.
+`Ctrl+Shift+F` opens a bar under the header: an entry, a scope selector — current
+folder, home, everywhere, applications — and a status line. The bar debounces by
+120 ms, so typing a path does not queue a query per keystroke, and an empty query
+with a scope is legal and means "everything here, filtered and sorted", which is
+what makes the same widget serve as a folder view over a network share with
+thousands of entries.
 
-An empty query with a scope is legal and means "everything here, filtered and
-sorted", which is what makes the same widget serve as a folder view over a
-network share with thousands of entries.
+The bar does not own a connection. It asks for one on the first query and keeps it
+after that, which is also what starts the daemon: there is no name watcher in
+`gio` 0.21, and no pre-flight check either, because D-Bus activation makes the
+call itself the check and a failed call carries the reason. A request that cannot
+be answered becomes a banner naming the reason rather than an empty result list,
+so an index that is unavailable is visibly different from an index with nothing to
+find.
+
+Answers arrive as one JSON body in a string, both ways. Each query is stamped with
+a generation number, and an answer whose stamp is older than the current one is
+dropped rather than painted — the failure this guards against is a slow
+"everywhere" query landing on top of the folder the user has since opened. The
+same rule covers putting the bar away, which bumps the generation so that nothing
+in flight can repaint the window after the listing is already back.
+
+`Changed` and `Progress` are subscribed once, on the connection, and kept for its
+lifetime. `Progress` only drives the status line. `Changed` re-runs the current
+query, and only while the bar is visible: a folder that is not on screen has no
+status line to update, and re-querying on every commit while hidden would turn a
+reindex into a query loop.
+
+Results replace the listing in the flat presentations rather than becoming a
+virtual folder. The rows are ordinary rows, so opening one, sorting, and the
+in-folder filter all work on them without knowing where they came from. The
+column panes are dropped for the duration — matches from all over the disk are not
+a chain of folders — and the folder's own rows are kept aside rather than
+discarded, so putting the bar away restores the window without re-reading it.
+
+Application results arrive as `kind: file` on a `.desktop` path, and the row turns
+that into an application: the mimetype is supplied as `application/x-desktop`
+whatever the record says, so a desktop entry opens through the desktop's own rules
+rather than in a text editor. Launching goes through the daemon, which is the only
+component that expands `Exec`; a start menu replacing this window's app grid needs
+the same two calls and no desktop-file parser of its own.

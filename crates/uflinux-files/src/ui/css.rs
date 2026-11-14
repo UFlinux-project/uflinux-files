@@ -76,6 +76,11 @@ box.ufm-pane {
 box.ufm-columns {
     background-color: alpha(currentColor, 0.02);
 }
+box.ufm-find {
+    padding: 6px 10px;
+    border-bottom: 1px solid alpha(currentColor, 0.12);
+    background-color: alpha(currentColor, 0.03);
+}
 ";
 
 /// Install the stylesheet for the current display.
@@ -123,6 +128,7 @@ mod tests {
             "ufm-banner",
             "ufm-pane",
             "ufm-columns",
+            "ufm-find",
             "ufm-grid",
             "ufm-list",
             "ufm-row",
