@@ -6,6 +6,10 @@
 
 mod cli;
 
+// Serves desktop icons over D-Bus. Links GTK but never initialises it, which is
+// what keeps the resident set at the size a desktop background is allowed to cost.
+mod provider;
+
 // The connect dialog calls `mount` and `forget`. `unmount` and `reconnect` are
 // still waiting for the buttons that will call them, in the sidebar's mount
 // rows; until then this keeps the two honest rather than deleting a capability
@@ -31,11 +35,7 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         Ok(cli::Command::Sweep(options)) => sweep(&options),
-        Ok(cli::Command::Provider) => {
-            // The desktop icon provider is a D-Bus service; see Phase 3.
-            eprintln!("uflinux-files: --provider is not implemented yet");
-            ExitCode::from(3)
-        }
+        Ok(cli::Command::Provider) => provider::run(),
         Ok(cli::Command::Ui(urls)) => ui(&urls),
         Err(usage) => {
             eprintln!("uflinux-files: {usage}");

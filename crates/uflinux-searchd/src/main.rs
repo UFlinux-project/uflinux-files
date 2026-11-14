@@ -124,6 +124,7 @@ fn run() -> Result<(), String> {
 
         let loop_ = glib::MainLoop::new(None, false);
         attach(&loop_, &service, live.as_ref());
+        watch_bus(&loop_, &service);
         held = Some(Held { service, live });
         Ok::<_, String>(loop_)
     })?;
@@ -215,6 +216,27 @@ fn attach(loop_: &glib::MainLoop, service: &Arc<Service>, live: Option<&Arc<Live
             glib::ControlFlow::Break
         });
     }
+}
+
+/// Quit when the bus goes away, because at that point there is nobody left to serve.
+///
+/// A daemon outliving its session bus is not hypothetical: a session that ends without
+/// stopping its services leaves this process holding a name nobody can call. Quitting here
+/// is also what makes the shutdown orderly rather than a race — the loop stops while the
+/// connection is still open, so `Service`'s `Drop` can withdraw the object and release the
+/// name properly instead of being overtaken by GLib's own teardown of a closed bus, and
+/// tantivy's commit is allowed to finish in a process that still has a bus to complain to.
+///
+/// The handler id is dropped, which does not detach the handler: the connection owns it,
+/// and the connection is owned by the service the loop is about to release.
+fn watch_bus(loop_: &glib::MainLoop, service: &Arc<Service>) {
+    let Some(connection) = service.connection() else {
+        return;
+    };
+    let loop_ = loop_.clone();
+    connection.connect_closed(move |_, _, _| {
+        loop_.quit();
+    });
 }
 
 /// Ask a running daemon what it thinks, from the command line.

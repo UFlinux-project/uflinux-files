@@ -62,9 +62,12 @@ is 96 px at the largest icon size, so 64 is a 6K monitor at 1x), 512 rows, 1024 
 cell edge, 2048 items.
 
 `Kind` decides the icon fallback and the double-click: `directory`, `file`,
-`launcher`. A `.desktop` file runs `Exec` rather than opening as text. The fallback
-names (`folder`, `text-x-generic`, `application-x-executable`) come from the model so
-a renderer never invents its own and every desktop shows the same thing.
+`launcher`. A `.desktop` file runs `Exec` rather than opening as text — and only
+becomes a `launcher` at all if GLib accepts the entry, which includes the `Exec`
+program resolving, so an icon left behind by an uninstalled application is offered
+as the text file it is rather than as something that fails when double-clicked. The
+fallback names (`folder`, `text-x-generic`, `application-x-executable`) come from the
+model so a renderer never invents its own and every desktop shows the same thing.
 
 ## The provider
 
@@ -93,6 +96,25 @@ generations never sees one go backwards after a provider restart.
 The file is a `BTreeMap` keyed by item id, so it is byte-identical after a round trip
 and a diff of two versions says something meaningful.
 
+### Coming down
+
+Three things stop the loop: `SIGTERM`, `SIGINT`, and the session bus closing. The
+third matters because a session that ends without stopping its services would
+otherwise leave a process holding a name nobody can call and reading a directory
+nobody looks at. Quitting on a closed bus is also what makes the shutdown orderly:
+the loop stops while the connection is still open, so the service can withdraw its
+object and release its name itself rather than being overtaken by GLib's teardown of
+a dead connection.
+
+That release has to be explicit. Neither the bus-name handle nor the registration
+returned by GIO's Rust bindings has a `Drop` impl, so holding them releases nothing,
+and the only binding that takes no callbacks aborts the process at logout — it
+unwraps a connection GLib is allowed to pass as `NULL` once the bus is gone. So the
+name is requested through the plain C entry point, whose two handlers are nullable,
+and given back in `Drop`. `uflinux-searchd` does the same for the same reason, and
+both are pinned by a test that reads their own source, because the failure only
+appears when a session ends.
+
 ## The renderer patch in `uflinux-desktop`
 
 `uflinux-desktop` claims `org.uflinux.FileManager.Desktop.Renderer` and, on
@@ -105,10 +127,12 @@ and a diff of two versions says something meaningful.
    a right-click, `RequestThumbnail` lazily for visible cells only;
 4. re-`GetModel` on `Changed`, ignoring any generation it has already drawn.
 
-Thumbnails are **off by default on targets with 512 MiB or less**, where `Status`
+Thumbnails are **off by default on targets with 512 MiB or less**, where the model
 answers `thumbnails: false` and every icon uses its fallback name. A thumbnail cache
 is the largest single thing this feature could add, and an icon grid is still useful
-without it.
+without it. The edge a renderer is told to ask for is the saved size clamped into
+128..=512 px, so a layout written by another version cannot ask this process for a
+thumbnail it would not decode.
 
 `uflinux-desktop` pins `gtk4` 0.10.1 and `gtk4-layer-shell` 0.6.3; this workspace
 uses gtk4 0.10 with gtk4-layer-shell 0.7. The two must resolve to one copy of each in

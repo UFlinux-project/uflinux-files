@@ -31,6 +31,7 @@
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
+use glib::translate::{IntoGlib as _, ToGlibPtr as _};
 use glib::variant::ToVariant;
 use serde::Serialize;
 
@@ -214,12 +215,70 @@ impl Core {
 /// unregisters the object and joins the indexing thread.
 pub struct Service {
     core: Arc<Core>,
-    // Neither `gio::OwnerId` nor `gio::RegistrationId` has a `Drop` impl, so holding them
-    // releases nothing; the real teardown is the process exiting, and the real cleanup is
-    // `Worker`'s `Drop` joining the indexing thread.
+    // The indexing thread is joined on drop, which is what lets tantivy finish its commit
+    // while the process still exists to do it.
     _worker: Worker,
-    _owner: gio::OwnerId,
-    _registration: gio::RegistrationId,
+    /// What `g_bus_own_name_on_connection` returned. A number rather than a
+    /// [`gio::OwnerId`] because the only binding gio-rs 0.21 offers wraps its callbacks in
+    /// a closure that unwraps the connection it is handed (`gio-0.21.5/src/dbus.rs:19`),
+    /// and GLib may pass `NULL` there: when the bus goes away, the ownership bookkeeping
+    /// drops its reference to the connection before reporting the loss. So gio-rs's
+    /// callback aborts the daemon at logout — a panic in a closure that cannot unwind —
+    /// which is a crash report in the journal on every session that ends without stopping
+    /// its services first. The plain C entry point takes both handlers as nullable, and
+    /// nothing here wants either event: a daemon that has lost the bus has nobody left to
+    /// serve, and `main` quits the loop on `connect_closed` for exactly that case.
+    owner: u32,
+    /// `Option` because there is no way to build a spent one — the id inside is private
+    /// and there is no `from_raw` — and [`Drop`] has to take the live value out. `None`
+    /// therefore means "already withdrawn", never "never registered". No `Drop` impl
+    /// exists for this type, so the field is only what keeps the registration alive.
+    registration: Option<gio::RegistrationId>,
+}
+
+/// Ask for the bus name, with no callback for either outcome. See [`Service::owner`].
+fn own_name(connection: &gio::DBusConnection) -> u32 {
+    let name = std::ffi::CString::new(SESSION_NAME)
+        .expect("the interface name is a literal with no interior NUL");
+    // SAFETY: both handlers are null, which the C declaration documents as nullable; the
+    // user data is null and has to be, since no destroy notify is given; the connection
+    // and the name both outlive the call.
+    unsafe {
+        gio::ffi::g_bus_own_name_on_connection(
+            connection.to_glib_none().0,
+            name.as_ptr(),
+            gio::BusNameOwnerFlags::ALLOW_REPLACEMENT.into_glib(),
+            None,
+            None,
+            std::ptr::null_mut(),
+            None,
+        )
+    }
+}
+
+impl Drop for Service {
+    fn drop(&mut self) {
+        // Withdraw the object before releasing the name, so a client that still sees the
+        // name gets `UnknownObject` rather than a reply from a daemon whose state is on
+        // its way out. Both calls are skipped once the bus has closed, because GLib then
+        // retires the registration and the ownership itself, and touching that
+        // bookkeeping again is touching memory GLib has already freed.
+        //
+        // `_worker` is dropped after this, which is the order wanted: the bus stops
+        // answering before the indexing thread is joined.
+        let Some(connection) = self.core.connection.as_ref() else {
+            return;
+        };
+        if connection.is_closed() {
+            return;
+        }
+        if let Some(registration) = self.registration.take() {
+            let _ = connection.unregister_object(registration);
+        }
+        // SAFETY: the id came from `g_bus_own_name_on_connection` in `own_name`, is used
+        // exactly once, and the connection is open, so the ownership is still tracked.
+        unsafe { gio::ffi::g_bus_unown_name(self.owner) };
+    }
 }
 
 impl Service {
@@ -262,20 +321,20 @@ impl Service {
                 .map_err(|e| format!("cannot serve {OBJECT_PATH}: {e}"))?
         };
 
-        let owner = gio::bus_own_name_on_connection(
-            &connection,
-            SESSION_NAME,
-            gio::BusNameOwnerFlags::ALLOW_REPLACEMENT,
-            |_, _| {},
-            |_, _| {},
-        );
+        let owner = own_name(&connection);
 
         Ok(Self {
             core,
             _worker: worker,
-            _owner: owner,
-            _registration: registration,
+            owner,
+            registration: Some(registration),
         })
+    }
+
+    /// The bus this daemon is served on, for watching it. `None` only in a test core.
+    #[must_use]
+    pub fn connection(&self) -> Option<&gio::DBusConnection> {
+        self.core.connection.as_ref()
     }
 
     /// The queue the file watcher pushes re-reads into.
@@ -776,6 +835,38 @@ mod tests {
                 "{signal} is not in the introspection data"
             );
         }
+    }
+
+    #[test]
+    fn the_bus_name_is_taken_without_a_callback_that_can_abort() {
+        // gio-rs's `bus_own_name_on_connection` wraps both handlers in a closure that
+        // unwraps the connection it is handed, and GLib passes NULL once the bus is gone.
+        // A daemon using it survives normal operation and aborts at logout, which no unit
+        // test on a live bus would ever catch — so the source itself is pinned.
+        let file = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("service.rs");
+        let text = fs::read_to_string(&file)
+            .unwrap_or_else(|e| panic!("{} should be readable: {e}", file.display()));
+        assert!(
+            text.contains(&["g_bus_own_name_on", "_connection"].concat()),
+            "the name has to be taken through the C entry point, whose handlers are nullable"
+        );
+        assert!(
+            text.contains(&["g_bus_unown_", "name"].concat()),
+            "the name has to be given back, since the wrapper type has no Drop"
+        );
+        // The aborting binding, spelled so this test cannot match its own comment.
+        let binding = ["bus_own_name_", "on_connection"].concat();
+        let called = text
+            .lines()
+            .map(str::trim_start)
+            .filter(|line| !line.starts_with("//"))
+            .filter(|line| line.contains(&binding))
+            // The `ffi::` form is the C call itself; only the bare gio-rs function is a
+            // regression.
+            .any(|line| !line.contains("ffi::"));
+        assert!(!called, "the closure-based binding is back");
     }
 
     #[test]
