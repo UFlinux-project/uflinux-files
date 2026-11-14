@@ -303,11 +303,13 @@ impl Columns {
             // and either patches it or re-reads it.
             // A picture is the same kind of no-op: a pane asks for one through
             // the shared pipeline, which the window answers, and the panes have
-            // nothing to match a token against.
+            // nothing to match a token against. A folder's total is the same
+            // again — it belongs to a dialog, not to a pane.
             Event::Batch { .. }
             | Event::Mounted { .. }
             | Event::Operation { .. }
-            | Event::Thumb { .. } => {}
+            | Event::Thumb { .. }
+            | Event::Sized { .. } => {}
             Event::Finished {
                 location, entries, ..
             } => {

@@ -55,6 +55,12 @@ the model over D-Bus and never opens a window.
   spec, so pictures already drawn by other software are read rather than decoded,
   and the desktop provider and the file manager share one implementation of the
   key and the freshness rule. Off with one click in the view menu.
+- **Properties** on `<Alt>Return`: what a thing is, where it lives, when it
+  changed, its mode bits, owner and group — every row drawn from what the listing
+  already holds, so the dialog appears at once. A folder's total is the one fact
+  that has to be counted, so it says it is counting and the number arrives when a
+  bounded walk finishes on a worker; a walk that stopped early says *at least*
+  rather than stating a total it did not finish computing.
 
 ## Layout
 

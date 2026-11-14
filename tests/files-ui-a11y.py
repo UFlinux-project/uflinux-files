@@ -178,14 +178,40 @@ def read_entry():
     return 0
 
 
-def press(wanted):
+def frame_named(wanted):
+    """The first `frame` node whose name is WANTED.
+
+    A dialog is a window of its own, so it arrives as a frame the same way a
+    folder window does. Reaching into that subtree rather than the whole desktop
+    is what lets a test press a dialog's button when the main window has one with
+    the same label: a folder window's titlebar carries a Close button too, and a
+    depth-first walk from the desktop reaches that one first, so an unscoped press
+    of `Close` closes the window rather than the dialog.
+    """
+    stack = list(apps())
+    while stack:
+        acc = stack.pop(0)
+        if role(acc) == "frame" and name(acc) == wanted:
+            return acc
+        stack = children(acc) + stack
+    return None
+
+
+def press(wanted, frame=None):
     """Run the default action of the first node named WANTED.
 
     This is how a test clicks a dialog's button: the accessibility tree is what
     the script can see, and an activation through it goes through the same
     controller a mouse click would.
+
+    When FRAME is given, the search is limited to that window's subtree, which is
+    how a button whose label is not unique to the dialog still gets pressed.
     """
-    acc = first_named(wanted)
+    root = frame_named(frame) if frame else None
+    if frame and root is None:
+        print("no frame named %s" % frame)
+        return 2
+    acc = first_named(wanted) if root is None else named_under(root, wanted)
     if acc is None:
         print("no node named %s" % wanted)
         return 2
@@ -200,6 +226,17 @@ def press(wanted):
         print("%s refused its action" % wanted)
         return 5
     return 0
+
+
+def named_under(root, wanted):
+    """The first node inside ROOT whose name is WANTED, depth-first."""
+    stack = list(children(root))
+    while stack:
+        acc = stack.pop(0)
+        if name(acc) == wanted:
+            return acc
+        stack = children(acc) + stack
+    return None
 
 
 def select(wanted):
@@ -258,11 +295,12 @@ def main(argv):
     if command == "entry":
         return read_entry()
     if command == "press":
-        return press(argv[1])
+        return press(argv[1], argv[2] if len(argv) > 2 else None)
     if command == "select":
         return select(argv[1])
     print(
-        "usage: files-ui-a11y.py [dump | type TEXT | entry | press NAME | select NAME]",
+        "usage: files-ui-a11y.py [dump | type TEXT | entry | press NAME [FRAME] |"
+        " select NAME]",
         file=sys.stderr,
     )
     return 64

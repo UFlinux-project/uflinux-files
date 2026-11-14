@@ -531,6 +531,76 @@ else
     fi
 fi
 
+# --- the properties dialog ---------------------------------------------------------
+# The dialog is built from what the listing already knows and then rewritten by a
+# walk on a worker, so the interesting assertions are the two halves separately:
+# that the facts available at once are on screen, and that the folder total arrives
+# afterwards rather than being promised and never delivered. The total itself is
+# not asserted digit by digit — the fixture grows a file here and loses one there
+# as the checks above run — so the check is that the row stops saying it is
+# counting and says what a finished walk says instead.
+#
+# One row is selected first, because the action is enabled for exactly one target
+# and `Describe` is the only way to see that from outside: a menu row that was
+# always sensitive would let a dialog open on nothing. The rows are matched on
+# their key labels — `Location`, `Permissions` — because those words appear
+# nowhere else in the interface, unlike the kind label, which the list view also
+# prints per row whenever that mode is showing.
+if ! python3 "$A11Y" select one >/dev/null 2>&1; then
+    fail "a row can be selected for the properties check"
+elif describe properties | grep -qF '(true'; then
+    ok "Properties is sensitive with one row selected"
+else
+    fail "Properties is sensitive with one row selected ($(describe properties))"
+fi
+act properties "[]" "[]"
+has_frame "Properties" "Properties opens a dialog of its own"
+has_named "Location" "the dialog says where the thing lives"
+has_named "Permissions" "the dialog reports the mode bits"
+# The mode string itself, read off the fixture rather than hard-coded: the umask
+# of whoever ran the script decides whether a folder is 755 or 750, and a check
+# that guessed would fail for the wrong reason. Matching a `label` node rather
+# than any node keeps the assertion inside the dialog, because the window's own
+# frame is titled with the same path the Location row prints.
+MODE=$(stat -c '%A' "$TARGET/one" 2>/dev/null || echo '')
+if [ -n "$MODE" ] && wait_named "$MODE"; then
+    ok "the dialog prints the mode bits the folder actually has"
+else
+    fail "the dialog prints the mode bits the folder actually has (no $MODE)"
+fi
+# The walk finishes on a fixture this small in milliseconds, but it runs on a
+# worker and the row belongs to the UI thread, so it is waited for. The pattern
+# is built with `printf` because a shell single-quoted `\t` is two characters and
+# `grep -E` would read it as a `t`; the shape to look for is a size, the word
+# `in`, a count, and the word `file`, which no other label in the interface says.
+total=$(printf '^label\t[^\t]* in [0-9][^\t]* file')
+i=0
+while [ "$i" -lt 50 ] && ! printf '%s\n' "$DUMP" | grep -qE "$total"; do
+    refresh
+    i=$((i + 1))
+    sleep 0.2
+done
+if printf '%s\n' "$DUMP" | grep -qE "$total"; then
+    ok "the folder total replaces the counting placeholder"
+else
+    fail "the folder total replaces the counting placeholder"
+fi
+# The dialog's own Close, pressed inside its frame: a folder window's titlebar
+# carries a button labelled `Close` too, and an unscoped press would reach that
+# one first and take the window down with the dialog.
+python3 "$A11Y" press Close Properties >/dev/null 2>&1 || true
+i=0
+while [ "$i" -lt 50 ] && printf '%s\n' "$DUMP" | grep -qF "$(printf 'frame\tProperties\t')"; do
+    refresh
+    i=$((i + 1))
+    sleep 0.2
+done
+if printf '%s\n' "$DUMP" | grep -qF "$(printf 'frame\tProperties\t')"; then
+    fail "Close dismisses the dialog"
+else
+    ok "Close dismisses the dialog"
+fi
+
 # --- the search bar -----------------------------------------------------------------
 # The bar opens and the field takes text. Whether it finds anything depends on the
 # indexer, which is checked separately below; the field accepting input is the UI's job.

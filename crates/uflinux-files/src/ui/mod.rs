@@ -27,6 +27,7 @@ mod extract;
 mod job;
 mod ops;
 mod panel;
+mod props;
 mod row;
 mod search;
 mod thumb;

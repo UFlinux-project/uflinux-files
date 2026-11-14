@@ -419,6 +419,31 @@ fn format_date(when: SystemTime) -> String {
     format!("{y:04}-{m:02}-{d:02}")
 }
 
+/// An absolute date and clock time, `2026-01-02 15:04`, for the places that
+/// must name the moment rather than its distance from now — the properties
+/// dialog above all, where "4 days ago" cannot be copied into a bug report.
+///
+/// UTC, like [`format_date`], and for the same reason: the whole point of
+/// writing these by hand was to avoid a date library, and a local time needs a
+/// timezone database as well as an algorithm. The list column shows UTC dates
+/// too, so the dialog and the column cannot disagree about the same file.
+#[must_use]
+pub fn format_full(when: SystemTime) -> String {
+    let secs = match when.duration_since(SystemTime::UNIX_EPOCH) {
+        Ok(d) => i64::try_from(d.as_secs()).unwrap_or(i64::MAX),
+        Err(e) => -i64::try_from(e.duration().as_secs()).unwrap_or(i64::MAX),
+    };
+    // `rem_euclid` rather than `%` so a timestamp before 1970 still shows a
+    // clock time inside the day rather than a negative one.
+    let time = secs.rem_euclid(86_400);
+    format!(
+        "{} {:02}:{:02}",
+        format_date(when),
+        time / 3_600,
+        (time % 3_600) / 60
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -608,5 +633,20 @@ mod tests {
         assert!(format_modified(ago(40 * 86_400)).contains('-'));
         // A clock skew into the future must not panic or say "-3 hours".
         assert!(!format_modified(SystemTime::now() + Duration::from_secs(3_600)).contains('-'));
+    }
+
+    #[test]
+    fn full_timestamps_name_the_moment() {
+        assert_eq!(format_full(SystemTime::UNIX_EPOCH), "1970-01-01 00:00");
+        assert_eq!(
+            format_full(SystemTime::UNIX_EPOCH + Duration::new(1_700_000_000, 0)),
+            "2023-11-14 22:13"
+        );
+        // Half a day before the epoch: the date is 1969 and the clock is still
+        // inside its day, which is what `rem_euclid` buys.
+        assert_eq!(
+            format_full(SystemTime::UNIX_EPOCH - Duration::from_secs(43_200)),
+            "1969-12-31 12:00"
+        );
     }
 }

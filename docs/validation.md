@@ -30,15 +30,15 @@ error type is named in the signature does not need an essay per method.
 
 | Area | The property under test |
 | --- | --- |
-| `ufm-core` | `Location` round-trips, including a `!` inside an archive path and a `..` that is a legal Linux component; traversal out of an archive is rejected; atomic writes leave no partial file; config migration from an older `version`. |
-| `ufm-vfs` | streaming reads publish in bounded slices and a cancelled read stops within one chunk; a second read of one folder is served from memory and reports no chunks at all; a changed sort order, hidden setting or filter is a miss rather than the wrong rows; a cancelled read stores nothing, an emptied folder is still a listing; the cache respects all three caps; invalidation reaches a folder, its parents and its children; the watcher's overflow path reports the directories it dropped. |
+| `ufm-core` | `Location` round-trips, including a `!` inside an archive path and a `..` that is a legal Linux component; traversal out of an archive is rejected; atomic writes leave no partial file; config migration from an older `version`; a mode string renders the file-type letter and all nine permission characters, including the socket and fifo cases a `kind` has to cover when a backend supplies no mode; an absolute timestamp names the moment rather than a relative distance. |
+| `ufm-vfs` | streaming reads publish in bounded slices and a cancelled read stops within one chunk; a second read of one folder is served from memory and reports no chunks at all; a changed sort order, hidden setting or filter is a miss rather than the wrong rows; a cancelled read stores nothing, an emptied folder is still a listing; the cache respects all three caps; invalidation reaches a folder, its parents and its children; the watcher's overflow path reports the directories it dropped; a folder total counts everything below, stops within one directory of a cancel, refuses to follow a symlink, says `partial` when a depth or entry cap stops it and when a directory cannot be read, and never loses a byte to overflow. |
 | `ufm-archive` | `.tar.gz` is a tar and `.gz` alone is a one-member container; a corrupt archive degrades to an error row rather than a panic, and a truncated one never lists a member it cannot read whole; a `../` member cannot escape the extract directory; a zip-in-tar navigates two levels. |
 | `ufm-mount` | the mount table survives a kill mid-write; a `Share` renders for display without its password; every backend's argv is checked for the absence of the secret; `SecretUse` matches what the real program expects. |
 | `ufm-index` | a commit that returned is visible after reopening the index; `hidden` filtering works with scoring on; the n-gram field finds a prefix the tokenised field cannot; a re-crawl replaces rather than accumulates. |
 | `ufm-search` | unknown fields are rejected; an oversized reply shrinks to snippets then page and says which; `Exec` expansion drops a field code with no value; a `NAME=value` prefix is not treated as an argument. |
 | `ufm-desktop-ipc` | an id with a slash cannot name a file outside the desktop directory; unplugging a monitor moves icons and deletes none; a saved layout meets a directory that changed since. |
 | `uflinux-files-mount` | the argv handed to `mount(8)` contains no argument from the request that begins with `-`; a target that is a symlink, relative, world-readable, or somebody else's is refused; a `credentials=` file anyone can read is refused and its contents never reach an error message; a `pass=` option is refused; the owner comes from `PKEXEC_UID` and is never `0`. |
-| `uflinux-files` | the location on argv reaches the window; `--new-window` gives up being the single instance; the application id matches the desktop entry; a machine with no render node is asked for the cairo renderer, and an explicit `GSK_RENDERER` is never overridden; a paste plan drops the rows that cannot land and names the reason for each, growing `report (2).pdf` rather than replacing; copying a folder takes its contents and deleting one takes what is inside it; a prompt refuses an empty name, hands the typed name over exactly once, and pre-selects the stem of a filename but not its extension. |
+| `uflinux-files` | the location on argv reaches the window; `--new-window` gives up being the single instance; the application id matches the desktop entry; a machine with no render node is asked for the cairo renderer, and an explicit `GSK_RENDERER` is never overridden; a paste plan drops the rows that cannot land and names the reason for each, growing `report (2).pdf` rather than replacing; copying a folder takes its contents and deleting one takes what is inside it; a prompt refuses an empty name, hands the typed name over exactly once, and pre-selects the stem of a filename but not its extension; a properties form draws a row only for a fact the entry actually has, spells one file without an `s`, says *at least* for a stopped walk, and holds the size row for a folder so the answer can be delivered into it or dropped when the dialog is gone. |
 | `uflinux-files-provider` | the crate does not depend on GTK, checked against its own manifest; the bus name is taken through the C entry point whose handlers are nullable, not the gio-rs wrapper that aborts at logout; the polling deadline is longer than the timer that checks it; a missing login session is refused before the bus is asked for. |
 
 ## Archives
@@ -161,11 +161,26 @@ beside the container holding the members, and the window that asked for it says 
 its banner; a file created and then deleted by the shell appears and disappears in the
 listing on its own; a picture placed in the folder is decoded and lands in the
 thumbnail cache, and the `thumbnails` switch reports its state through `Describe`;
-the search action opens a field and the field takes typed text; a
+`Describe` reports `properties` enabled with exactly one row selected, the dialog it
+opens is a window of its own that names the folder the row lives in and prints the mode
+bits `stat` gives for it, and its Size row stops saying it is counting and states a
+total; the search action opens a field and the field takes typed text; a
 second invocation opens a `Computer` window in the running instance; `--new-window` opens
 a window rather than focusing an open one; and the indexer answers `Status` on the bus.
 The prompt is driven through the accessibility tree, by the `press` command of the probe,
 which activates a node by name — the same controller path a mouse click takes.
+
+The properties checks are the reason the probe's `press` takes an optional frame name. A
+folder window's titlebar carries a button labelled `Close`, and a depth-first walk from
+the desktop reaches that node before the one inside a dialog titled `Properties`, so an
+unscoped press closed the window instead of the dialog and the two search checks after
+it then failed for a reason that had nothing to do with search. Passing a frame scopes
+the search to that window's subtree. The mode string is read off the fixture with `stat`
+rather than hard-coded, because the umask of whoever ran the script decides whether a
+folder is `755` or `750` and a check that guessed would fail for the wrong reason; the
+folder total is matched on its shape — a size, the word `in`, a count, the word `file` —
+for the same kind of reason, since the fixture gains and loses files as the checks above
+it run.
 
 The collision checks are the ones that had to be built up rather than read off, for two
 reasons worth knowing before adding to them. The first is that a selection has to be made
@@ -308,8 +323,6 @@ catches.
 - Physical HDR, VRR and GPU behaviour: separate hardware validation.
 - Wireless and DHCP: ConnMan owns those, and the file manager has no opinion about
   them beyond mounting what is already mounted.
-- The properties dialog: it does not exist yet, so there is nothing to certify. Its
-  tests land with it.
 - Replacing across devices, and a trash that lives on another filesystem than the
   row being discarded: both need a second mounted filesystem in the fixture, which
   the container has no way to offer honestly. The conflict prompt itself is the same

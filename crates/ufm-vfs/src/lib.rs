@@ -18,12 +18,14 @@
 
 pub mod cache;
 pub mod cancel;
+pub mod du;
 pub mod fsinfo;
 pub mod local;
 pub mod watch;
 
 pub use cache::{CachedListing, DirCache};
 pub use cancel::Cancel;
+pub use du::Tally;
 pub use fsinfo::FsHints;
 pub use local::LocalReader;
 

@@ -13,5 +13,8 @@ ufm-core.workspace = true
 libc.workspace = true
 mime_guess.workspace = true
 
+[dev-dependencies]
+tempfile.workspace = true
+
 [lints]
 workspace = true

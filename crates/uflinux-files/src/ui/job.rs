@@ -16,6 +16,7 @@
 use std::io;
 use std::mem;
 use std::os::fd::RawFd;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use glib::ControlFlow;
@@ -23,7 +24,7 @@ use glib::source::{SourceId, unix_fd_add_local};
 
 use ufm_core::entry::Entry;
 use ufm_core::location::Location;
-use ufm_vfs::FsHints;
+use ufm_vfs::{FsHints, Tally};
 
 use crate::runner::Report;
 use crate::ui::ops::Outcome;
@@ -65,6 +66,12 @@ pub enum Event {
     /// which is the ordinary outcome of scrolling rather than a failure. Only
     /// encoded bytes travel, because a `Pixbuf` is not `Send`.
     Thumb { token: u64, png: Option<Vec<u8>> },
+    /// A folder has been walked and its total is known. The fourth variant that
+    /// is not about a listing, and the only one whose destination is a dialog:
+    /// the properties window asked for the number (see [`super::props`]) and the
+    /// window is only the postman. `path` is the folder that was walked, which is
+    /// what lets an answer for a dialog the user has since closed be dropped.
+    Sized { path: PathBuf, tally: Tally },
 }
 
 /// Closes a file descriptor when the last owner drops it, so a worker that

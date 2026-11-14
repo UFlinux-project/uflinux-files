@@ -81,6 +81,9 @@ box.ufm-find {
     border-bottom: 1px solid alpha(currentColor, 0.12);
     background-color: alpha(currentColor, 0.03);
 }
+label.ufm-mono {
+    font-family: monospace;
+}
 ";
 
 /// Install the stylesheet for the current display.
@@ -129,6 +132,7 @@ mod tests {
             "ufm-pane",
             "ufm-columns",
             "ufm-find",
+            "ufm-mono",
             "ufm-grid",
             "ufm-list",
             "ufm-row",

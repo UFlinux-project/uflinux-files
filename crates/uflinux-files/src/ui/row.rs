@@ -109,19 +109,12 @@ impl Row {
         self.entry().modified_label()
     }
 
+    /// What the row is, in the words the kind column shows. The wording lives on
+    /// [`Entry::kind_label`] so that this column and the properties dialog cannot
+    /// describe the same file differently.
     #[must_use]
     pub fn kind_label(&self) -> String {
-        let entry = self.entry();
-        // What a folder or an archive *is* says more here than its mime type
-        // does: the mime of an archive names its codec, which reads as noise in
-        // a column whose siblings all say "Folder".
-        match entry.kind {
-            EntryKind::Directory | EntryKind::MountPoint => return "Folder".to_string(),
-            EntryKind::Archive => return "Archive".to_string(),
-            EntryKind::Device => return "Device".to_string(),
-            _ => {}
-        }
-        entry.mime.clone().unwrap_or_else(|| "File".to_string())
+        self.entry().kind_label()
     }
 
     #[must_use]

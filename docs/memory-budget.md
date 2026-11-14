@@ -102,6 +102,15 @@ without either noticing. Freshness comes from invalidation rather than from the 
 watch event, a finished file operation, a mount or a reload each drop what they
 invalidate, so the 30 s is only the worst case for a folder whose watch was lost.
 
+**A folder total walks with a cap, not a stack.** The Properties dialog counts a folder
+on a worker, and the walk keeps its own list of directories rather than recursing, so
+the thread's stack is the only thing that could grow with the tree — 256 KiB, which a
+tree 32 levels deep cannot spend. The list itself is bounded by a depth cap of 32 and an
+entry cap of a million, and cancellation is polled once per directory, so closing the
+dialog stops the walk at the next directory rather than at the end of the folder. What
+the walk holds is four numbers, not a set of paths: a total that reports itself as
+`partial` when a cap stopped it costs the same as one that finished, and says so.
+
 **The archive TOC cache holds 8 containers.** A TOC is the one structure worth keeping
 — rebuilding it means re-reading the whole archive — and eight is more than anyone has
 open at once.

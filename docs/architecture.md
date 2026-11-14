@@ -313,6 +313,48 @@ is that preference. Turning it off re-binds the rows rather than re-reading the
 folder — the files on screen are the same files either way — which is the same
 distinction the icon-size control makes.
 
+## Properties
+
+One dialog, on `<Alt>Return`, built almost entirely from the `Entry` the listing
+already holds: the type, the folder it lives in, the timestamps, the mode string,
+the owner and group. Nothing in that list costs a syscall beyond the `stat` the
+listing already did, which is why the dialog appears the moment it is asked for
+rather than after a read. The two lookups it does add are the password and group
+files, via `getpwuid_r` and `getgrgid_r` with a stack buffer, because a dialog
+that prints `1000` where another prints `panmourovaty (1000)` looks broken
+whichever number is correct.
+
+The mode string is rendered rather than stored, from the raw mode the local
+reader already carries, and the type letter comes from the file-type bits with
+the entry's kind behind them — a socket read through an archive backend has no
+mode to read and still has a kind. The same `kind_label` backs the dialog's Type
+row and the list view's Kind column, so the two cannot disagree about what a
+thing is.
+
+One row cannot come from the listing: a folder's total. `ufm_vfs::du::total`
+walks it, on a worker, with the same temperament as the directory reader — an
+explicit stack rather than recursion, a depth cap, an entry cap, cancellation
+polled once per directory, symlinks counted and never followed, and a `partial`
+flag set by whichever cap or error stopped the walk. The answer travels back on
+the queue a listing uses, as `Event::Sized`, and the dialog registry is a
+thread-local list keyed by the folder's path: an answer whose dialog has been
+closed is dropped rather than reported, because closing a dialog quickly is
+ordinary and not a failure.
+
+Two wording rules carry the honesty. A `partial` walk says *at least* — a number
+that is quietly a lower bound reads as a lie the moment a folder turns out to be
+bigger. And the Contents row shows the child count the listing already had, so a
+folder is never on screen saying it knows nothing while the walk that will know
+everything is still running.
+
+The dialog is deliberately not modal. Every other prompt in this program is,
+because every other prompt is an obstacle: a name to type, a collision to
+settle. A properties dialog is something being read, and reading the size of a
+folder and then clicking into it is the ordinary sequence, which a modal would
+turn into two. It is a plain `gtk::Window` added to the application rather than
+an `ApplicationWindow`, which keeps it off the D-Bus like the other prompts, so
+the window paths a test drives do not shift when a dialog opens.
+
 ## Desktop icons
 
 The file manager owns the model, `uflinux-desktop` draws it, over

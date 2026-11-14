@@ -43,6 +43,7 @@ use super::extract;
 use super::job::{Event, Handle, Queue};
 use super::ops;
 use super::panel::{Panel, Place, Usage};
+use super::props;
 use super::row::Row;
 use super::search::{Found, Outcome, Search};
 use super::thumb::Pipeline;
@@ -710,6 +711,12 @@ fn apply(ctx: &Ctx, event: Event) {
         // token says which widget asked, and the pipeline knows whether that
         // widget is still showing the file it asked about.
         Event::Thumb { token, png } => ctx.thumbs.deliver(token, png),
+        // Also not about the folder on screen: a folder's total belongs to the
+        // dialog that asked for it, which decides whether it is still open.
+        Event::Sized {
+            ref path,
+            ref tally,
+        } => props::deliver(path, tally),
     }
 }
 
@@ -1123,7 +1130,7 @@ fn sync_buttons(ctx: &Ctx) {
     // this runs on every navigation.
     drop(window);
     sync_paste(ctx);
-    sync_extract(ctx);
+    sync_ops(ctx);
 }
 
 fn enable(window: &gtk::ApplicationWindow, name: &str, on: bool) {
@@ -1246,6 +1253,10 @@ fn menu() -> gio::Menu {
     // open an archive at all, and the label says what happens — a folder named
     // after the container, appearing beside it, with no dialog in between.
     files.append(Some("Extract to Folder"), Some("win.extract"));
+    // Last, because it is the one command here that changes nothing: a user
+    // reaches for it to find out what something is, not to make it become
+    // something else.
+    files.append(Some("Properties"), Some("win.properties"));
     let network = gio::Menu::new();
     network.append(Some("Connect to Server…"), Some("win.connect"));
     let window = gio::Menu::new();
@@ -1309,11 +1320,11 @@ fn wire_handlers(panel: &Rc<Panel>, view: &Rc<View>, columns: &Rc<Columns>, ctx:
     // fires no navigation and changes no clipboard.
     view.on_selection({
         let ctx = ctx.clone();
-        move || sync_extract(&ctx)
+        move || sync_ops(&ctx)
     });
     columns.on_selection({
         let ctx = ctx.clone();
-        move || sync_extract(&ctx)
+        move || sync_ops(&ctx)
     });
 }
 
@@ -1635,6 +1646,25 @@ fn op_actions(ctx: &Ctx) -> Vec<Rc<gio::SimpleAction>> {
         }
     });
 
+    let facts = gio::SimpleAction::new("properties", None);
+    facts.connect_activate({
+        let ctx = ctx.clone();
+        move |_action, _parameter| {
+            let Some((window, handle)) = sink_for(&ctx) else {
+                return;
+            };
+            // One row, for the same reason renaming asks for one: a dialog about
+            // three files has no obvious shape, and a user who selected three
+            // usually wanted the folder they are looking at rather than a summary
+            // of a third of it.
+            let picked = targets(&ctx);
+            let [entry] = picked.as_slice() else {
+                return;
+            };
+            props::show(&window, &handle, entry);
+        }
+    });
+
     vec![
         Rc::new(new_folder),
         Rc::new(rename),
@@ -1644,6 +1674,7 @@ fn op_actions(ctx: &Ctx) -> Vec<Rc<gio::SimpleAction>> {
         pickup_action("cut", ops::Transfer::Move, ctx),
         Rc::new(paste),
         Rc::new(unpack),
+        Rc::new(facts),
     ]
 }
 
@@ -1666,15 +1697,33 @@ fn extract_target(ctx: &Ctx) -> Option<Location> {
     extract::container_of(&current).is_some().then_some(current)
 }
 
-/// Enable or disable extract to match the row under the keyboard. The only file
-/// command whose answer depends on *what* is selected rather than on there being
-/// a selection, which is why it is synced from the selection handlers as well as
-/// from navigation.
+/// Enable or disable the two commands whose answer depends on the selection
+/// rather than on the folder or the clipboard. Both are synced from navigation
+/// and from every change of selection, which is the only moment their answer can
+/// change without a navigation.
+fn sync_ops(ctx: &Ctx) {
+    sync_extract(ctx);
+    sync_properties(ctx);
+}
+
+/// Enable or disable extract to match the row under the keyboard. The one file
+/// command whose answer depends on *what* is selected rather than on how much;
+/// properties depends on the count instead — see [`sync_properties`].
 fn sync_extract(ctx: &Ctx) {
     let Some(window) = ctx.window.upgrade() else {
         return;
     };
     enable(&window, "extract", extract_target(ctx).is_some());
+}
+
+/// Enable or disable properties: exactly one row, whatever it is. Every row has
+/// a name and a type, so unlike extract the answer never depends on what the row
+/// turns out to be — only on there being one and only one of them.
+fn sync_properties(ctx: &Ctx) {
+    let Some(window) = ctx.window.upgrade() else {
+        return;
+    };
+    enable(&window, "properties", targets(ctx).len() == 1);
 }
 
 /// `trash` and `delete` differ by one flag, so they are built by one function.
@@ -1773,6 +1822,10 @@ fn install_accels(app: &gtk::Application) {
     // the keyboard rather than on a chord, so the letter most people expect for
     // extract is not spoken for.
     app.set_accels_for_action("win.extract", &["<Ctrl>E"]);
+    // `<Alt>Return` is the GNOME chord for properties and is bound nowhere else:
+    // plain `Return` activates a row, which is the one thing a file manager can
+    // never give up.
+    app.set_accels_for_action("win.properties", &["<Alt>Return"]);
     for mode in [ViewMode::Grid, ViewMode::List, ViewMode::Columns] {
         app.set_accels_for_action(
             &format!("win.mode::{}", mode_name(mode)),
