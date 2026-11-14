@@ -258,6 +258,18 @@ if [ "${panes:-0}" -ge 2 ]; then
 else
     fail "the columns view shows one pane per path level (got ${panes:-0})"
 fi
+# The pane for the folder in the title bar has to be full the moment it appears.
+# Building a chain leaves the deepest pane to a listing the window is expected to
+# be reading, which is true while navigating and false when the user only changed
+# how the folder already on screen is drawn — so the rows have to be handed over,
+# and a column that painted empty until the next folder was opened would pass the
+# check above and fail this one.
+refresh
+if printf '%s\n' "$DUMP" | grep -qF "$(printf '\tone\t')"; then
+    ok "the deepest column holds the folder's own entries at once"
+else
+    fail "the deepest column holds the folder's own entries at once"
+fi
 
 # --- the file operations -------------------------------------------------------------
 # The actions are wired to real work: a prompt, a worker, and a reload. Reading the
@@ -827,6 +839,113 @@ else
             ok "the chooser closes when its Close button is pressed"
         fi
     fi
+fi
+
+# --- the spacebar preview ----------------------------------------------------
+# The popover is built from what the listing already carries, so the assertions
+# are that it appears at all, that it says something the rest of the interface
+# does not, and that the same key that opened it closes it. The text pane is what
+# makes this checkable: its content is the file's own bytes, which appear
+# nowhere else on screen, so finding the string proves the worker read the file
+# and the answer found the label that asked for it.
+#
+# Unlike Open With, whose check sits just above and runs on this same selection,
+# the command is enabled for a folder: a preview answers "what is this row", and a
+# folder's size, date and permissions are an answer. The contrast is the point of
+# the check — the two actions share the one-row rule and differ only on what a row
+# may be, and a selection that disables one while enabling the other is the only
+# way to see that from outside.
+#
+# The file is written here rather than reused from the checks above, because
+# those sit behind a skip and this section does not depend on the desktop
+# database.
+#
+# The archive window from the extract section is closed first. A preview
+# belongs to the window the user is looking at, and an autohide popover on a
+# window the compositor considers inactive dismisses itself the moment it maps
+# — correct behaviour, and the reason the popover would otherwise appear to
+# flash here: the open-with chooser left this window without focus, and the
+# archive window still holding it. Closing the archive window hands focus back.
+gdbus call --session --dest org.uflinux.FileManager \
+    --object-path /org/uflinux/FileManager/window/2 \
+    --method org.gtk.Actions.Activate win.close "[]" "[]" >/dev/null 2>&1 || :
+sleep 1
+python3 "$A11Y" select one >/dev/null 2>&1 || :
+if describe preview | grep -qF '(true'; then
+    ok "Preview is enabled for a folder, which has facts of its own to show"
+else
+    fail "Preview is enabled for a folder, which has facts of its own to show ($(describe preview))"
+fi
+
+printf preview-head-line >"$TARGET/preview.txt"
+if ! wait_named "preview.txt"; then
+    fail "a plain file appears so a preview can be asked of it"
+else
+    ok "a plain file appears so a preview can be asked of it"
+    if ! python3 "$A11Y" select preview.txt >/dev/null 2>&1; then
+        fail "Preview is sensitive with one plain file selected"
+    elif describe preview | grep -qF '(true'; then
+        ok "Preview is sensitive with one plain file selected"
+    else
+        fail "Preview is sensitive with one plain file selected ($(describe preview))"
+    fi
+    act preview "[]" "[]"
+    # The file's bytes, which no row, column heading or status label says.
+    has_named "preview-head-line" "the preview shows the opening text of the file"
+    # The facts the listing already had, read off the fixture rather than
+    # hard-coded. Nothing else in the interface prints a mode string: the
+    # properties dialog that does is closed at this point.
+    pmode=$(stat -c '%A' "$TARGET/preview.txt")
+    refresh
+    if printf '%s\n' "$DUMP" | grep -qF "$(printf '\t%s\t' "$pmode")"; then
+        ok "the preview reports the mode bits the file actually has"
+    else
+        fail "the preview reports the mode bits the file actually has (no $pmode)"
+    fi
+    # The same key closes it, which is the whole difference between a preview and
+    # a dialog the user has to go looking for the dismiss of.
+    act preview "[]" "[]"
+    i=0
+    while [ "$i" -lt 50 ] && printf '%s\n' "$DUMP" |
+        grep -qF "$(printf '\tpreview-head-line\t')"; do
+        refresh
+        i=$((i + 1))
+        sleep 0.2
+    done
+    if printf '%s\n' "$DUMP" | grep -qF "$(printf '\tpreview-head-line\t')"; then
+        fail "the same key closes the preview again"
+    else
+        ok "the same key closes the preview again"
+    fi
+fi
+
+# A picture preview asks the thumbnail pipeline for the largest size it allows,
+# which the cache files under its own band rather than the one the row icons
+# live in. The band is the assertion: a preview that shared an entry with an icon
+# would paint a 16 px picture at thirty times its size, and look like a rendering
+# bug rather than a cache one. The same probe as further up decides whether a
+# decode is possible here at all.
+if [ "$probe" != ok ]; then
+    echo "skip preview picture: this machine cannot decode an image"
+else
+    python3 "$A11Y" select photo.png >/dev/null 2>&1 || :
+    act preview "[]" "[]"
+    i=0
+    big=
+    while [ "$i" -lt 100 ] && [ -z "$big" ]; do
+        big=$(find "$HOME/.cache/thumbnails/large" -name '*.png' -size +0 2>/dev/null |
+            head -1)
+        [ -n "$big" ] || {
+            i=$((i + 1))
+            sleep 0.2
+        }
+    done
+    if [ -n "$big" ]; then
+        ok "a preview picture is cached in the band of its own size"
+    else
+        fail "a preview picture is cached in the band of its own size"
+    fi
+    act preview "[]" "[]"
 fi
 
 # --- the search bar -----------------------------------------------------------------

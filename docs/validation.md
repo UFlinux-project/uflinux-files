@@ -37,8 +37,9 @@ error type is named in the signature does not need an essay per method.
 | `ufm-index` | a commit that returned is visible after reopening the index; `hidden` filtering works with scoring on; the n-gram field finds a prefix the tokenised field cannot; a re-crawl replaces rather than accumulates. |
 | `ufm-search` | unknown fields are rejected; an oversized reply shrinks to snippets then page and says which; `Exec` expansion drops a field code with no value; a `NAME=value` prefix is not treated as an argument. |
 | `ufm-desktop-ipc` | an id with a slash cannot name a file outside the desktop directory; unplugging a monitor moves icons and deletes none; a saved layout meets a directory that changed since. |
+| `ufm-thumb` | a requested edge is clamped into the band the spec names, so an icon stays in `normal` and only a preview crosses into `large`; the cache key covers only the file's URI, which is what makes the band the only thing telling a 16 px icon and a 512 px preview apart; a stale entry is a miss. |
 | `uflinux-files-mount` | the argv handed to `mount(8)` contains no argument from the request that begins with `-`; a target that is a symlink, relative, world-readable, or somebody else's is refused; a `credentials=` file anyone can read is refused and its contents never reach an error message; a `pass=` option is refused; the owner comes from `PKEXEC_UID` and is never `0`. |
-| `uflinux-files` | the location on argv reaches the window; `--new-window` gives up being the single instance; the application id matches the desktop entry; a machine with no render node is asked for the cairo renderer, and an explicit `GSK_RENDERER` is never overridden; a paste plan drops the rows that cannot land and names the reason for each, growing `report (2).pdf` rather than replacing; copying a folder takes its contents and deleting one takes what is inside it; a prompt refuses an empty name, hands the typed name over exactly once, and pre-selects the stem of a filename but not its extension; a properties form draws a row only for a fact the entry actually has, spells one file without an `s`, says *at least* for a stopped walk, and holds the size row for a folder so the answer can be delivered into it or dropped when the dialog is gone; the Open With list is deduplicated by desktop entry, drops an entry that asked not to be shown, keeps a fallback when nothing is registered for the type, and names a file whose type nothing owns; a member of an archive is written out under its own name with its own bytes and a second one of the same name does not clobber the first, while a folder inside an archive is refused rather than written as a zero-byte file; a week-old write-out is swept; and a menu over one file offers Open With where a menu over a folder does not. |
+| `uflinux-files` | the location on argv reaches the window; `--new-window` gives up being the single instance; the application id matches the desktop entry; a machine with no render node is asked for the cairo renderer, and an explicit `GSK_RENDERER` is never overridden; a paste plan drops the rows that cannot land and names the reason for each, growing `report (2).pdf` rather than replacing; copying a folder takes its contents and deleting one takes what is inside it; a prompt refuses an empty name, hands the typed name over exactly once, and pre-selects the stem of a filename but not its extension; a properties form draws a row only for a fact the entry actually has, spells one file without an `s`, says *at least* for a stopped walk, and holds the size row for a folder so the answer can be delivered into it or dropped when the dialog is gone; the Open With list is deduplicated by desktop entry, drops an entry that asked not to be shown, keeps a fallback when nothing is registered for the type, and names a file whose type nothing owns; a member of an archive is written out under its own name with its own bytes and a second one of the same name does not clobber the first, while a folder inside an archive is refused rather than written as a zero-byte file; a week-old write-out is swept; and a menu over one file offers Open With where a menu over a folder does not; a preview reads only the head of a file, refuses a binary by its `NUL` byte rather than by its extension, says `(empty file)` for an empty one and `(cannot be shown)` for an unreadable one, and takes text from a `JSON`, `XML` or shell script whose registration hides it under `application/`; arriving at columns mode paints the deepest pane from the listing the window already holds, and a read that was already running still overwrites those provisional rows when it answers. |
 | `uflinux-files-provider` | the crate does not depend on GTK, checked against its own manifest; the bus name is taken through the C entry point whose handlers are nullable, not the gio-rs wrapper that aborts at logout; the polling deadline is longer than the timer that checks it; a missing login session is refused before the bus is asked for. |
 
 ## Archives
@@ -171,7 +172,11 @@ navigating away closes an open one; `Describe` reports `open-with` disabled with
 folder as the one selection and enabled with a plain file, the chooser it opens is a
 window of its own that lists the program the desktop database registers for that type,
 pressing its row really starts that program and hands it the file that was selected,
-and its `Close` dismisses it; the search action opens a field and the field takes typed
+and its `Close` dismisses it; the `preview` action is enabled for a folder as well as
+for a plain file, the popover it opens shows the file's own bytes and the mode bits
+`stat` gives for it, the same key closes it again, and a picture preview lands in the
+cache's `large` band rather than the `normal` one the row icons share; the search action
+opens a field and the field takes typed
 text; a
 second invocation opens a `Computer` window in the running instance; `--new-window` opens
 a window rather than focusing an open one; and the indexer answers `Status` on the bus.
@@ -294,6 +299,27 @@ expecting an argument it can open, and is reported as measured rather than as ho
 The section prints a `skip` line where there is no `update-desktop-database`, on the
 same reasoning as the picture previews. The chooser is closed again at the end because
 the frame count `--new-window` is checked against is read from the same bus.
+
+The preview checks sit after the `Open With` ones deliberately, and one of them exists
+because of that. The text pane is what makes the popover checkable at all: its content
+is the file's own bytes, which appear nowhere else on screen, so finding the string
+proves the worker read the file and the answer found the label that asked for it. The
+mode string is read off the fixture with `stat` for the same reason the properties check
+reads it that way. The picture check asserts on the cache rather than the tree, like the
+row-icon checks, and asserts on the *band*: a preview that shared an entry with an icon
+would paint a 16 px picture at thirty times its size, and that looks like a rendering bug
+rather than a cache one.
+
+The archive window from the extraction section is closed before this section begins, and
+that is not tidiness. An autohide popover anchors the grab that dismisses it on an
+outside click to the parent window's keyboard focus, and a window holding none dismisses
+the popover inside `GTK`'s own focus handling as the popup maps — not through `popdown`,
+which is why the dismissal survives turning `autohide` off and why it took a while to
+find. The `Open With` chooser had just taken that focus, and a `select` through the
+accessibility tree moves the selection without moving the focus, so the window reached
+this point with none. The action now puts focus back on whatever listing is on screen
+before opening, which is the state a real user is always in; the check that the popover
+stays open long enough to be read is therefore also the check that the fix holds.
 
 The run fails if the app printed a GLib critical. One message is excepted, and it is
 excepted on evidence rather than convenience: `GTK4` 4.22 re-reads a toplevel's

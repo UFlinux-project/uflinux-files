@@ -73,6 +73,11 @@ the model over D-Bus and never opens a window.
   with an empty dialog. It works on a member of an archive too: the one member is
   written out to a cache that forgets what is a week old, and the program is handed
   that.
+- **A preview on `Space`**: one row, one popover, no detour. The facts come from the
+  listing, so it is instant; a picture is one request to the same thumbnail pipeline
+  the rows use, decoded at the largest size the cache's `large` band holds; and a text
+  file shows its opening bytes, read on a worker that stops at 64 KiB so a 2 MiB
+  document costs no more than a 2 KiB one. The same key closes it.
 
 ## Layout
 

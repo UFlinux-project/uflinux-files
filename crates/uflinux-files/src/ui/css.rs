@@ -91,6 +91,13 @@ box.ufm-open-with button {
     padding: 6px 8px;
     border-radius: 6px;
 }
+/* The preview popover. A minimum width so a short name does not make the whole
+   popover a narrow column of facts. There is no maximum here because `GTK4`
+   stylesheets have no `max-width` property at all — the ceiling is the text
+   pane's own `max-width-chars`, which is where the width is actually decided. */
+box.ufm-preview {
+    min-width: 320px;
+}
 ";
 
 /// Install the stylesheet for the current display.
@@ -141,6 +148,7 @@ mod tests {
             "ufm-find",
             "ufm-mono",
             "ufm-open-with",
+            "ufm-preview",
             "ufm-grid",
             "ufm-list",
             "ufm-row",

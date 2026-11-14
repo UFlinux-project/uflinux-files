@@ -45,6 +45,7 @@ use super::openwith;
 use super::ops;
 use super::panel::{Panel, Place, Usage};
 use super::popup::{self, Popup};
+use super::preview::{self, Preview};
 use super::props;
 use super::row::Row;
 use super::search::{Found, Outcome, Search};
@@ -86,6 +87,11 @@ pub fn open(app: &gtk::Application, urls: &[String]) {
     // greyed out in exactly the places the header menu and the keyboard are greyed
     // out rather than having a second set of rules of its own.
     let popup = Popup::install(&window);
+    // The spacebar preview, built closed. Its own popover rather than a second
+    // job for the menu's popover: a menu and a preview have nothing in common
+    // beyond being popovers, and sharing one would mean a preview that closes
+    // the menu it did not open.
+    let preview = Preview::install(&window);
 
     let panel = Rc::new(Panel::new());
     // One preview pipeline per window: the worker, the queue and the token table
@@ -141,6 +147,7 @@ pub fn open(app: &gtk::Application, urls: &[String]) {
         shared: Rc::clone(&shared),
         handle: Rc::new(RefCell::new(None)),
         popup: Rc::clone(&popup),
+        preview: Rc::clone(&preview),
         thumbs: thumbs.clone(),
         // Filled in right after the queue, because the answer to a change is a
         // re-read and a re-read needs somewhere to report to.
@@ -193,6 +200,7 @@ pub fn open(app: &gtk::Application, urls: &[String]) {
             _queue: queue,
             _live: live,
             _popup: popup,
+            _preview: preview,
         });
     });
 }
@@ -285,6 +293,8 @@ struct Ctx {
     /// owned by widgets inside the window, and the menu is parented to that window,
     /// so nothing else in the tree would keep it alive.
     popup: Rc<Popup>,
+    /// The spacebar preview, for the same reason and by the same argument.
+    preview: Rc<Preview>,
     /// The folders this window has on screen, watched. `None` when the kernel
     /// refused an inotify instance, which leaves the window refreshing on
     /// navigation alone exactly as it did before there were watches.
@@ -458,6 +468,8 @@ struct Window {
     /// because a popover with no other owner is freed as soon as the call that
     /// built it returns.
     _popup: Rc<Popup>,
+    /// Likewise the preview popover.
+    _preview: Rc<Preview>,
 }
 
 /// Where the first window should start.
@@ -517,6 +529,12 @@ fn navigate(ctx: &Ctx, location: Location, record: bool) {
     // are about to be replaced, and points at a widget that may not survive the
     // repaint.
     ctx.popup.hide();
+    // A preview left open says what one row of the folder being left was, and a
+    // text read in flight belongs to a file that may not be on screen a moment
+    // later. Closing it is cheaper than tracking whether it still applies.
+    if let Some(window) = ctx.window.upgrade() {
+        ctx.preview.hide(&window);
+    }
     // Results describe a query, not this folder, so they leave when the folder
     // does. `reset` rather than `clear`: the listing coming on screen is the
     // thing that replaces them, and reporting `Cleared` here would paint over it.
@@ -757,6 +775,11 @@ fn apply(ctx: &Ctx, event: Event) {
         // `gio::AppInfo` is neither `Send` nor `Sync` and the list of programs has
         // to be read on the main thread.
         Event::Materialised { id, ref path } => openwith::arrived(id, path),
+        // Also not about the folder on screen: a text head belongs to the popover
+        // that asked for it, and the token says which label it was. A preview
+        // dismissed while its file was being read is the ordinary case, which is
+        // why the answer is looked up rather than assumed wanted.
+        Event::Preview { token, ref text } => preview::arrived(token, text.as_deref()),
     }
 }
 
@@ -1578,9 +1601,23 @@ fn mode_action(ctx: &Ctx) -> Rc<gio::SimpleAction> {
             // first time: the chain has to be built, and any pane that was
             // dropped while hidden has to come back.
             if columns && !was_columns {
-                let current = ctx.shared.state.borrow().current.clone();
+                let (current, shown) = {
+                    let state = ctx.shared.state.borrow();
+                    (state.current.clone(), state.shown.clone())
+                };
                 if let Some(location) = current {
                     ctx.columns.show_chain(&location);
+                    // The chain leaves the deepest pane to a read the window
+                    // would normally be making. Here it is not: the folder is
+                    // already on screen in another form, and its listing is
+                    // sitting in `shown`. Handing those rows over is what stops
+                    // the column for the folder in the title bar appearing empty
+                    // until the next navigation. While a read really is running
+                    // the pane stays as the chain left it, because those rows
+                    // would then be thrown away by the answer that is coming.
+                    if !ctx.shared.reading.get() {
+                        ctx.columns.fill_leaf(&location, &shown);
+                    }
                 }
             }
             action.set_state(&name.to_variant());
@@ -1798,6 +1835,17 @@ fn sync_ops(ctx: &Ctx) {
     sync_extract(ctx);
     sync_open_with(ctx);
     sync_properties(ctx);
+    sync_preview(ctx);
+}
+
+/// Enable or disable the preview. One row is the whole condition: any row at all
+/// can be previewed, because the popover decides what to say from what the row
+/// is, and a folder with no text and no picture still gets its facts.
+fn sync_preview(ctx: &Ctx) {
+    let Some(window) = ctx.window.upgrade() else {
+        return;
+    };
+    enable(&window, "preview", targets(ctx).len() == 1);
 }
 
 /// Enable or disable the chooser. Depends on what the one selected row *is* — a
@@ -1925,11 +1973,43 @@ fn context_actions(ctx: &Ctx) -> Vec<Rc<gio::SimpleAction>> {
             // are the ones for the folder on screen, which is what a keyboard user
             // standing in a folder means by "the menu here".
             ctx.popup.hide();
+            // Two popovers over one row answer one question, so the preview steps
+            // aside rather than competing for the same corner of the screen.
+            ctx.preview.hide(&window);
             ctx.popup.show(&window, &menu_rows(&ctx, true), None);
         }
     });
 
-    vec![Rc::new(open), Rc::new(menu)]
+    // The spacebar preview. Enabled for exactly one row, like Properties: the
+    // question a preview answers is about one thing, and a popover that tried to
+    // summarise six files would be a report rather than a glance.
+    let preview = gio::SimpleAction::new("preview", None);
+    preview.connect_activate({
+        let ctx = ctx.clone();
+        move |_action, _parameter| {
+            let (Some(window), Some(handle)) = (ctx.window.upgrade(), ctx.handle.borrow().clone())
+            else {
+                return;
+            };
+            let picked = targets(&ctx);
+            let [entry] = picked.as_slice() else {
+                return;
+            };
+            // The preview anchors its autohide grab on the window's focus, so a
+            // window left without one — just after a dialog or chooser closed and
+            // took it — would show a popover that dismisses itself as it maps.
+            // A real preview is asked for from a focused row; putting focus back on
+            // whatever listing is on screen makes the popover behave the same here.
+            if gtk::prelude::GtkWindowExt::focus(&window).is_none()
+                && let Some(visible) = ctx.modes.visible_child()
+            {
+                visible.grab_focus();
+            }
+            ctx.preview.toggle(&window, &handle, &ctx.thumbs, entry);
+        }
+    });
+
+    vec![Rc::new(open), Rc::new(menu), Rc::new(preview)]
 }
 
 /// The rows for a menu opened without a press, from the state the window is in.
@@ -2015,6 +2095,10 @@ fn install_accels(app: &gtk::Application) {
     // action the pointer uses, so the keyboard gets the same menu rather than a
     // shorter list chosen because it was cheaper to build.
     app.set_accels_for_action("win.context-menu", &["Menu", "<Shift>F10"]);
+    // The preview. The rows answer `Return` and the arrows, and Space is what
+    // every other file manager uses for this, so the chord costs nothing and
+    // buys the feature its name.
+    app.set_accels_for_action("win.preview", &["space"]);
     for mode in [ViewMode::Grid, ViewMode::List, ViewMode::Columns] {
         app.set_accels_for_action(
             &format!("win.mode::{}", mode_name(mode)),

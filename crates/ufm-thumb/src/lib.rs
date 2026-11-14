@@ -12,8 +12,15 @@
 //! `$XDG_CACHE_HOME/thumbnails/normal/<md5 of the file URI>.png` — for one
 //! reason that is not about tidiness: a file manager window that already
 //! thumbnailled a picture puts the same bytes where the desktop, and every other
-//! conforming component, will look for them. One thing is deliberately *not* the
-//! spec. The spec records the source's size and mtime in a `tEXt` chunk inside
+//! conforming component, will look for them. The spec's own size bands are used
+//! too, which is more than tidiness again: a caller that paints a cached picture
+//! at the size it was asked for — as both the icon pipeline and the preview
+//! popover do, because scaling a `Pixbuf` costs an allocation the request should
+//! not have needed — must never be handed bytes decoded for a different edge.
+//! Icons of every size live in `normal`, where the spec puts them and where the
+//! desktop already looks; a request past 256 px, which only a preview makes, is
+//! kept in `large` where the spec says a big thumbnail goes. One thing is
+//! deliberately *not* the spec. The spec records the source's size and mtime in a `tEXt` chunk inside
 //! the PNG, so honouring it means walking chunks and checking CRCs in a process
 //! whose whole budget is 10 MiB. Comparing the cached file's own mtime against
 //! the source's is the same staleness rule with no parser, and it fails in the
@@ -115,7 +122,7 @@ pub fn bytes(job: &Job) -> Option<Vec<u8>> {
 /// Read a cached thumbnail, if one exists and is not older than its source.
 #[must_use]
 pub fn cached(job: &Job) -> Option<Vec<u8>> {
-    let path = cached_path(&job.path)?;
+    let path = cached_path(&job.path, job.size)?;
     let cache = std::fs::metadata(&path).ok()?;
     if !cache.is_file() || cache.len() == 0 || cache.len() > MAX_SOURCE_BYTES {
         return None;
@@ -169,7 +176,7 @@ pub fn make(job: &Job) -> Option<Vec<u8>> {
 /// its way to being painted, and a cache directory that cannot be written should
 /// cost one repeated decode and nothing else.
 fn store(job: &Job, png: &[u8]) {
-    let Some(path) = cached_path(&job.path) else {
+    let Some(path) = cached_path(&job.path, job.size) else {
         return;
     };
     let Some(dir) = path.parent() else {
@@ -181,14 +188,33 @@ fn store(job: &Job, png: &[u8]) {
     let _ = std::fs::write(&path, png);
 }
 
-/// Where a thumbnail for `source` lives: `<cache>/thumbnails/normal/<md5>.png`.
+/// Where a thumbnail of `size` for `source` lives:
+/// `<cache>/thumbnails/<band>/<md5>.png`.
+///
+/// The size is part of the answer because the size is not part of the hash: two
+/// requests for one file differ only in the edge they asked for, and a reader
+/// that paints what it reads without scaling — which is what both callers here
+/// do — would otherwise paint a 16 px icon into a 512 px preview frame, or the
+/// other way round, and call that a cache hit.
 #[must_use]
-pub fn cached_path(source: &Path) -> Option<PathBuf> {
+pub fn cached_path(source: &Path, size: u32) -> Option<PathBuf> {
     let mut sum = glib::Checksum::new(glib::ChecksumType::Md5)?;
     sum.update(uri(source).as_bytes());
     let hash = sum.string()?;
     let root = ufm_core::paths::thumbnail_dir();
-    Some(root.join("normal").join(hash).with_extension("png"))
+    Some(root.join(band(size)).join(hash).with_extension("png"))
+}
+
+/// The spec's name for the band a thumbnail of `size` belongs to.
+///
+/// Two of the three are reachable here: nothing asks for more than
+/// [`MAX_SIZE`], and `MAX_SIZE` is inside the band the spec calls `large`. Every
+/// icon size the file manager and the desktop provider ask for is at or under
+/// 256 px, which is `normal` — the directory the spec tells other components to
+/// read from, and the one already holding pictures this machine has thumbnailled
+/// until now.
+fn band(size: u32) -> &'static str {
+    if size > 256 { "large" } else { "normal" }
 }
 
 /// The `file://` URI of a path, which is what the spec hashes.
@@ -339,9 +365,11 @@ mod tests {
     #[test]
     fn a_cache_path_is_the_md5_of_the_uri() {
         // The spec's own example: the hash is of the URI text and nothing else,
-        // so this is the value another component will look for.
+        // so this is the value another component will look for. The icon band is
+        // spelled out too, because a directory the desktop does not read from
+        // would make this cache private rather than shared.
         let path = Path::new("/home/u/Desktop/a.png");
-        let got = cached_path(path).expect("md5 is always available");
+        let got = cached_path(path, 128).expect("md5 is always available");
         let want = {
             let mut sum = glib::Checksum::new(glib::ChecksumType::Md5).unwrap();
             sum.update(b"file:///home/u/Desktop/a.png");
@@ -352,13 +380,49 @@ mod tests {
             format!("{want}.png")
         );
         assert!(got.starts_with(ufm_core::paths::thumbnail_dir()));
+        assert_eq!(
+            got.parent()
+                .and_then(|p| p.file_name())
+                .and_then(|n| n.to_str()),
+            Some("normal")
+        );
     }
 
     #[test]
     fn two_different_files_get_two_cache_entries() {
-        let a = cached_path(Path::new("/home/u/Desktop/a.png")).unwrap();
-        let b = cached_path(Path::new("/home/u/Desktop/b.png")).unwrap();
+        let a = cached_path(Path::new("/home/u/Desktop/a.png"), 128).unwrap();
+        let b = cached_path(Path::new("/home/u/Desktop/b.png"), 128).unwrap();
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn a_preview_and_an_icon_of_one_file_do_not_share_one_entry() {
+        // The hash covers only the URI, so the band is the only thing telling a
+        // 512 px preview apart from a 16 px icon. Read the other way round, a
+        // preview would paint an icon-sized picture at four times its size, or
+        // an icon would be handed a decode twenty times bigger than it asked
+        // for — and neither would look like a cache bug on screen.
+        let path = Path::new("/home/u/Desktop/a.png");
+        let icon = cached_path(path, 64).unwrap();
+        let preview = cached_path(path, 512).unwrap();
+        assert_ne!(icon, preview);
+        assert_eq!(
+            icon.parent()
+                .and_then(|p| p.file_name())
+                .and_then(|n| n.to_str()),
+            Some("normal")
+        );
+        assert_eq!(
+            preview
+                .parent()
+                .and_then(|p| p.file_name())
+                .and_then(|n| n.to_str()),
+            Some("large")
+        );
+        // The boundary the spec draws, and the sizes this workspace actually
+        // asks for: every icon stays in `normal`, only a preview crosses over.
+        assert_eq!(cached_path(path, 256).unwrap().parent(), icon.parent());
+        assert_eq!(cached_path(path, 257).unwrap().parent(), preview.parent());
     }
 
     #[test]
@@ -410,7 +474,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("a folder to read");
         let path = dir.path().join("a.png");
         std::fs::write(&path, b"not an image").expect("a file to thumbnail");
-        let cache = cached_path(&path).expect("a cache path");
+        let cache = cached_path(&path, 32).expect("a cache path");
         std::fs::create_dir_all(cache.parent().expect("a cache folder"))
             .expect("a cache directory");
         let stored = png(48, 24);
@@ -427,7 +491,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("a folder to read");
         let path = dir.path().join("a.png");
         std::fs::write(&path, b"not an image").expect("a file to thumbnail");
-        let cache = cached_path(&path).expect("a cache path");
+        let cache = cached_path(&path, 32).expect("a cache path");
         std::fs::create_dir_all(cache.parent().expect("a cache folder"))
             .expect("a cache directory");
         std::fs::write(&cache, png(48, 24)).expect("a writable cache");
@@ -462,7 +526,7 @@ mod tests {
         let got = bytes(&Job::new(&path, 32)).expect("a working encoder must decode");
         assert_eq!(png_size(&got), Some((32, 32)));
         assert!(
-            cached_path(&path).is_some_and(|c| c.is_file()),
+            cached_path(&path, 32).is_some_and(|c| c.is_file()),
             "a fresh thumbnail must be written into the cache"
         );
     }

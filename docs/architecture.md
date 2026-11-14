@@ -444,6 +444,70 @@ paths a test drives do not shift when it opens. Its rows are buttons whose child
 is a box — `gtk::Button` has no image property in this `GTK` — so the name a
 screen reader reads is set explicitly rather than inherited from a label.
 
+## Previewing a file
+
+`Space` over one row opens a popover that says what the row holds. The point is
+the answer without a detour: opening a document means waiting for an application
+to start and Properties means a dialog and a walk, and a user deciding which of
+six files to open wants neither. `ui/preview.rs` is one `gtk::Popover` per
+window, built closed and refilled on every opening — rebuilt rather than updated
+in place, because what a preview holds depends so completely on the row that the
+alternative is a widget tree with holes in it that every rule has to remember to
+refill. The same key closes it again, and `autohide` gives a pointer user the
+click-anywhere-else and `Escape` dismissals they already expect from every other
+popover here.
+
+The popover is enabled for exactly one row, like Properties: the question a
+preview answers is about one thing, and a popover that tried to summarise six
+files would be a report rather than a glance. It is enabled for a *folder* too,
+which is the one place it differs from `Open With…` — a folder's size, date and
+permissions are an answer, and the two actions share the one-row rule while
+differing only on what a row may be.
+
+Three parts, two of them borrowed. The header and the facts come from the
+`Entry` the listing already carries, so the popover is instant on a folder of ten
+thousand rows and costs no syscall beyond the `stat` the read already did. The
+picture is one request to the window's thumbnail [`Pipeline`](#picture-previews),
+which already owns the worker, the queue and the token table, and already drops
+an answer whose widget has gone away — the ordinary fate of a preview dismissed
+before its decode finished. The gate inside `Pipeline::request` is also the
+preference: with picture previews switched off the request is refused and the
+popover shows the facts alone, which is what the switch promises.
+
+The text is the only part with machinery of its own, because it is the only part
+that reads a file. It goes to a worker of its own and reports through the listing
+queue as `Event::Preview`, since file I/O on the main thread is what this whole
+program exists to avoid. The label its answer belongs to is held in a thread-local
+table keyed by a token, and the window only as a key for `forget`, so an answer
+that arrives after its popover was dismissed writes into a label that is in no
+widget tree — one string copy, nothing else. The read stops at 64 KiB plus one,
+so a 2 MiB document costs the same as a 2 KiB one, and a `NUL` byte in what was
+read settles the question of whether this is text: `UTF-8` tolerates it, and every
+real text file here is either `UTF-8` or something the user did not want a preview
+of. A member of an archive gets the facts and no text pane; reading it would mean
+opening the container on a worker while the view is browsing through it, which is
+far too much work for a glance.
+
+The picture is asked for at `ufm_thumb::MAX_SIZE`, which the cache files under the
+spec's `large` band rather than the `normal` one the icons live in. That separation
+is what makes the big request safe: both the popover and the icon pipeline paint
+cached bytes at the size they were decoded for, so a preview reading an icon-sized
+cache entry would paint a 16 px picture at thirty times its size and look like a
+rendering bug rather than a cache one.
+
+One detail took the whole of a debugging session to find. An autohide popover
+anchors the grab that dismisses it on an outside click to the parent window's
+keyboard focus, and a window holding none dismisses the popover the instant it
+maps — not through `popdown`, which is why it survives `autohide` off, but inside
+`GTK`'s own focus handling during the popup. A preview asked for from a focused
+row never sees this, and neither does the context menu, which is a `PopoverMenu`
+and anchors itself by focusing its first row. It appears the moment a dialog or
+chooser has just closed over the window and taken its focus, which is exactly the
+state the `UI` harness is in after the `Open With` section. So the action puts
+focus back on whatever listing is on screen before opening, when the window holds
+none — the state a real user is always in, and the reason the fix belongs to the
+action rather than to the popover.
+
 ## Concurrency
 
 No tokio. A GLib main context plus a bounded worker pool, the same shape

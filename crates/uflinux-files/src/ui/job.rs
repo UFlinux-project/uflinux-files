@@ -79,6 +79,14 @@ pub enum Event {
     /// travel to the worker and back, so the worker brings the bytes and the
     /// dialog reads the list itself (see [`super::openwith`]).
     Materialised { id: usize, path: PathBuf },
+    /// The head of a text file, read for the preview popover. The sixth variant
+    /// that is not about a folder, and shaped the way [`Event::Sized`] is: the
+    /// popover asked, the window is only the postman, and `token` names the
+    /// popover that asked so an answer for one that has since been dismissed is
+    /// dropped rather than painted (see [`super::preview`]). The bytes arrive
+    /// already decoded and already cut down, because a worker that read a whole
+    /// 2 MiB document into a popover would cost more than the popover is worth.
+    Preview { token: u64, text: Option<String> },
 }
 
 /// Closes a file descriptor when the last owner drops it, so a worker that

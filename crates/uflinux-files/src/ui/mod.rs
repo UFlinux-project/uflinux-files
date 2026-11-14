@@ -29,6 +29,7 @@ mod openwith;
 mod ops;
 mod panel;
 mod popup;
+mod preview;
 mod props;
 mod row;
 mod search;

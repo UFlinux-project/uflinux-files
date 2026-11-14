@@ -263,6 +263,31 @@ impl Columns {
         }
     }
 
+    /// Paint the deepest pane from a listing the window already has, and
+    /// remember it as that pane's own.
+    ///
+    /// For arriving at columns mode from grid or list. [`Columns::show_chain`]
+    /// leaves the leaf pane to the window on the grounds that the window is
+    /// reading that folder anyway — true while navigating, and false when the
+    /// user merely changes how the folder they are already looking at is drawn.
+    /// Without this the column for the folder in the title bar appears empty
+    /// until something else happens to re-read it, which reads as a broken view
+    /// rather than as a view that is waiting for a read nobody was going to make.
+    ///
+    /// The pane is left waiting, as [`Columns::expect_leaf`] leaves it: these
+    /// rows are provisional in the sense that a read started before the mode
+    /// changed still outranks them, and it is the fresh listing that should
+    /// replace them rather than nothing. The listing goes into the pane's cache
+    /// as well, so that re-sorting or narrowing the column afterwards does not
+    /// lose the rows.
+    pub fn fill_leaf(&self, location: &Location, entries: &[Entry]) {
+        let Some(pane) = self.pane_for(location) else {
+            return;
+        };
+        *pane.entries.borrow_mut() = entries.to_vec();
+        paint(&pane, entries);
+    }
+
     /// Re-order the rows already on screen, from the cached listing. The cache
     /// is rewritten too: a pane that painted a new order and kept the old one
     /// would jump back the next time its rows were replaced, which is what
@@ -322,12 +347,15 @@ impl Columns {
             // nothing to match a token against. A folder's total is the same
             // again — it belongs to a dialog, not to a pane. So does a member
             // written out of an archive, which belongs to the chooser that asked.
+            // So does a text head, which belongs to the preview popover and is
+            // looked up there by its token.
             Event::Batch { .. }
             | Event::Mounted { .. }
             | Event::Operation { .. }
             | Event::Thumb { .. }
             | Event::Sized { .. }
-            | Event::Materialised { .. } => {}
+            | Event::Materialised { .. }
+            | Event::Preview { .. } => {}
             Event::Finished {
                 location, entries, ..
             } => {
@@ -886,6 +914,33 @@ mod tests {
             // stale read must not replace what is on screen.
             columns.apply(&done("/home/u", Vec::new()));
             assert_eq!(columns.pane_len(2), 2);
+        });
+    }
+
+    #[test]
+    fn the_deepest_column_can_be_filled_without_a_read() {
+        tk::ui(|| {
+            let columns = columns();
+            columns.show_chain(&location("/home/u"));
+            // Arriving at columns mode from another view: the window is not
+            // reading the folder, so no event would ever arrive for the leaf.
+            columns.fill_leaf(&location("/home/u"), &[file("a"), file("b"), file("c")]);
+            assert_eq!(columns.pane_len(2), 3);
+            // The rows are painted but the pane is still waiting, so a read
+            // that was already running when the mode changed still gets to
+            // replace them. That answer is fresher than the rows on screen.
+            columns.apply(&done("/home/u", vec![file("a"), file("b")]));
+            assert_eq!(columns.pane_len(2), 2);
+        });
+    }
+
+    #[test]
+    fn filling_a_column_that_is_not_on_screen_changes_nothing() {
+        tk::ui(|| {
+            let columns = columns();
+            columns.show_chain(&location("/home/u"));
+            columns.fill_leaf(&location("/somewhere/else"), &[file("a")]);
+            assert_eq!(columns.pane_len(2), 0);
         });
     }
 
