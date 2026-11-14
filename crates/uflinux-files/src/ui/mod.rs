@@ -32,6 +32,8 @@ mod window;
 #[cfg(test)]
 mod tk;
 
+use std::ffi::OsStr;
+use std::path::Path;
 use std::process::ExitCode;
 
 // gio's, not gtk's: `connect_activate`, `connect_open` and `run_with_args` all
@@ -56,6 +58,7 @@ const APP_ID: &str = "org.uflinux.FileManager";
 /// new rather than one that might only be focused. The id stays the same either
 /// way, so the shell still folds the new window in with the old ones.
 pub fn run(options: &cli::Ui) -> ExitCode {
+    pick_renderer();
     let app = gtk::Application::builder()
         .application_id(APP_ID)
         .flags(flags(options))
@@ -97,6 +100,62 @@ fn flags(options: &cli::Ui) -> gio::ApplicationFlags {
     } else {
         gio::ApplicationFlags::HANDLES_OPEN
     }
+}
+
+/// Pick a renderer before GTK reads one.
+///
+/// `GSK_RENDERER` is the documented knob and there is no setter for it, so the choice has
+/// to be made before the display exists — which means before the application is built,
+/// which is also before GTK, `GApplication` or any worker thread of ours exist. That is
+/// the only context in which writing the environment is sound, and the reason this is a
+/// function called on one line rather than a method on the builder.
+///
+/// GTK's default is GL, which is the right answer wherever there is a GPU. Where there is
+/// none, Mesa answers with llvmpipe, and llvmpipe's rasteriser buffers are anonymous
+/// memory: measured on a machine with no render node, one window on an empty folder cost
+/// 222 MiB of PSS with 137 MiB of it inside Mesa's software pipeline, against 54 MiB with
+/// cairo. A machine that cannot accelerate a shader is not a machine that can afford to
+/// cache one, and cairo is what GTK recommends for exactly that case. An explicit
+/// `GSK_RENDERER` always wins, including `=gl`, for whoever is measuring the difference.
+fn pick_renderer() {
+    let Some(name) = renderer_choice(
+        std::env::var_os("GSK_RENDERER").as_deref(),
+        Path::new("/dev/dri"),
+    ) else {
+        return;
+    };
+    // SAFETY: nothing has been started yet — no display, no thread, no GApplication — so
+    // there is no concurrent reader of the environment to race with.
+    unsafe { std::env::set_var("GSK_RENDERER", name) };
+}
+
+/// The renderer to ask for, given what the environment already says and what `/dev/dri`
+/// holds. `None` means leave the environment alone, which is GTK's own default.
+///
+/// Split out from [`pick_renderer`] because the interesting part of this decision is that
+/// it happens once, in a context where mutating the environment is safe, and a test that
+/// called `pick_renderer` would change the renderer for every other test in the binary.
+fn renderer_choice(explicit: Option<&OsStr>, dri: &Path) -> Option<&'static str> {
+    if explicit.is_some() || has_render_node(dri) {
+        None
+    } else {
+        Some("cairo")
+    }
+}
+
+/// Whether the machine has a GPU this process could draw with.
+///
+/// `cardN` is what a driver creates and `renderD128N` is what it creates for rendering
+/// without a display; a `/dev/dri` holding neither, or no directory at all, means every GL
+/// context comes out of Mesa's software fallback.
+fn has_render_node(dri: &Path) -> bool {
+    std::fs::read_dir(dri).is_ok_and(|entries| {
+        entries.flatten().any(|entry| {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            name.starts_with("card") || name.starts_with("renderD")
+        })
+    })
 }
 
 #[cfg(test)]
@@ -146,6 +205,52 @@ mod tests {
         assert!(
             entry.contains("StartupWMClass=uflinux-files"),
             "the desktop entry lost the class the window reports"
+        );
+    }
+
+    #[test]
+    fn a_machine_without_a_render_node_is_asked_for_cairo() {
+        // The container this suite runs in has no /dev/dri at all, which is the case the
+        // 90 MiB window budget was written for and the case GL fails by 130 MiB.
+        let missing = std::env::temp_dir().join("ufm-no-such-dri");
+        assert_eq!(
+            renderer_choice(None, &missing),
+            Some("cairo"),
+            "a machine with no GPU must not be handed Mesa's software pipeline"
+        );
+    }
+
+    #[test]
+    fn a_render_node_leaves_the_renderer_to_gtk() {
+        let dri = std::env::temp_dir().join("ufm-fake-dri");
+        let _ = std::fs::remove_dir_all(&dri);
+        std::fs::create_dir_all(&dri).unwrap();
+        // Cleaned up before the assertions: a leftover directory under /tmp would make
+        // every later run of this suite look like it had a GPU.
+        std::fs::write(dri.join("renderD128"), []).unwrap();
+        let with_render_node = renderer_choice(None, &dri);
+        std::fs::remove_file(dri.join("renderD128")).unwrap();
+        std::fs::write(dri.join("card0"), []).unwrap();
+        let with_card = renderer_choice(None, &dri);
+        std::fs::remove_dir_all(&dri).unwrap();
+        assert_eq!(
+            with_render_node, None,
+            "renderD128 is a GPU as far as this cares"
+        );
+        assert_eq!(with_card, None, "card0 is a GPU as far as this cares");
+    }
+
+    #[test]
+    fn an_explicit_renderer_is_never_overridden() {
+        // Includes GSK_RENDERER=gl: whoever sets it is either shipping a GPU driver or
+        // measuring what the two renderers cost, and in both cases being contradicted
+        // would be worse than the memory saved.
+        let missing = std::env::temp_dir().join("ufm-no-such-dri");
+        assert_eq!(renderer_choice(Some(OsStr::new("gl")), &missing), None);
+        assert_eq!(
+            renderer_choice(Some(OsStr::new("cairo")), &missing),
+            None,
+            "setting it to cairo still needs no change, and must not be treated as a no-op"
         );
     }
 }

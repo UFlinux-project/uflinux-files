@@ -14,6 +14,9 @@ makedepends="cargo cargo-auditable gtk4.0-dev gtk4-layer-shell-dev glib-dev
 	gdk-pixbuf-dev shared-mime-info pkgconf"
 subpackages="$pkgname-dbg $pkgname-doc $pkgname-searchd:searchd
 	$pkgname-desktop:desktop $pkgname-mount-helper:mount_helper"
+# The provider is its own binary so that it stays out of the file manager's
+# library closure; see crates/uflinux-files-provider/Cargo.toml.
+_bin_provider="uflinux-files-provider"
 # Optional at runtime, and each one is named in the UI when it is missing:
 # `7z` comes from p7zip (Alpine's package provides `7z`, not `7zz`), the tar
 # codecs and `bsdtar` from libarchive-tools, and `xdg-open` for "Open With".
@@ -41,10 +44,10 @@ prepare() {
 	# Source bundles normalize timestamps. Never reuse stale workspace binaries.
 	cargo clean -p ufm-core -p ufm-vfs -p ufm-archive -p ufm-mount -p ufm-index \
 		-p ufm-search -p ufm-desktop-ipc -p uflinux-files-mount -p uflinux-files \
-		-p uflinux-searchd
+		-p uflinux-files-provider -p uflinux-searchd
 	cargo clean --release -p ufm-core -p ufm-vfs -p ufm-archive -p ufm-mount \
 		-p ufm-index -p ufm-search -p ufm-desktop-ipc -p uflinux-files-mount \
-		-p uflinux-files -p uflinux-searchd
+		-p uflinux-files -p uflinux-files-provider -p uflinux-searchd
 }
 build() {
 	# abuild enables Rust debug info when a -dbg subpackage exists, and the
@@ -59,6 +62,7 @@ check() {
 package() {
 	local target="${CARGO_TARGET_DIR:-target}/release"
 	install -Dm755 "$target/uflinux-files" "$pkgdir/usr/bin/uflinux-files"
+	install -Dm755 "$target/$_bin_provider" "$pkgdir/usr/bin/$_bin_provider"
 	install -Dm755 "$target/uflinux-searchd" "$pkgdir/usr/libexec/uflinux-searchd"
 	install -Dm755 "$target/uflinux-files-mount" "$pkgdir/usr/libexec/uflinux-files-mount"
 	install -Dm644 data/org.uflinux.Files.desktop \
@@ -93,9 +97,13 @@ searchd() {
 }
 desktop() {
 	pkgdesc="Desktop icon provider for uflinux-desktop"
-	# The provider is GLib/GIO only, no GTK, so it does not pull in the toolkit.
+	# GLib/GIO only, no GTK, so this does not pull the toolkit onto a session that
+	# has no windows. Enforced by the crate's dependency list, not by a wish: the
+	# binary maps twenty-five shared libraries and gtk4 is not among them, where
+	# the file manager maps a hundred and eleven. See docs/memory-budget.md.
 	depends="dbus"
-	amove usr/share/dbus-1/services/org.uflinux.FileManager.Desktop1.service
+	amove usr/bin/$_bin_provider \
+		usr/share/dbus-1/services/org.uflinux.FileManager.Desktop1.service
 }
 mount_helper() {
 	pkgdesc="Privileged mount helper for UFLinux Files"
@@ -108,5 +116,5 @@ mount_helper() {
 # Filled in by scripts/files-source.py --update; empty here so the recipe still
 # parses as shell before a bundle has been generated.
 sha512sums="
-2f43adaaf0537effb1468be6dc22d93bbb5228ac8ce9994ac67fa45a329dd40b863c26f563614152b36a8454c0308bf8663e87abc5c298e10542ef144437e797  uflinux-files-0.1.0.tar
+c7d5a87f08b71bec3a6551eef2aec5e617d271ead79d547ed65280b8d094a248962b60e1521563bf10d7414a0e35dddb2da4ce14157cc42dc530c0fbcb59a6cc  uflinux-files-0.1.0.tar
 "

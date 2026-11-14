@@ -1,0 +1,32 @@
+[package]
+name = "uflinux-files-provider"
+description = "UFLinux desktop icons provider: serves the desktop model over D-Bus"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+# One binary, no GTK, and that is the point rather than an oversight. See the
+# module comment in src/main.rs and the provider row in docs/memory-budget.md.
+[[bin]]
+name = "uflinux-files-provider"
+path = "src/main.rs"
+
+[dependencies]
+ufm-core.workspace = true
+ufm-vfs.workspace = true
+ufm-desktop-ipc.workspace = true
+gio.workspace = true
+glib.workspace = true
+gdk-pixbuf.workspace = true
+libc.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

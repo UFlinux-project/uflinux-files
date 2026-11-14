@@ -9,7 +9,7 @@ where the knowledge already is:
 | | owns | because |
 | --- | --- | --- |
 | `uflinux-desktop` | the pixels, the geometry, the clicks | it already has the layer-shell surface and the monitor layout |
-| `uflinux-files --provider` | the filesystem, the layout, the actions | it already knows what is in the desktop directory and how to launch or trash it |
+| `uflinux-files-provider` | the filesystem, the layout, the actions | it already knows what is in the desktop directory and how to launch or trash it |
 
 `ufm-desktop-ipc` is the seam: types and validation, no I/O, no GLib.
 
@@ -71,9 +71,10 @@ model so a renderer never invents its own and every desktop shows the same thing
 
 ## The provider
 
-`uflinux-files --provider` claims the bus name and does **not** initialise GTK —
-GLib and GIO only. That is what keeps it at ~10 MiB resident: no window, no widget
-tree, no CSS provider, no icon theme search beyond what a thumbnail needs. It:
+`uflinux-files-provider` claims the bus name and does **not** link GTK — GLib and
+GIO only, in a binary of its own. That is what keeps it at ~3 MiB resident: no window,
+no widget tree, no CSS provider, no icon theme search beyond what a thumbnail needs.
+It:
 
 - watches `$XDG_DESKTOP_DIR` (falling back to `~/Desktop`) through the same
   coalescing watcher the file manager uses;
@@ -137,18 +138,26 @@ thumbnail it would not decode.
 `uflinux-desktop` pins `gtk4` 0.10.1 and `gtk4-layer-shell` 0.6.3; this workspace
 uses gtk4 0.10 with gtk4-layer-shell 0.7. The two must resolve to one copy of each in
 the image — the reason the dependency is optional here and behind the
-`desktop-icons` feature, so the common package does not link it at all.
+`desktop-icons` feature, so the common package does not link it at all. The provider
+never links it either way: it has no window to place on a layer.
 
 ## Fallback without a renderer
 
-If no renderer claims the interface within 2 s of the provider starting, the file
-manager can draw the grid itself with `uflinux-files --desktop-icons`, which builds a
-layer-shell window of its own. That is the `desktop-icons` feature: an extra binary
-mode rather than a second package, so the feature works on any compositor while the
-default install pays nothing for it.
+If no renderer claims the interface, the desktop has no icons and no error: the provider
+answers `Status` with `renderer: false` and waits. The intended answer is for the file
+manager to draw the grid itself, in a layer-shell window of its own, behind the
+`desktop-icons` feature — an extra build flag rather than a second package, so the
+feature works on any compositor while the default install pays nothing for it.
 
-The 2 s timeout is a timeout and not a poll: the provider starts on the bus's demand,
-and a shell that is still starting should win without the file manager having
+**That fallback is not implemented.** What exists today is the dependency, the feature,
+and the `renderer: false` answer that a shell or a person can act on. The reason for
+saying so here rather than describing the window as if it were built: the check that
+would catch a missing renderer is a check on `Status`, and a reader who believed the
+fallback existed would look for a bug in the provider instead of a missing feature in the
+UI. The 2 s figure below is what the fallback is specified to wait, not a timer that runs.
+
+The timeout is specified as a timeout and not a poll: the provider starts on the bus's
+demand, and a shell that is still starting should win without the file manager having
 committed to painting a desktop it will have to stop painting.
 
 ## Cost

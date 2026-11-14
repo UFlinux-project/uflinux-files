@@ -995,8 +995,8 @@ mod tests {
             "the bus name in {file} is not the one the provider takes"
         );
         assert!(
-            text.contains("Exec=/usr/bin/uflinux-files --provider"),
-            "activation has to run the mode that serves this interface"
+            text.contains("Exec=/usr/bin/uflinux-files-provider"),
+            "activation has to run the binary that serves this interface"
         );
     }
 

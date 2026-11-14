@@ -10,8 +10,10 @@ desktop icon model that `uflinux-desktop` draws.
 
     uflinux-files ~/Documents            # open a window at a folder
     uflinux-files computer://            # the My Computer panel
-    uflinux-files --provider             # desktop-icons provider, no window
     uflinux-files --sweep-mounts         # clean up after an unclean shutdown
+
+Desktop icons are served by a separate program, `uflinux-files-provider`, which holds
+the model over D-Bus and never opens a window.
 
 ## What it does
 
@@ -41,28 +43,34 @@ desktop icon model that `uflinux-desktop` draws.
 | `crates/ufm-search` | The `org.uflinux.Search1` wire format, index config, `Exec` expansion |
 | `crates/ufm-desktop-ipc` | The `org.uflinux.FileManager.Desktop1` protocol and desktop model |
 | `crates/uflinux-files-mount` | The privileged mount helper `pkexec` runs as root |
-| `crates/uflinux-files` | The GTK4 UI, the mount runner, and `--provider` |
+| `crates/uflinux-files` | The GTK4 UI and the mount runner |
+| `crates/uflinux-files-provider` | The desktop-icons provider: GLib and GIO, no GTK |
 | `crates/uflinux-searchd` | The indexer daemon |
 | `data/` | Desktop entry, icon, D-Bus activation, polkit policy and rules |
 | `aports/uflinux-files/` | Alpine package recipe |
 | `docs/` | Architecture, mounts, indexer, desktop integration, memory budget, validation |
 
-Everything above `uflinux-files` is pure Rust with no GLib in sight, which is what
-lets it be built and tested anywhere; the two binaries are where GTK and GIO
-enter. The mount helper is a binary and still pure Rust on purpose: it runs as
-root, so a small dependency graph is a security property rather than a preference.
+Everything above `uflinux-files-mount` is pure Rust with no GLib in sight, which is
+what lets it be built and tested anywhere; the three binaries are where GLib enters,
+and only the file manager links GTK. The mount helper is a binary and still pure Rust
+on purpose: it runs as root, so a small dependency graph is a security property rather
+than a preference. The provider links GLib and nothing above it, which is a memory
+property rather than a preference — see
+[memory-budget.md](docs/memory-budget.md).
 
 ## Building
 
-The workspace needs Rust 1.88 or newer. The library crates build anywhere:
+The workspace needs Rust 1.88 or newer. The library crates and the mount helper are
+default members and build anywhere:
 
     cargo test
+    cargo build --release
 
-The binaries need GTK 4.12 development files (`gtk4.0-dev`, `gtk4-layer-shell-dev`,
-`glib-dev`, `gdk-pixbuf-dev` on Alpine) and are built by the package recipe. The
-mount helper needs neither and builds with the rest:
+The two GLib binaries are not default members, so they need GTK 4.12 and GLib
+development files (`gtk4.0-dev`, `gtk4-layer-shell-dev`, `glib-dev`, `gdk-pixbuf-dev`
+on Alpine) and are built by the package recipe:
 
-    cargo build --release -p uflinux-files -p uflinux-searchd -p uflinux-files-mount
+    cargo build --release --workspace
 
 At runtime, everything optional is named in the user's language when it is
 missing rather than failing quietly: `7z` for 7z archives, `cifs-utils` and

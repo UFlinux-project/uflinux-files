@@ -1,5 +1,5 @@
 #!/bin/sh
-# End-to-end check for `uflinux-files --provider`, run against a real session bus.
+# End-to-end check for `uflinux-files-provider`, run against a real session bus.
 #
 # This is the part of the desktop-icons feature that a unit test cannot reach: the
 # provider's whole job is to answer D-Bus calls, and the unit tests deliberately drive
@@ -10,8 +10,8 @@
 #
 # Run it from a checkout, with the binary already built:
 #
-#   cargo build -p uflinux-files
-#   tests/provider-bus.sh target/debug/uflinux-files
+#   cargo build -p uflinux-files-provider
+#   tests/provider-bus.sh target/debug/uflinux-files-provider
 #
 # With no session bus around — which is the case in a build chroot or a container — it
 # starts a private bus for itself. Needs `dbus-run-session` and `gdbus` either way (both
@@ -19,13 +19,13 @@
 # protocol says, so it can be chained onto the test run rather than read by a person.
 set -eu
 
-BIN=${1:-target/debug/uflinux-files}
+BIN=${1:-target/debug/uflinux-files-provider}
 IFACE=org.uflinux.FileManager.Desktop1
 OBJ=/org/uflinux/FileManager/Desktop
 
 command -v dbus-run-session >/dev/null || { echo "need dbus-run-session" >&2; exit 2; }
 command -v gdbus >/dev/null || { echo "need gdbus" >&2; exit 2; }
-[ -x "$BIN" ] || { echo "no binary at $BIN — run cargo build -p uflinux-files" >&2; exit 2; }
+[ -x "$BIN" ] || { echo "no binary at $BIN — run cargo build -p uflinux-files-provider" >&2; exit 2; }
 
 # A bus of our own rather than the developer's, so a failure cannot leave anything
 # attached to a running session and so the check works in a chroot.
@@ -75,7 +75,7 @@ expect() {
     esac
 }
 
-"$BIN" --provider >"$ROOT/provider.log" 2>&1 &
+"$BIN" >"$ROOT/provider.log" 2>&1 &
 pid=$!
 # The provider reads the directory before it takes the name, so by the time the object
 # answers the first model exists. The loop covers process start, not the read.

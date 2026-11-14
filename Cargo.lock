@@ -1737,7 +1737,6 @@ dependencies = [
 name = "uflinux-files"
 version = "0.1.0"
 dependencies = [
- "gdk-pixbuf",
  "gio",
  "glib",
  "gtk4",
@@ -1764,6 +1763,22 @@ dependencies = [
  "tempfile",
  "ufm-core",
  "ufm-mount",
+]
+
+[[package]]
+name = "uflinux-files-provider"
+version = "0.1.0"
+dependencies = [
+ "gdk-pixbuf",
+ "gio",
+ "glib",
+ "libc",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "ufm-core",
+ "ufm-desktop-ipc",
+ "ufm-vfs",
 ]
 
 [[package]]

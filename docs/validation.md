@@ -11,14 +11,15 @@ cargo clippy --all-targets
 ```
 
 Both are green today with no GTK4 development packages installed. Every default
-member is pure Rust — the seven library crates and the mount helper — and the two
-binaries that need a toolkit are not default members. That is the whole reason for
+member is pure Rust — the seven library crates and the mount helper — and the three
+binaries that need GLib are not default members. That is the whole reason for
 the split: the logic that decides what a user sees is testable on a machine that
 cannot build the UI, and so is the code that runs as root.
 
 `--all-targets` and not `--workspace`: `-p uflinux-files` pulls in gtk4-sys, gsk4-sys
-and graphene-sys, which need `pkg-config` to find GTK4. Packaging builds
-`--workspace` inside the Alpine chroot where those exist.
+and graphene-sys, which need `pkg-config` to find GTK4, and `-p uflinux-files-provider`
+needs `glib-dev`. Packaging builds `--workspace` inside the Alpine chroot where those
+exist.
 
 Clippy runs at `pedantic` level with `-D warnings` in CI. The allows are narrow and
 each one is a decision, not a convenience: `cast_possible_truncation` and friends for
@@ -37,6 +38,8 @@ error type is named in the signature does not need an essay per method.
 | `ufm-search` | unknown fields are rejected; an oversized reply shrinks to snippets then page and says which; `Exec` expansion drops a field code with no value; a `NAME=value` prefix is not treated as an argument. |
 | `ufm-desktop-ipc` | an id with a slash cannot name a file outside the desktop directory; unplugging a monitor moves icons and deletes none; a saved layout meets a directory that changed since. |
 | `uflinux-files-mount` | the argv handed to `mount(8)` contains no argument from the request that begins with `-`; a target that is a symlink, relative, world-readable, or somebody else's is refused; a `credentials=` file anyone can read is refused and its contents never reach an error message; a `pass=` option is refused; the owner comes from `PKEXEC_UID` and is never `0`. |
+| `uflinux-files` | the location on argv reaches the window; `--new-window` gives up being the single instance; the application id matches the desktop entry; a machine with no render node is asked for the cairo renderer, and an explicit `GSK_RENDERER` is never overridden. |
+| `uflinux-files-provider` | the crate does not depend on GTK, checked against its own manifest; the bus name is taken through the C entry point whose handlers are nullable, not the gio-rs wrapper that aborts at logout; the polling deadline is longer than the timer that checks it; a missing login session is refused before the bus is asked for. |
 
 ## Archives
 
@@ -111,6 +114,25 @@ server. The privileged detach path goes through the helper directly rather than 
 `pkexec`, because `pkexec` does not run in the test container; the unit tests cover the
 argv `pkexec` would be handed.
 
+## The desktop-icons bus
+
+`tests/provider-bus.sh` is the part of the desktop feature a unit test cannot reach: the
+provider's whole job is to answer D-Bus calls, and the unit tests drive the dispatch with
+a core that has no connection at all. Everything up to the wire is tested there; what the
+wire itself does — the introspection data being accepted by a real client, the interface
+name being claimable, a refusal arriving as a real D-Bus error, the name being released
+on `SIGTERM` — is only visible with a bus running.
+
+```sh
+cargo build -p uflinux-files-provider
+tests/provider-bus.sh target/debug/uflinux-files-provider
+```
+
+With no session bus around — which is the case in a build chroot or a container — it
+starts a private one for itself, so it needs `dbus-run-session` and `gdbus` either way.
+It exits non-zero on the first answer that is not what the protocol says, so it chains
+onto the test run rather than being read by a person.
+
 ## UI
 
 `tests/files-ui-smoke.sh` brings up its own headless `labwc` (headless backend, pixman
@@ -145,6 +167,28 @@ pixels are right, and it says nothing about a physical GPU at 4K.
 [memory-budget.md](memory-budget.md). See that file for what a report must contain and
 why retained PSS and descriptor counts are checked across 100 cycles rather than
 sampled once.
+
+```sh
+cargo build --release -p uflinux-files -p uflinux-files-provider -p uflinux-searchd
+tests/files-memory-bench.py \
+    --binary target/release/uflinux-files \
+    --provider-binary target/release/uflinux-files-provider \
+    --searchd target/release/uflinux-searchd \
+    --output /tmp/report.json
+scripts/files-memory-gate.py --report /tmp/report.json
+```
+
+Three things about reading the result. It has to be a **release** build; `--quick` shrinks
+the fixtures to check the plumbing and is not a measurement; and a scenario the bench
+could not run is reported as skipped and the gate prints `not measured` rather than
+counting it as a pass. The four window scenarios need a compositor — run the bench inside
+a Wayland session, or let it start a private bus and a headless `labwc` the way
+`files-ui-smoke.sh` does — so on a host without either, the two rows that matter most go
+unevaluated rather than wrong.
+
+The renderer is recorded in the report and printed as a note by the gate, because it is
+most of what a window costs: 222 MiB for Mesa's software GL against 54 MiB for cairo on
+the same machine, same window, same folder.
 
 ## Packaging
 

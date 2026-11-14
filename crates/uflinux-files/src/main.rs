@@ -1,14 +1,17 @@
 //! Entry point. The argument handling is in [`cli`], the mount bookkeeping in
-//! [`runner`], and the two modes that need no display — `--sweep-mounts` and
-//! `--provider` — run without touching GTK at all, which is what lets the session
-//! start them before a compositor is ready and keeps their memory footprint a
-//! fraction of a window's.
+//! [`runner`], and the widgets in [`ui`].
+//!
+//! `--sweep-mounts` runs without touching GTK at all, which is what lets the session
+//! start it before a compositor is ready and keeps its memory footprint a fraction
+//! of a window's.
+//!
+//! Desktop icons are not a mode of this program. They used to be `--provider`, and
+//! the binary grew to 28.6 MiB of resident set on the strength of GTK's import
+//! table alone — the linker maps `LLVM` at exec whether or not the code that needs
+//! it ever runs. The provider is now `uflinux-files-provider`, whose whole library
+//! closure is twenty-five shared objects instead of a hundred and eleven.
 
 mod cli;
-
-// Serves desktop icons over D-Bus. Links GTK but never initialises it, which is
-// what keeps the resident set at the size a desktop background is allowed to cost.
-mod provider;
 
 // The connect dialog calls `mount` and `forget`. `unmount` and `reconnect` are
 // still waiting for the buttons that will call them, in the sidebar's mount
@@ -35,7 +38,6 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         Ok(cli::Command::Sweep(options)) => sweep(&options),
-        Ok(cli::Command::Provider) => provider::run(),
         Ok(cli::Command::Ui(options)) => ui(&options),
         Err(usage) => {
             eprintln!("uflinux-files: {usage}");

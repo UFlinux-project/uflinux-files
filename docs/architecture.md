@@ -38,9 +38,14 @@ The mount helper is a binary and still pure Rust for a second reason. It runs as
 root, so every dependency is code that runs with elevated privileges and has to be
 audited; it links `libc` for `kill(2)` and nothing else that matters.
 
-`uflinux-files --provider` is the exception worth naming: it serves the desktop
-icon protocol using GLib and GIO only, with no GTK and no windows, which is what
-keeps its budget at 10 MiB rather than the 90 MiB a GTK process costs.
+`uflinux-files-provider` is the case where that reasoning has teeth: it serves the
+desktop icon protocol using GLib and GIO only, with no GTK and no windows, which is
+what keeps its budget at 10 MiB rather than the 90 MiB a GTK process costs. It is a
+separate binary rather than a mode of the file manager because the linker maps a
+program's whole library closure at `exec`, so sharing an executable with the UI would
+have charged the provider for Mesa and `LLVM` — measured at 28.6 MiB against a 10 MiB
+budget, of which all but 7 MiB was shared library text. See
+[memory-budget.md](memory-budget.md).
 
 ## The location model
 

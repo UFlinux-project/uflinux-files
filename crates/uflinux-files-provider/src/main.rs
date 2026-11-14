@@ -1,14 +1,22 @@
-//! `--provider` — the desktop icons service, with no window and no GTK.
+//! The desktop icons service: no window, no display, and no GTK.
 //!
 //! The renderer draws the icons; this decides what they are. That split is the reason
 //! the process exists separately rather than as another widget in a file manager
 //! window: a desktop background has to be up before the first window opens and has to
 //! stay up after the last one closes, and it has to cost a fraction of what a window
-//! costs. So this mode links GTK but never initialises it — no `gtk::init`, no
-//! application, no display connection — which is what keeps the resident set at the
-//! 10 MiB the integration document allows instead of the 60 MiB a `gtk4-layer-shell`
-//! window needs. [`service`] is the bus surface, [`scan`] is the directory read, and
+//! costs. [`service`] is the bus surface, [`scan`] is the directory read, and
 //! [`thumb`] is the only place image bytes are touched.
+//!
+//! Being a separate binary rather than a mode of `uflinux-files` is what makes the
+//! memory budget reachable. As a mode it shared an executable with the UI, and the
+//! linker resolves the whole import table at exec, so the 30 MiB of `LLVM` that
+//! GTK's GL renderer drags in was resident before this process ran a single
+//! instruction — measured at 28.6 MiB of proportional set against a 10 MiB budget,
+//! of which all but 7 MiB was shared library text. As its own binary it maps
+//! twenty-five shared libraries instead of a hundred and eleven, and the budget is
+//! met. The check in `the_provider_does_not_depend_on_gtk_at_all` is what keeps it
+//! that way: a `use gtk` here would quietly undo the split, and only a memory report
+//! would notice.
 //!
 //! Startup mirrors `uflinux-searchd`: refuse without a login session, reach the bus,
 //! register, take the name, enter the loop. Two things differ, and both are about the
@@ -59,11 +67,11 @@ const TICK: Duration = Duration::from_secs(20);
 const RESCAN: Duration = Duration::from_secs(300);
 
 /// Serve desktop icons until asked to stop.
-pub fn run() -> ExitCode {
+fn main() -> ExitCode {
     match serve() {
         Ok(()) => ExitCode::SUCCESS,
         Err(message) => {
-            eprintln!("uflinux-files: {message}");
+            eprintln!("uflinux-files-provider: {message}");
             ExitCode::FAILURE
         }
     }
@@ -99,13 +107,15 @@ fn serve() -> Result<(), String> {
             .await
             .map_err(|e| format!("cannot reach the session bus: {e}"))?;
         let service = Arc::new(Service::serve(connection, &desktop, file.clone(), note)?);
-        eprintln!("uflinux-files: serving {}", service.desktop());
+        eprintln!("uflinux-files-provider: serving {}", service.desktop());
         let live = Live::start(Arc::downgrade(&service), &desktop);
         if live.is_none() {
             // No inotify, or no descriptor for the wake pipe. The desktop still works and
             // still updates; only changes that happen while the provider is awake stop
             // being immediate, and the rescan timer catches those.
-            eprintln!("uflinux-files: live updates unavailable, falling back to polling");
+            eprintln!(
+                "uflinux-files-provider: live updates unavailable, falling back to polling"
+            );
         }
 
         let loop_ = glib::MainLoop::new(None, false);
@@ -320,20 +330,39 @@ mod tests {
     /// rather than asserted in a comment.
     fn own(source: &str) -> String {
         let file = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("src/provider")
+            .join("src")
             .join(source);
         std::fs::read_to_string(&file)
             .unwrap_or_else(|e| panic!("{} should be readable: {e}", file.display()))
     }
 
     #[test]
-    fn provider_mode_never_touches_gtk() {
-        // The budget for this process is 10 MiB, and GTK is the reason it is not
-        // smaller: the same binary links it, and initialising it would triple the
-        // resident set of a process whose only job is to answer requests about icons.
-        // The check is textual because the failure is invisible otherwise — a provider
-        // that grew a `gtk::init` still works, and only a memory report notices.
-        for source in ["mod.rs", "scan.rs", "service.rs", "thumb.rs"] {
+    fn the_provider_does_not_depend_on_gtk_at_all() {
+        // The budget for this process is 10 MiB, and GTK is what would break it: the
+        // linker resolves the whole import table at exec, so a binary that mentions
+        // GTK pays for `LLVM` — 30 MiB on the machine this was measured on — before
+        // it runs a single instruction, whether or not it ever opens a window. That
+        // is why this is a separate crate rather than a mode of the file manager, and
+        // why the check is against the manifest rather than the source: a `use gtk`
+        // that compiles is a regression even if no code path reaches it.
+        let manifest = own("../Cargo.toml");
+        let depends = manifest
+            .split("[dependencies]")
+            .nth(1)
+            .and_then(|rest| rest.split("[dev-dependencies]").next())
+            .expect("the manifest has a dependency list");
+        for (number, line) in depends.lines().enumerate() {
+            let name = line.split('=').next().unwrap_or_default().trim();
+            assert!(
+                name != "gtk" && !name.starts_with("gtk4"),
+                "Cargo.toml dependency {} pulls GTK into the provider",
+                number + 1
+            );
+        }
+        // The source check still earns its place: a dependency could arrive through a
+        // feature, and a stray `gtk::` would then compile against a crate the manifest
+        // does not list.
+        for source in ["main.rs", "scan.rs", "service.rs", "thumb.rs"] {
             let text = own(source);
             // Built rather than written, or the assertion below would find GTK in its
             // own source and fail for the wrong reason.
@@ -405,7 +434,7 @@ mod tests {
         );
         // `serve` reads the environment before it reads the desktop or the bus, so the
         // two paths cannot disagree about which one failed.
-        let text = own("mod.rs");
+        let text = own("main.rs");
         let guard = text
             .find("XDG_RUNTIME_DIR")
             .expect("the guard against a missing session is there");

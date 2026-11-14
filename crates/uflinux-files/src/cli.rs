@@ -1,10 +1,13 @@
 //! Command line, kept apart from `main` so the shape of the interface is tested
 //! and the entry point stays a dispatch.
 //!
-//! The set of modes is small on purpose. `--provider` and `--sweep-mounts` are
-//! the two that run without GTK, and both are entered by something other than a
-//! human — D-Bus activation and the session starter — so their argument handling
-//! has to be boring and predictable. Everything else opens a window.
+//! The set of modes is small on purpose. `--sweep-mounts` runs without GTK and is
+//! entered by something other than a human — the session starter — so its argument
+//! handling has to be boring and predictable. Everything else opens a window. The
+//! desktop icons provider used to be a mode here and is now its own program,
+//! `uflinux-files-provider`: sharing this executable meant sharing its import
+//! table, and GTK's GL stack made the provider cost three times its budget without
+//! ever running a line of provider code.
 
 use std::error::Error;
 use std::fmt;
@@ -22,8 +25,6 @@ pub enum Command {
     Sweep(Sweep),
     /// Open a window. The default.
     Ui(Ui),
-    /// Serve the desktop icon model over D-Bus and never touch GTK.
-    Provider,
 }
 
 /// The flags for opening a window.
@@ -67,7 +68,6 @@ pub fn parse(args: &[String]) -> Result<Command, Usage> {
     let mut sweep = Sweep::default();
     let mut sweeping = false;
     let mut urls: Vec<String> = Vec::new();
-    let mut provider = false;
     let mut new_window = false;
     let mut help = false;
     let mut version = false;
@@ -78,7 +78,6 @@ pub fn parse(args: &[String]) -> Result<Command, Usage> {
             "--version" => version = true,
             "--sweep-mounts" => sweeping = true,
             "--json" => sweep.json = true,
-            "--provider" => provider = true,
             "--new-window" => new_window = true,
             "--idle-after" => {
                 let value = iter
@@ -113,9 +112,6 @@ pub fn parse(args: &[String]) -> Result<Command, Usage> {
     if sweeping {
         return Ok(Command::Sweep(sweep));
     }
-    if provider {
-        return Ok(Command::Provider);
-    }
     Ok(Command::Ui(Ui { urls, new_window }))
 }
 
@@ -128,7 +124,6 @@ uflinux-files — browse files, archives and network shares
 
 Usage:
   uflinux-files [PATH|URL ...]          open a window, one tab per location
-  uflinux-files --provider              serve desktop icons over D-Bus, no window
   uflinux-files --sweep-mounts          clean up dead mounts and leftover files
   uflinux-files --version
 
@@ -172,13 +167,12 @@ mod tests {
     }
 
     #[test]
-    fn provider_wins_over_locations_but_not_over_help() {
-        assert_eq!(parse(&args(&["--provider", "/tmp"])), Ok(Command::Provider));
-        assert_eq!(
-            parse(&args(&["--provider", "--help"])),
-            Ok(Command::Help),
-            "a launcher that adds --help to --provider should get the text, not a daemon"
-        );
+    fn the_provider_flag_is_gone_loudly_rather_than_opening_a_window() {
+        // An activation file or a session script left over from before the split
+        // would otherwise open a window on the desktop, which is a confusing way to
+        // report "that mode lives elsewhere now".
+        let error = parse(&args(&["--provider"])).expect_err("should be refused");
+        assert_eq!(error.to_string(), "unknown option --provider");
     }
 
     #[test]
@@ -255,14 +249,12 @@ mod tests {
     #[test]
     fn usage_names_every_mode_it_accepts() {
         let text = usage();
-        for needle in [
-            "--provider",
-            "--sweep-mounts",
-            "--idle-after",
-            "--json",
-            "--new-window",
-        ] {
+        for needle in ["--sweep-mounts", "--idle-after", "--json", "--new-window"] {
             assert!(text.contains(needle), "usage is missing {needle}");
         }
+        assert!(
+            !text.contains("--provider"),
+            "usage advertising a mode that was refused would be a lie"
+        );
     }
 }

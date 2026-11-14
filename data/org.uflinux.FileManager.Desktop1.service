@@ -11,4 +11,4 @@
 # than a stale grid.
 [D-BUS Service]
 Name=org.uflinux.FileManager.Desktop1
-Exec=/usr/bin/uflinux-files --provider
+Exec=/usr/bin/uflinux-files-provider
