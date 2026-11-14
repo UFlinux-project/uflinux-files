@@ -21,9 +21,21 @@ pub enum Command {
     /// [`crate::runner`].
     Sweep(Sweep),
     /// Open a window. The default.
-    Ui(Vec<String>),
+    Ui(Ui),
     /// Serve the desktop icon model over D-Bus and never touch GTK.
     Provider,
+}
+
+/// The flags for opening a window.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Ui {
+    /// The locations to show, in the order given. Empty means the window opens
+    /// wherever the preferences say a window should start.
+    pub urls: Vec<String>,
+    /// Ask for a window of this process's own rather than handing the locations to
+    /// a window already on screen. What the desktop entry's `new-window` action
+    /// passes; see [`crate::ui`] for what it costs in single-instance behaviour.
+    pub new_window: bool,
 }
 
 /// The flags `--sweep-mounts` accepts.
@@ -56,6 +68,7 @@ pub fn parse(args: &[String]) -> Result<Command, Usage> {
     let mut sweeping = false;
     let mut urls: Vec<String> = Vec::new();
     let mut provider = false;
+    let mut new_window = false;
     let mut help = false;
     let mut version = false;
     let mut iter = args.iter();
@@ -66,6 +79,7 @@ pub fn parse(args: &[String]) -> Result<Command, Usage> {
             "--sweep-mounts" => sweeping = true,
             "--json" => sweep.json = true,
             "--provider" => provider = true,
+            "--new-window" => new_window = true,
             "--idle-after" => {
                 let value = iter
                     .next()
@@ -102,7 +116,7 @@ pub fn parse(args: &[String]) -> Result<Command, Usage> {
     if provider {
         return Ok(Command::Provider);
     }
-    Ok(Command::Ui(urls))
+    Ok(Command::Ui(Ui { urls, new_window }))
 }
 
 /// The usage text, shared by `--help` and by a bad argument, so the two cannot
@@ -123,6 +137,7 @@ Options for --sweep-mounts:
   --json                 report what was done as one JSON object
 
 Other options:
+  --new-window           open a new window instead of focusing an open one
   -h, --help             show this text
   --version              print the version
 "
@@ -136,16 +151,23 @@ mod tests {
         list.iter().map(|a| (*a).to_string()).collect()
     }
 
+    fn ui(urls: &[&str]) -> Command {
+        Command::Ui(Ui {
+            urls: args(urls),
+            new_window: false,
+        })
+    }
+
     #[test]
     fn no_arguments_opens_a_window_with_no_locations() {
-        assert_eq!(parse(&[]), Ok(Command::Ui(Vec::new())));
+        assert_eq!(parse(&[]), Ok(ui(&[])));
     }
 
     #[test]
     fn a_path_or_a_url_is_a_location_and_not_an_option() {
         assert_eq!(
             parse(&args(&["/tmp", "smb://srv/share"])),
-            Ok(Command::Ui(args(&["/tmp", "smb://srv/share"])))
+            Ok(ui(&["/tmp", "smb://srv/share"]))
         );
     }
 
@@ -207,13 +229,39 @@ mod tests {
 
     #[test]
     fn a_lone_dash_is_a_location_because_stdin_is_not_a_flag() {
-        assert_eq!(parse(&args(&["-"])), Ok(Command::Ui(args(&["-"]))));
+        assert_eq!(parse(&args(&["-"])), Ok(ui(&["-"])));
+    }
+
+    #[test]
+    fn new_window_is_a_flag_on_opening_a_window_and_keeps_its_locations() {
+        // The desktop entry's `new-window` action runs `uflinux-files --new-window`
+        // with no location; a launcher that adds one must not lose it.
+        assert_eq!(
+            parse(&args(&["--new-window"])),
+            Ok(Command::Ui(Ui {
+                urls: Vec::new(),
+                new_window: true,
+            }))
+        );
+        assert_eq!(
+            parse(&args(&["--new-window", "/tmp"])),
+            Ok(Command::Ui(Ui {
+                urls: args(&["/tmp"]),
+                new_window: true,
+            }))
+        );
     }
 
     #[test]
     fn usage_names_every_mode_it_accepts() {
         let text = usage();
-        for needle in ["--provider", "--sweep-mounts", "--idle-after", "--json"] {
+        for needle in [
+            "--provider",
+            "--sweep-mounts",
+            "--idle-after",
+            "--json",
+            "--new-window",
+        ] {
             assert!(text.contains(needle), "usage is missing {needle}");
         }
     }

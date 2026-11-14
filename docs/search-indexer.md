@@ -111,6 +111,14 @@ times an hour and does no work.
 It owns `org.uflinux.Search1` with `ALLOW_REPLACEMENT`, which is what lets a
 newer daemon take over during an upgrade rather than refusing to start.
 
+The daemon takes no arguments, because a service started by the bus cannot be
+given any — with one exception: `uflinux-searchd --status` does not serve at all.
+It asks a running daemon the `Status` question, prints the answer, and exits.
+That is what makes an installed daemon debuggable without a bus browser, and it
+is the check `tests/files-ui-smoke.sh` runs when the two binaries sit side by
+side. Only the first argument is read, so a stray argument later on still gets a
+daemon rather than a printed status and an immediate exit.
+
 **The exit clock.** A request re-arms it, and so does a commit — a client that
 asked for a reindex and then stopped talking is still waiting for the result, and
 exiting under it would lose the work it paid for. The clock is held while the

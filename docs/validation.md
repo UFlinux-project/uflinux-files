@@ -113,15 +113,30 @@ argv `pkexec` would be handed.
 
 ## UI
 
-`tests/files-ui-smoke.sh` runs in a private headless labwc session with
-`UFLINUX_FILES_BIN` set: open a window, switch all three views, navigate three column
-levels, run a search, open the Computer view. Assertions are on the accessibility tree
-plus a painted-frame probe.
+`tests/files-ui-smoke.sh` brings up its own headless `labwc` (headless backend, pixman
+renderer — no GPU, no X) and its own session bus, and runs the real binary under it. The
+binary is the first argument; if a `uflinux-searchd` sits beside it, or is named in
+`UFLINUX_SEARCHD_BIN`, the indexer is exercised too. Anything missing — `labwc`, `grim`,
+`gdbus`, the AT-SPI typelib — makes it print a `SKIP` line and exit 0, so a build host
+with no compositor is not read as a broken program.
 
-The frame probe is an upper bound and should be read as one — the same caveat the
-distro's own desktop tests carry. It proves the window painted something within the
-budget; it does not certify that the pixels are right, and it says nothing about a
-physical GPU at 4K.
+The assertions are on the accessibility tree, read out-of-process by
+`tests/files-ui-a11y.py` (an in-process AT-SPI walk deadlocks against the bus the walked
+process is itself serving). The tree is what a screen reader sees, so it is the closest
+thing the interface has to a public contract. The checks, in order: a window opens on the
+location named on the command line; the sidebar offers every place; the header buttons
+carry the right sensitivity for the start of a history; the grid lists the folder's
+entries and counts them; the list mode swaps in a tree table with the four headings; the
+columns mode renders one pane per path level; the search action opens a field and the
+field takes typed text; a second invocation opens a `Computer` window in the running
+instance; `--new-window` opens a window rather than focusing an open one; and the indexer
+answers `Status` on the bus. The run fails if the app printed a single GLib critical.
+
+The painted-frame probe is an upper bound and should be read as one — the same caveat the
+distro's own desktop tests carry. `grim` captures the frame and the test counts distinct
+colours in it: an empty desktop is one flat colour, a rendered folder is thousands. It
+proves the window painted something with variety in it; it does not certify that the
+pixels are right, and it says nothing about a physical GPU at 4K.
 
 ## Memory and latency
 

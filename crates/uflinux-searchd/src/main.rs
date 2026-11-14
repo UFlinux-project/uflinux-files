@@ -36,6 +36,7 @@ mod service;
 mod watch;
 mod worker;
 
+use std::ffi::OsStr;
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::sync::Weak;
@@ -56,6 +57,9 @@ use worker::Queue;
 /// machine from a suspend. It is also what runs [`Live::tick`], which is how a share
 /// mounted while the daemon sat idle becomes searchable without a restart.
 const TICK: Duration = Duration::from_secs(12);
+
+/// The word that turns this process into a client of the daemon rather than the daemon.
+const STATUS_FLAG: &str = "--status";
 
 fn main() -> ExitCode {
     match run() {
@@ -81,6 +85,14 @@ fn run() -> Result<(), String> {
     // nothing to do, and lingers.
     if std::env::var_os("XDG_RUNTIME_DIR").is_none_or(|dir| dir.is_empty()) {
         return Err("a user login session is required".to_string());
+    }
+
+    // Asked before the configuration or the index is touched, so that probing a daemon
+    // on a machine with no index yet does not create one. This is the only argument the
+    // daemon reads; everything else about it comes from the configuration file and the
+    // bus, because a service started by the bus cannot be given arguments at all.
+    if status_requested(std::env::args_os().nth(1).as_deref()) {
+        return status_probe();
     }
 
     let path = ufm_search::config::path();
@@ -244,8 +256,7 @@ fn watch_bus(loop_: &glib::MainLoop, service: &Arc<Service>) {
 /// Not part of the protocol's contract — the intended client is the file manager — but it
 /// is what makes an installed daemon debuggable without a bus browser, and it doubles as
 /// the smoke test in `tests/`.
-#[allow(dead_code)]
-fn status_probe() -> Result<String, String> {
+fn status_probe() -> Result<(), String> {
     let connection = gio::bus_get_sync(gio::BusType::Session, Option::<&gio::Cancellable>::None)
         .map_err(|e| format!("cannot reach the session bus: {e}"))?;
     let body = serde_json::to_string(&Request::Status).map_err(|e| e.to_string())?;
@@ -256,7 +267,10 @@ fn status_probe() -> Result<String, String> {
             ufm_search::SESSION_NAME,
             "Status",
             Some(&(body,).to_variant()),
-            Some(glib::VariantTy::STRING),
+            // The service answers with a one-string tuple, like every other method on
+            // this interface; asking for a bare string makes GIO reject the reply before
+            // it reaches us. The file manager's client asks for the same tuple.
+            Some(glib::VariantTy::TUPLE),
             gio::DBusCallFlags::NONE,
             2_000,
             Option::<&gio::Cancellable>::None,
@@ -265,5 +279,48 @@ fn status_probe() -> Result<String, String> {
     let (text,) = reply
         .get::<(String,)>()
         .ok_or("the reply was not a string")?;
-    Ok(text)
+    println!("{text}");
+    Ok(())
+}
+
+/// Whether the first argument asks for the status of a running daemon.
+///
+/// Only the first argument is looked at. A daemon activated by the bus is started with no
+/// arguments at all, and anything after a first argument that is not this word is a
+/// mistake worth ignoring rather than a mode worth entering — printing an index instead of
+/// serving one because of a stray argument would be the worse failure.
+fn status_requested(first: Option<&OsStr>) -> bool {
+    first.is_some_and(|arg| arg == STATUS_FLAG)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::ffi::OsString;
+
+    use super::*;
+
+    #[test]
+    fn the_status_flag_is_recognised_only_as_the_first_argument() {
+        assert!(status_requested(Some(OsStr::new("--status"))));
+        assert!(!status_requested(None));
+        assert!(!status_requested(Some(OsStr::new("--stat"))));
+        assert!(!status_requested(Some(OsStr::new("status"))));
+        // A path that happens to be the first argument is a location, not a mode.
+        assert!(!status_requested(Some(OsStr::new("/tmp/--status"))));
+    }
+
+    #[test]
+    fn an_unexpected_argument_does_not_turn_the_daemon_into_a_client() {
+        // Bus activation passes no arguments at all, and a unit that passes something
+        // else by mistake should still get a daemon rather than a printed status and an
+        // immediate exit — a service that exits at once looks like a crash to the bus.
+        let near: OsString = "--statu".into();
+        let empty: OsString = String::new().into();
+        for arg in [&near, &empty] {
+            assert!(!status_requested(Some(arg.as_os_str())), "{arg:?}");
+        }
+        // Only the first argument is read, so a later one never selects the mode.
+        let args: [OsString; 2] = ["--verbose".into(), "--status".into()];
+        assert!(!status_requested(args.first().map(OsString::as_os_str)));
+    }
 }

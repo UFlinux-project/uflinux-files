@@ -36,7 +36,7 @@ fn main() -> ExitCode {
         }
         Ok(cli::Command::Sweep(options)) => sweep(&options),
         Ok(cli::Command::Provider) => provider::run(),
-        Ok(cli::Command::Ui(urls)) => ui(&urls),
+        Ok(cli::Command::Ui(options)) => ui(&options),
         Err(usage) => {
             eprintln!("uflinux-files: {usage}");
             eprint!("{}", cli::usage());
@@ -107,10 +107,11 @@ fn verb(action: &Action) -> &'static str {
     }
 }
 
-/// Open a window. The application is single-instance, so the arguments are
-/// handed to whichever process already owns the name and this call returns once
-/// that process has finished; a launcher mistake therefore shows up as an
-/// already-open window rather than a second copy of the program.
-fn ui(urls: &[String]) -> ExitCode {
-    ui::run(urls)
+/// Open a window. Unless `--new-window` was given the application is
+/// single-instance, so the locations are handed to whichever process already owns
+/// the name and this call returns once that process has finished; a launcher
+/// mistake therefore shows up as an already-open window rather than a second copy
+/// of the program.
+fn ui(options: &cli::Ui) -> ExitCode {
+    ui::run(options)
 }
