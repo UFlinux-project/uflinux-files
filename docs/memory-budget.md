@@ -24,8 +24,8 @@ below is a consequence of a decision already made elsewhere, not a wish:
 
 Measured on the reference machine, release build, three sessions, full fixtures, cairo
 renderer (see [The renderer is most of a window](#the-renderer-is-most-of-a-window)):
-provider 3.7, cold window 50.6, warm window 50.6, 5k columns 54.8, `uflinux-searchd`
-idle 5.1 and 5.2 answering a query, desktop model 3.7 MiB. Every row is inside its
+provider 2.1, cold window 28.0, warm window 28.0, 5k columns 32.5, `uflinux-searchd`
+idle 4.1 and 4.2 answering a query, desktop model 2.1 MiB. Every row is inside its
 budget with room for the thumbnail cache and the widgets a real desktop has that the
 bench does not build. The window rows are the ones to read against the directory
 cache: the bench walks a five-thousand-entry folder and then revisits folders on the
@@ -33,6 +33,20 @@ way back, so those listings are resident in the numbers above, and the spread be
 the three sessions is wider than the cache's own ceiling. The provider reads
 directories but never shows one, so it holds no listings at all and its figure moves
 with how the container was started rather than with anything in this crate.
+
+That last sentence now applies to the window rows too, and the honest way to read this
+table is as a distance from a budget rather than as a measurement. The same build with
+the same fixtures measured cold 50.6 and 5k columns 54.8 in an earlier run and 28.0 and
+32.5 in this one, on the same machine, the same renderer and the same budget — a swing
+of 22 MiB that no change to this crate explains. What a window costs is dominated by
+mapped shared libraries, and shared pages are divided by PSS among every process
+standing next to it, so a bench that starts a compositor, a bus, an AT-SPI registry and
+a second copy of itself gets a different answer each time. The two things worth reading
+from these numbers are therefore the gap to the budget, which is wide enough that no
+plausible measurement noise closes it, and the difference between scenarios within one
+session — 5k columns costs about 4 MiB more than a warm window here, and that figure is
+ours rather than the loader's. A regression is caught by the gate's ceiling, not by
+comparing one session's total against another day's.
 
 Latency, same machine:
 
