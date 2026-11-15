@@ -14,9 +14,11 @@
 #   tests/provider-bus.sh target/debug/uflinux-files-provider
 #
 # With no session bus around — which is the case in a build chroot or a container — it
-# starts a private bus for itself. Needs `dbus-run-session` and `gdbus` either way (both
-# from `glib-tools` on Alpine). It exits non-zero on the first answer that is not what the
-# protocol says, so it can be chained onto the test run rather than read by a person.
+# starts a private bus for itself. Needs `dbus-run-session` and `gdbus` either way; on
+# Alpine those come from `dbus` and `glib` separately, and only the former has to be named
+# as a build dependency, since anything that can compile this package already has `glib`.
+# It exits non-zero on the first answer that is not what the protocol says, so it can be
+# chained onto the test run rather than read by a person.
 #
 # `crates/uflinux-files-provider/tests/bus.rs` is what chains it, and turns a missing tool
 # into exit `2` — a skip, printed as one. That is the only way this can be both a gate and

@@ -60,6 +60,7 @@ no rows at all, which opens no popover. |
 | `ufm-core` (stars) | a star list round-trips through its file and a half-written file is read as empty rather than as an error; starring is idempotent and does not re-order, so a row does not jump to the top of the collection because the action fired twice; `toggle` reports the state afterwards, which is what makes the two directions agree; stamping *sets* a row's flag, so a listing stamped against an empty list has every badge taken off and an un-star is visible without a re-read; `forget` drops only the locations a discard destroyed and leaves a trashed row alone; `prune` and `prune_under` drop a star whose folder is gone, including one nested below it; a corrupt or newer-version file is replaced rather than trusted. |
 | `ufm-core` (bookmarks) | a bookmark list round-trips through its file, including a location that is an archive inside an archive; `add` dedupes by location rather than by label, so bookmarking a folder twice cannot produce two rows; `find` answers with a position by the same comparison `add` dedupes by, so the title-bar toggle and a row's menu cannot disagree about whether a folder is bookmarked; `rename` replaces a name and treats a blank one as no name, which is how a row gets its folder's own name back, and says when there was nothing to rename; `move_item` reorders and ignores a destination that is out of range or already where the row is; a list with an unparseable file behind it is an error rather than a silent reset to empty. |
 | `uflinux-files-provider` | the crate does not depend on GTK, checked against its own manifest; the bus name is taken through the C entry point whose handlers are nullable, not the gio-rs wrapper that aborts at logout; the polling deadline is longer than the timer that checks it; a missing login session is refused before the bus is asked for. |
+| `uflinux-files-provider` (the wire, `tests/bus.rs`) | the fixture is POSIX shell, and it calls every method the interface declares and waits on both signals — asserted by reading the script, so a method that arrives without a check is caught even where no bus can run; then, where `dbus-run-session` and `gdbus` exist, the fixture runs against the binary this build produced and its exit status decides: `2` prints a skip, anything but `0` fails carrying the fixture's own output. |
 | `uflinux-files` (desktop icons, `--features desktop-icons`) | the grid a screen becomes: a monitor divided by the cell an icon needs, never zero cells and never past the protocol's caps — columns by the column cap and rows by the row cap, which differ by eight times; the cell grows with the picture the model asks for, clamped into the band the provider decodes in; an icon lands in the grid its cell names and nowhere else, and a drop outside a grid is not a move; every request names the bus method that answers it, so a renamed variant cannot silently aim at the wrong one; a renderer already there means no desktop is drawn; the grace period is the one the documents promise; the desktop is its own application id, so it cannot be the file manager's single instance; an icon is a picture, a name and a button, and one with no icon of its own still shows something. |
 
 ## Archives
@@ -173,9 +174,48 @@ tests/provider-bus.sh target/debug/uflinux-files-provider
 
 With no session bus around — which is the case in a build chroot or a container — it
 starts a private one for itself, so it needs `dbus-run-session` and `gdbus` either way.
-It exits non-zero on the first answer that is not what the protocol says, so it chains
-onto the test run rather than being read by a person. It is run by hand and by the
-packaging image today, not by `cargo test`: nothing in the workspace shells out to it.
+It exits non-zero on the first answer that is not what the protocol says, and it exits
+`2` rather than `0` when either tool is absent, which is how a skip is told apart from a
+pass.
+
+That exit code is what lets `cargo test` own the script.
+`crates/uflinux-files-provider/tests/bus.rs` looks for the two tools, runs the fixture
+against the binary its own build produced — through `CARGO_BIN_EXE_`, so it cannot
+silently test a stale target directory — and turns exit `2` into a printed `SKIP` and any
+other non-zero status into a failure that carries the fixture's own output. A feature
+that went untested has to be visible as that: a green result from a check that ran
+nothing is the worst kind of green.
+
+The two tools are not equally scarce. `gdbus` ships in `glib` itself, so anything that can
+build this package has it; `dbus-run-session` comes from `dbus`, which nothing else here
+pulls in and which is therefore named in `makedepends` as a check dependency — the only
+reason it is there. Where it is missing, `APKBUILD check()` still passes and prints the
+skip, which is the honest reading rather than a false green. The second test in that file
+needs no bus at all: it reads the fixture and asserts that every method the interface
+declares is actually called and that both signals are waited for, so a future method that
+arrives without a check is caught even where the bus cannot run.
+
+Twenty-nine checks run wherever the tools are there, and a thirtieth when the machine can
+put a picture over the bus. All eight methods are exercised, and both signals are caught by
+a `gdbus monitor` that attaches before the first call that changes anything: `Progress`
+announcing a read and then its end, `Changed` carrying the moved name and the new count.
+The refusals are checked as refusals — a grid with no cells, one monitor named twice, an
+unknown id, a body on the wrong method — because a desktop that quietly kept its old layout
+is a bug report nobody can reproduce.
+
+Three checks accept two answers, because two answers are correct and the fixture has no
+business insisting on one. `Launch` and `ContextMenu` reach for an application, and a
+machine with no handler registered for `inode/directory` or `text/plain` is entitled to
+refuse; what is asserted either way is the refusal's *content*, read back from
+`Status.note`, which quotes the `file://` URI the provider tried to open — so the check is
+that the provider failed for the reason it claims and can say so, not that it succeeded.
+`RequestThumbnail` is the other, and the one that prints which branch it took: a machine
+whose `gdk-pixbuf` can encode a PNG gets the picture and the check asserts the `fd` it
+travels on, and a machine whose pixbuf cannot gets the icon fallback, which is a
+protocol-legal answer and the reason the model advertises `thumbnails` at all. Printing
+the branch keeps the weaker answer from being mistaken for the stronger one. What is
+asserted outright in every case is that a path outside the desktop is answered with an icon
+and no fd, since that is the answer the provider owes without ever opening the file.
 
 The other half of the feature — the renderer that draws when nobody else does — is
 covered by the UI harness below rather than here, because what has to be seen is a

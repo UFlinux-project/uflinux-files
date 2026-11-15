@@ -10,8 +10,15 @@ depends="uflinux-files-searchd=$pkgver-r$pkgrel desktop-file-utils hicolor-icon-
 # Not `udisks2`: UFLinux has no udisks2, so SMB and NFS go through our own
 # polkit action and /usr/libexec/uflinux-files-mount. The session agent that
 # answers the pkexec prompt is the one uflinux-desktop already registers.
+# Only needed to run the tests, and listed here rather than in `checkdepends`
+# because that is the variable abuild guarantees installs for the check phase:
+# `tests/provider-bus.sh` needs `dbus-run-session` to own a bus, while `gdbus`
+# arrives with `glib` already. Without it the wire test prints a skip, which is
+# honest but means the one part of the desktop feature that is only visible
+# against a live bus goes untested by the build that ships it. Nothing here
+# needs it at runtime.
 makedepends="cargo cargo-auditable gtk4.0-dev gtk4-layer-shell-dev glib-dev
-	gdk-pixbuf-dev shared-mime-info pkgconf"
+	gdk-pixbuf-dev shared-mime-info pkgconf dbus"
 subpackages="$pkgname-dbg $pkgname-doc $pkgname-searchd:searchd
 	$pkgname-desktop:desktop $pkgname-mount-helper:mount_helper"
 # The provider is its own binary so that it stays out of the file manager's
@@ -120,5 +127,5 @@ mount_helper() {
 # Filled in by scripts/files-source.py --update; empty here so the recipe still
 # parses as shell before a bundle has been generated.
 sha512sums="
-702901d417b8bdc6cc4cae6ce9b4f26af194f892b6c2a5bc30dc54dfef0de792982f71820fa7627417be401b4edd0146639180ad7a5c278652fabd6d3c3fe817  uflinux-files-0.1.0.tar
+c9bc072ec3ed9ecd87625da61b670bcc5061d3823547f87d9714870b4445a8f35d7713b1c24ef0424d8fb3af0a238b2507e569f25cf655e2d33003520be188ef  uflinux-files-0.1.0.tar
 "
