@@ -210,6 +210,96 @@ fn edit_prefs(shared: &Shared, edit: impl FnOnce(&mut Preferences)) {
     *shared.prefs.borrow_mut() = current;
 }
 
+/// What one window has to be shown once the mount table has changed anywhere.
+///
+/// Built from a window's own state rather than from a [`Ctx`], because the part
+/// worth testing is the part that needs no widgets: which rows there are, which
+/// bars, which cards, and which folder the window is standing in. Painting
+/// those is the caller's business, and needs a display.
+struct Followed {
+    places: Vec<Place>,
+    usages: Vec<Usage>,
+    cards: Vec<Card>,
+    current: Option<Location>,
+    /// The mount points this window believed were shares and no longer are.
+    lost: Vec<PathBuf>,
+}
+
+/// The mount points a window's own copy of the table lists.
+fn mount_points(shared: &Shared) -> Vec<PathBuf> {
+    let state = shared.state.borrow();
+    state
+        .runner
+        .table()
+        .iter()
+        .map(|record| record.mountpoint.clone())
+        .collect()
+}
+
+/// Bring one window's copy of the mount table to what the file says now, and
+/// work out what that window would have to repaint.
+///
+/// Re-reading the file rather than handing over the asker's table: every
+/// mutation writes it, so following it also picks up a change made by something
+/// with no window at all — `--sweep-mounts`, or a second copy of this
+/// application. The kernel is re-read with it, since a share can stop being a
+/// mount with nobody asking, which is the one change no command reports.
+///
+/// The filesystem cache goes unconditionally. It is the cheapest thing in this
+/// process to re-probe, every event reaching here is one a user waited for, and
+/// a rule with four exceptions arguing about which rare event may skip a
+/// `statvfs` is worth less than being uniformly right.
+fn follow_mounts(shared: &Rc<Shared>) -> Followed {
+    let was = mount_points(shared);
+    {
+        shared.state.borrow_mut().runner.reload();
+    }
+    shared.readers.clear_fs_cache();
+    let now = mount_points(shared);
+    Followed {
+        places: places(shared),
+        usages: usages(shared),
+        cards: card_data(shared),
+        current: shared.state.borrow().current.clone(),
+        lost: was.into_iter().filter(|path| !now.contains(path)).collect(),
+    }
+}
+
+/// Tell every open window to follow the mount table.
+///
+/// No parameters, because there is nothing useful to pass. Each window compares
+/// what its own table said with what the file says now, and that one comparison
+/// covers a share appearing, a share being let go, a record being forgotten and
+/// a sweep detaching something while nobody was looking — without a new call in
+/// `ufm-mount` and without the asker describing what it did.
+///
+/// The asker is in the list like everyone else, so its own repaint is this
+/// call's job rather than a second copy of it. What stays with the asker is
+/// where it goes and what it says: [`navigate`] and [`show_banner`] belong to
+/// the window the user pressed, for the reason [`repaint_places`] gives.
+///
+/// Nothing here moves a window off the folder it is showing. A window standing
+/// in a share another window let go is looking at rows that no longer exist, and
+/// it was told nothing while it looked at them; what it gets instead is the
+/// cached listing dropped, so the next look at that folder is a real read rather
+/// than the vanished files served from memory.
+fn tell_windows_about_mounts() {
+    for other in living() {
+        let followed = follow_mounts(&other.shared);
+        if let Some(panel) = other.panel.upgrade() {
+            panel.set_places(followed.places.clone());
+            panel.set_usage(followed.usages.clone());
+        }
+        paint_cards(&other, &followed.cards);
+        if let Some(location) = followed.current.as_ref() {
+            select_place(&other, location);
+        }
+        for path in &followed.lost {
+            other.shared.readers.invalidate_around(path);
+        }
+    }
+}
+
 /// How often to look for a mount that has gone idle. The threshold itself belongs
 /// to [`crate::runner`], so a window and `--sweep-mounts` cannot disagree about
 /// how long a share is allowed to sit unused.
@@ -848,6 +938,35 @@ fn select_place(ctx: &Ctx, location: &Location) {
     }
 }
 
+/// Put the current cards on screen, and the count of them in the status bar.
+fn show_cards(ctx: &Ctx) {
+    paint_cards(ctx, &card_data(&ctx.shared));
+}
+
+/// Show a set of cards that has already been built, and the count of them.
+///
+/// Both, always. The count lives in the status bar rather than beside the cards,
+/// so a window showing the cards has two places saying how many drives there
+/// are, and only one of them is the card set; repainting the cards alone leaves
+/// a window that started with three drives and lost one saying "3 items" over
+/// two.
+///
+/// The bar is left alone unless the cards are what this window is showing, since
+/// a mount that happened in a folder window would otherwise replace that
+/// folder's count of entries with a count of filesystems.
+fn paint_cards(ctx: &Ctx, cards: &[Card]) {
+    ctx.computer.set_cards(cards);
+    if ctx.modes.visible_child_name().as_deref() != Some("computer") {
+        return;
+    }
+    // The cards are not rows, so the count in the bar would say "Empty folder"
+    // about a window showing six machines.
+    if let Some(view) = ctx.view.upgrade() {
+        let count = u64::try_from(ctx.computer.card_count()).unwrap_or(u64::MAX);
+        view.set_status(Some(&format_items(count)));
+    }
+}
+
 /// Put a synthesized collection on screen: the cards, or a listing assembled from
 /// the history rather than read from a directory.
 ///
@@ -858,12 +977,8 @@ fn select_place(ctx: &Ctx, location: &Location) {
 fn show_virtual(ctx: &Ctx, dir: VirtualDir, view: &View) {
     match dir {
         VirtualDir::Computer => {
-            ctx.computer.set_cards(&card_data(&ctx.shared));
             ctx.modes.set_visible_child_name("computer");
-            // The cards are not rows, so the count in the bar would say "Empty
-            // folder" about a window showing six machines.
-            let places = u64::try_from(ctx.computer.card_count()).unwrap_or(u64::MAX);
-            view.set_status(Some(&format_items(places)));
+            show_cards(ctx);
         }
         VirtualDir::Recent => {
             let readers = Arc::clone(&ctx.shared.readers);
@@ -1348,7 +1463,7 @@ fn operated(ctx: &Ctx, outcome: ops::Outcome) {
         panel.set_usage(usages(&ctx.shared));
     }
     // …and so do the cards, which say the same thing about the same filesystems.
-    ctx.computer.set_cards(&card_data(&ctx.shared));
+    show_cards(ctx);
 }
 
 /// A share a card's Disconnect asked to be let go, on a worker.
@@ -1357,23 +1472,15 @@ fn operated(ctx: &Ctx, outcome: ops::Outcome) {
 /// mount steps into the share, because a user who typed an address wants to be
 /// standing in it. An unmount does not move anybody — the share that just left is
 /// the one the window may be showing, and walking out of it would be the window
-/// admitting it did not know. So the table is re-read, the sidebar and the cards
-/// are repainted, and the answer is said out loud either way.
+/// admitting it did not know. So every window follows the table, and the answer
+/// is said out loud in the one that was asked.
 fn unmounted(ctx: &Ctx, report: Report) {
-    {
-        let mut state = ctx.shared.state.borrow_mut();
-        state.runner.reload();
-    }
     // The mount point is gone, and so is every fact cached about it: the listing of
     // the folder it held, and the capacity and permissions of the filesystem that
     // was behind it. Without this the sidebar keeps a bar for a share that is now
-    // an empty directory.
-    ctx.shared.readers.clear_fs_cache();
-    if let Some(panel) = ctx.panel.upgrade() {
-        panel.set_places(places(&ctx.shared));
-        panel.set_usage(usages(&ctx.shared));
-    }
-    ctx.computer.set_cards(&card_data(&ctx.shared));
+    // an empty directory, and the folder keeps rows read through a share that is
+    // gone and cannot serve them.
+    tell_windows_about_mounts();
     // The window may be standing in the share that left, or in a folder that was
     // under it. Its listing is now a listing of an empty directory, and the only
     // honest answer is to say what happened and let the user look.
@@ -1490,24 +1597,17 @@ fn presentation(location: &Location, mode: ViewMode) -> &'static str {
 /// its own and wrote the record to disk — so the first thing this does is re-read
 /// that file. Without it the sidebar would go on listing the shares that were
 /// there when the window opened, and a share that had just connected would look
-/// like it never had.
+/// like it never had. Every other window reads the same file, and is told to
+/// re-read it at the same moment.
+///
+/// The share that just appeared is a card, and a window may be looking at the
+/// cards rather than at a folder — in which case navigating below would be the
+/// only other way to learn the mount happened.
 fn mounted(ctx: &Ctx, report: Report) {
-    {
-        let mut state = ctx.shared.state.borrow_mut();
-        state.runner.reload();
-    }
-    // Before the sidebar is repainted: free space and the trash badge come from
-    // the cached filesystem capabilities, and a mount point that has just become a
+    // Also what brings the filesystem capabilities back: free space and the trash
+    // badge come from the cached answers, and a mount point that has just become a
     // share has both of them wrong until they are probed again.
-    ctx.shared.readers.clear_fs_cache();
-    if let Some(panel) = ctx.panel.upgrade() {
-        panel.set_places(places(&ctx.shared));
-        panel.set_usage(usages(&ctx.shared));
-    }
-    // The share that just appeared is a card, and the window may be looking at the
-    // cards rather than at a folder — in which case navigating below would be the
-    // only other way to learn the mount happened.
-    ctx.computer.set_cards(&card_data(&ctx.shared));
+    tell_windows_about_mounts();
     if !report.ok {
         show_banner(ctx, &report.message);
         return;
@@ -2204,15 +2304,11 @@ fn forget_share(ctx: &Ctx, id: &str) {
         let mut state = ctx.shared.state.borrow_mut();
         state.runner.forget_share(id)
     };
-    // The row and the card follow the table. The filesystem cache is left alone on
-    // purpose: nothing was unmounted, so no fact about a filesystem changed — the
-    // mount point is either still a live share or still the empty directory it was
-    // before, and both are what is already cached about it.
-    if let Some(panel) = ctx.panel.upgrade() {
-        panel.set_places(places(&ctx.shared));
-        panel.set_usage(usages(&ctx.shared));
-    }
-    ctx.computer.set_cards(&card_data(&ctx.shared));
+    // The row and the card follow the table, in every window. Re-probing the
+    // filesystems is the one thing this now does that it did not need before:
+    // nothing was unmounted, so no fact about a filesystem changed, and what is
+    // paid for is one `statvfs` each for the places the sidebar shows.
+    tell_windows_about_mounts();
     show_banner(ctx, &report.message);
 }
 
@@ -2240,14 +2336,11 @@ fn set_share_autostart(ctx: &Ctx, id: &str) {
         let mut state = ctx.shared.state.borrow_mut();
         state.runner.set_autostart(id, wanted)
     };
-    // Repaint either way. The rows are built from the table, so a press that found
-    // the share gone — forgotten in another window — has to drop the row rather
-    // than leave it offering a menu for a share that is not listed.
-    if let Some(panel) = ctx.panel.upgrade() {
-        panel.set_places(places(&ctx.shared));
-        panel.set_usage(usages(&ctx.shared));
-    }
-    ctx.computer.set_cards(&card_data(&ctx.shared));
+    // Repaint either way, and in every window. The rows are built from the table,
+    // so a press that found the share gone — forgotten in another window — has to
+    // drop the row rather than leave it offering a menu for a share that is not
+    // listed.
+    tell_windows_about_mounts();
     let message = match (changed, wanted) {
         (true, true) => "this share will connect at login",
         (true, false) => "this share will no longer connect at login",
@@ -3378,13 +3471,23 @@ fn sweep_on_idle(shared: Weak<Shared>) {
         // What it does have to do is forget the listings that were read through a
         // share that has just gone away: a cached folder on a detached mount is a
         // folder whose rows no longer exist, and the next visit would paint them.
-        if let Ok(sweep) = shared.state.borrow_mut().runner.auto_unmount()
+        // The borrow ends with the call: the sweep writes the table, and following
+        // it wants to borrow the same state.
+        let swept = {
+            let mut state = shared.state.borrow_mut();
+            state.runner.auto_unmount()
+        };
+        if let Ok(sweep) = swept.as_ref()
             && !sweep.removed().is_empty()
         {
-            shared.readers.clear_fs_cache();
+            // The paths named here are the ones no record covers — a leftover
+            // credential file, a mount point whose share was forgotten first — so
+            // no window's own table can have listed them and the broadcast below
+            // has no way to know to drop them.
             for item in sweep.removed() {
                 shared.readers.invalidate_around(&item.path);
             }
+            tell_windows_about_mounts();
         }
         glib::ControlFlow::Continue
     });
@@ -3648,6 +3751,8 @@ mod tests {
     // badges and sidebar follow is the broadcast's job, and needs a sidebar to look
     // at, which is what the UI harness does.
     use ufm_core::sort::SortField;
+    use ufm_mount::Share;
+    use ufm_mount::table::MountTable;
 
     /// Tests that change the process environment have to hold this, because
     /// `set_var` is unsafe in edition 2024 precisely because another thread may be
@@ -3713,6 +3818,89 @@ mod tests {
         fn drop(&mut self) {
             unset_env("UFLINUX_FILES_CONFIG_DIR");
         }
+    }
+
+    /// Point the mount root at a throwaway too, so the paths a test's records name
+    /// are inside it rather than inside the real `/run/user/$UID/ufm`. The table
+    /// rebuilds every mount point from the root it was loaded with, so a test that
+    /// leaves this alone compares paths against a live session's. Unsetting on the
+    /// way out matters for the same reason as for [`ConfigDir`].
+    struct MountRoot {
+        _dir: tempfile::TempDir,
+    }
+
+    impl MountRoot {
+        fn new() -> Self {
+            let dir = tempfile::tempdir().expect("a throwaway mount root");
+            set_env(
+                "UFLINUX_FILES_MOUNT_ROOT",
+                &dir.path().display().to_string(),
+            );
+            Self { _dir: dir }
+        }
+    }
+
+    impl Drop for MountRoot {
+        fn drop(&mut self) {
+            unset_env("UFLINUX_FILES_MOUNT_ROOT");
+        }
+    }
+
+    /// Write a table holding one share for `uri`, the way a window's runner leaves
+    /// it. Going through the file rather than through a window's memory is the
+    /// point: the file is the only thing another window can be told by.
+    fn listed(uri: &str) -> MountRecord {
+        let share = Share::parse(uri)
+            .expect("an address the table can hold")
+            .share;
+        let mut table = MountTable::new(paths::config_dir(), paths::mount_root());
+        let record = table.add(&share).clone();
+        table.save().expect("the table is written");
+        record
+    }
+
+    /// The same file with nothing in it, which is what letting go of the last share
+    /// leaves behind.
+    fn unlisted() {
+        MountTable::new(paths::config_dir(), paths::mount_root())
+            .save()
+            .expect("an empty table is still a table");
+    }
+
+    /// Flip a record's flag through the file, with no window involved, as the
+    /// sidebar row's action ends up doing.
+    fn marked(id: &str) {
+        let config = paths::config_dir();
+        let root = paths::mount_root();
+        let mut table = MountTable::try_load_at(&config, &root).expect("the table");
+        assert!(
+            table.set_autostart(id, true),
+            "the fixture found the record it was asked to mark"
+        );
+        table.save().expect("the table is written");
+    }
+
+    /// Which shares a set of sidebar rows offers, in order.
+    fn mount_ids(places: &[Place]) -> Vec<String> {
+        places
+            .iter()
+            .filter_map(|place| match place {
+                Place::Mount { id, .. } => Some(id.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Which shares a set of cards offers. The drives on this machine are always
+    /// there, so only the mount cards say anything about the table.
+    fn card_ids(cards: &[Card]) -> Vec<String> {
+        cards
+            .iter()
+            .filter_map(|card| match &card.id {
+                CardId::Mount(id) => Some(id.clone()),
+                CardId::Local(_) => None,
+            })
+            .collect()
     }
 
     fn stars_on_disk() -> Vec<String> {
@@ -3892,6 +4080,128 @@ mod tests {
             on_disk.view_mode_for(&location("photos")),
             ViewMode::Columns,
             "alongside the mode the second window chose"
+        );
+    }
+
+    // The mount table: the third file every window reads and any of them may write.
+    // It is the one that cannot be fixed by re-reading on edit rather than on
+    // event, because a share appearing is not a change to the shape of the file, it
+    // is a change to what the kernel has, and the answer to that is a row that has
+    // to be built. So the fix here is a broadcast rather than a re-read, and what
+    // these tests can reach with no display is the half that decides what a window
+    // would show. Rows following that half from one window to another is the UI
+    // harness.
+
+    #[test]
+    fn a_share_written_to_disk_is_a_row_the_window_that_missed_it_follows() {
+        let _guard = env();
+        let _dir = ConfigDir::new();
+        let _root = MountRoot::new();
+        let (_first, second) = two_windows();
+        let record = listed("nfs://srv/videos");
+        let followed = follow_mounts(&second);
+        assert_eq!(
+            mount_ids(&followed.places),
+            vec![record.id.clone()],
+            "a window that was never told picks the share up off the file"
+        );
+        assert_eq!(
+            card_ids(&followed.cards),
+            vec![record.id.clone()],
+            "as a card of its own, which is the other half of the same table"
+        );
+        assert!(
+            followed.lost.is_empty(),
+            "a window that had nothing has nothing to let go of"
+        );
+    }
+
+    #[test]
+    fn a_share_taken_off_disk_lets_the_row_go_and_names_the_mount_point_it_lost() {
+        // The lost set is why the broadcast needs no parameters. It is one question
+        // — what did this window think was mounted, and what does the file say now
+        // — asked of a share that was let go, forgotten, or swept away with nobody
+        // looking. The path is what the caller drops from the listing cache.
+        let _guard = env();
+        let _dir = ConfigDir::new();
+        let _root = MountRoot::new();
+        let (_first, second) = two_windows();
+        let record = listed("smb://srv/videos");
+        let _ = follow_mounts(&second);
+        unlisted();
+        let followed = follow_mounts(&second);
+        assert!(
+            mount_ids(&followed.places).is_empty(),
+            "the row goes out with its share"
+        );
+        assert!(
+            card_ids(&followed.cards).is_empty(),
+            "and the card goes out with it"
+        );
+        assert_eq!(
+            followed.lost,
+            vec![record.mountpoint],
+            "and the window knows which mount point to stop remembering a listing for"
+        );
+    }
+
+    #[test]
+    fn an_answer_flipped_on_disk_reaches_the_row_without_losing_the_share() {
+        // Connect-at-login changes one boolean and unmounts nothing, so the row has
+        // to arrive with its new answer and nothing may count as lost. The flag is
+        // part of the row's identity, and a row left holding the old answer would
+        // offer a menu saying the opposite of what the next press does.
+        let _guard = env();
+        let _dir = ConfigDir::new();
+        let _root = MountRoot::new();
+        let (_first, second) = two_windows();
+        let record = listed("nfs://srv/videos");
+        let _ = follow_mounts(&second);
+        marked(&record.id);
+        let followed = follow_mounts(&second);
+        assert_eq!(
+            mount_ids(&followed.places),
+            vec![record.id.clone()],
+            "the share is still listed"
+        );
+        assert!(
+            followed.places.iter().any(|place| matches!(
+                place,
+                Place::Mount {
+                    autostart: true,
+                    ..
+                }
+            )),
+            "and it is listed as connecting at login"
+        );
+        assert!(
+            followed.lost.is_empty(),
+            "a share that only changed its answer is not a share that left"
+        );
+    }
+
+    #[test]
+    fn following_the_table_twice_lets_go_of_nothing_the_second_time() {
+        // What makes the broadcast safe to hang off four different events and a
+        // timer: a window that already agrees with the file has nothing to report,
+        // so calling it twice costs a re-read rather than dropping a listing that
+        // is still good.
+        let _guard = env();
+        let _dir = ConfigDir::new();
+        let _root = MountRoot::new();
+        let (_first, second) = two_windows();
+        let record = listed("nfs://srv/videos");
+        let first = follow_mounts(&second);
+        assert_eq!(mount_ids(&first.places), vec![record.id.clone()]);
+        let again = follow_mounts(&second);
+        assert_eq!(
+            mount_ids(&again.places),
+            vec![record.id.clone()],
+            "the share is still there the second time round"
+        );
+        assert!(
+            again.lost.is_empty(),
+            "and having just picked it up, the window has nothing to let go of"
         );
     }
 }

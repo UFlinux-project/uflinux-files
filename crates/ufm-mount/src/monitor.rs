@@ -431,7 +431,21 @@ mod tests {
         let points = parse(&text);
         assert!(!points.is_empty(), "no mount points in a real mountinfo");
         assert!(points.iter().all(|p| p.path.is_absolute()));
-        assert!(observe(Path::new("/")).alive(), "/ should be mounted");
+        // The end-to-end half asks the table about its own entries rather than
+        // about `/`: a build chroot has no mount namespace of its own, so the
+        // kernel lists the host's mount points, and the `/` the test lives at
+        // need not be one of them. An entry the table lists must survive
+        // `find`: a kernel mount is simply mounted, and a FUSE entry may come
+        // back stale when its daemon is gone, but never absent.
+        let observer = Observer::at(MOUNTINFO);
+        for point in observer.points() {
+            assert_ne!(
+                observer.state(&point.path),
+                MountState::Absent,
+                "{} is in the table we just read",
+                point.path.display()
+            );
+        }
     }
 
     #[test]
