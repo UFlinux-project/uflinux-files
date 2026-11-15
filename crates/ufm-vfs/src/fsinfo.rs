@@ -176,9 +176,16 @@ fn probe(path: &Path) -> FsHints {
 /// a `~/mnt` overlay resolves to itself rather than to `/`.
 fn mount_for(path: &Path) -> Option<Mount> {
     let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-    mounts()
+    deepest(mounts(), &canonical)
+}
+
+/// The longest mount point that is a prefix of `path`, taken from a parsed
+/// table rather than the live one so the rule can be checked against a
+/// fixture.
+fn deepest(mounts: Vec<Mount>, path: &Path) -> Option<Mount> {
+    mounts
         .into_iter()
-        .filter(|m| canonical.starts_with(&m.path))
+        .filter(|m| path.starts_with(&m.path))
         .max_by_key(|m| m.path.as_os_str().len())
 }
 
@@ -187,6 +194,10 @@ fn mounts() -> Vec<Mount> {
     let Ok(text) = std::fs::read_to_string("/proc/self/mountinfo") else {
         return Vec::new();
     };
+    parse_mounts(&text)
+}
+
+fn parse_mounts(text: &str) -> Vec<Mount> {
     text.lines().filter_map(parse_mountinfo_line).collect()
 }
 
@@ -383,14 +394,44 @@ mod tests {
 
     #[test]
     fn nested_mounts_resolve_to_the_deeper_one() {
-        let mounts = mounts();
-        assert!(
-            !mounts.is_empty(),
-            "/proc/self/mountinfo should be readable"
+        // The rule is checked against a fixture rather than the live table: a
+        // build chroot has no mount namespace of its own, so the kernel lists
+        // the host's mount points, and a chroot cannot arrange for a nested
+        // pair to exist exactly where the test wants them.
+        let fixture = "\
+17 25 8:1 / / rw,relatime shared:1 - ext4 /dev/sda1 rw
+22 17 8:3 / /home/u/data rw,relatime shared:2 - ext4 /dev/sda3 rw
+31 22 253:0 / /home/u/data/deeper ro,relatime shared:3 - btrfs /dev/mapper/v-root ro
+";
+        let parsed = parse_mounts(fixture);
+        assert_eq!(parsed.len(), 3, "the fixture itself parses");
+
+        let under = deepest(parsed.clone(), Path::new("/home/u/data/deeper/report.txt"));
+        assert_eq!(
+            under.map(|m| m.path),
+            Some(PathBuf::from("/home/u/data/deeper")),
+            "a nested mount wins over its parents"
         );
-        assert!(
-            mounts.iter().any(|m| m.path == Path::new("/")),
-            "every system has a root mount"
+        let between = deepest(parsed.clone(), Path::new("/home/u/data/report.txt"));
+        assert_eq!(
+            between.map(|m| m.path),
+            Some(PathBuf::from("/home/u/data")),
+            "one level up resolves to the middle mount"
         );
+        let outside = deepest(parsed, Path::new("/etc/passwd"));
+        assert_eq!(
+            outside.map(|m| m.path),
+            Some(PathBuf::from("/")),
+            "a path under nothing else still resolves to the root mount"
+        );
+
+        // The live table only has to survive parsing, and only where /proc is
+        // mounted at all. Whether `/` is in it is a fact about the mount
+        // namespace, not about this parser.
+        if Path::new("/proc/self/mountinfo").exists() {
+            let live = mounts();
+            assert!(!live.is_empty(), "/proc/self/mountinfo should be readable");
+            assert!(live.iter().all(|m| m.path.is_absolute()));
+        }
     }
 }
