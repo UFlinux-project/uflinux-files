@@ -14,9 +14,13 @@
 //! that a worker thread produced elsewhere (see [`job`]) and only ever splice
 //! them into the model.
 
-// The window, and the modules that follow it, are what make these live. Until
-// `ui()` builds a window, nothing here is reachable from `main`, and a warning
-// per public item would be noise about work in progress rather than about code.
+// Not work in progress any more: the window is built and reachable from `main`.
+// What this covers now is a list of read-side accessors and helpers that nothing
+// calls — `View::selected_count`, `Jobs::label_text`, `popup::sections` and about
+// two dozen more, all of them facts their type does hold. They are kept rather
+// than deleted because dropping them is a cleanup in its own right and not
+// something to settle in passing. Comment this line out and run
+// `cargo clippy -p uflinux-files --all-targets` to see the list.
 #![allow(dead_code)]
 
 mod columns;
