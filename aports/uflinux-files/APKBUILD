@@ -58,7 +58,10 @@ build() {
 		cargo auditable build --workspace --release --frozen --features uflinux-files/desktop-icons
 }
 check() {
-	cargo test --workspace --frozen
+	# The feature is named because it is what `build()` above compiles and what the
+	# image ships. `--workspace` alone would leave the desktop-icons fallback — the
+	# one part of this package with a window in it — untested.
+	cargo test --workspace --frozen --features uflinux-files/desktop-icons
 }
 package() {
 	local target="${CARGO_TARGET_DIR:-target}/release"
@@ -117,5 +120,5 @@ mount_helper() {
 # Filled in by scripts/files-source.py --update; empty here so the recipe still
 # parses as shell before a bundle has been generated.
 sha512sums="
-2b271d7ab00bc0e99622d16f057158d178d7097fbb15afbc18678299317c12036902954e7de62b1994dfb988b1b6a583a7ca9d21c6bbb9555db91af96316b65e  uflinux-files-0.1.0.tar
+702901d417b8bdc6cc4cae6ce9b4f26af194f892b6c2a5bc30dc54dfef0de792982f71820fa7627417be401b4edd0146639180ad7a5c278652fabd6d3c3fe817  uflinux-files-0.1.0.tar
 "

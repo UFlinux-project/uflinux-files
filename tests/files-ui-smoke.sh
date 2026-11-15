@@ -86,6 +86,14 @@ XDG_CONFIG_HOME=$HOME/.config
 export HOME XDG_DATA_HOME XDG_CONFIG_HOME
 # The path the window opens on. Two entries, so the status line has a number to say.
 TARGET=$ROOT/tree/alpha
+# A desktop for the desktop icons to sit on. The provider reads `$HOME/Desktop` when
+# `user-dirs.dirs` says nothing, which it does here, so naming the folder is enough.
+# The two names are ones nothing else in the fixture uses, so a tree match on them can
+# only be the desktop answering.
+DESKTOP_DIR=$HOME/Desktop
+mkdir -p "$DESKTOP_DIR"
+: >"$DESKTOP_DIR/desk-one.txt"
+: >"$DESKTOP_DIR/desk-two.txt"
 
 # One network share the user connected to in some earlier session, written where
 # the mount table lives so the application finds a share already listed before it
@@ -1540,9 +1548,10 @@ else
     ok "Computer shows cards rather than a reader error"
 fi
 # The count in the bar counts cards. Left to the listing path it would have said
-# "Empty folder" about a window showing two drives. Three since the fixture started
-# with one share listed: Home, the system drive, and that share.
-if printf '%s\n' "$CFRAME" | grep -qF "$(printf '\t3 items\t')"; then
+# "Empty folder" about a window showing two drives. Four since the fixture started
+# with one share listed and a desktop folder: Home, Desktop, the system drive, and
+# that share.
+if printf '%s\n' "$CFRAME" | grep -qF "$(printf '\t4 items\t')"; then
     ok "the status line counts the cards rather than entries read from disk"
 else
     fail "the status line counts the cards rather than entries read from disk"
@@ -1766,10 +1775,11 @@ if printf '%s\n' "$CFRAME" | grep -qF "$(printf 'table cell\tvideos2024\t')"; th
 else
     ok "forgetting a share takes its card out of the window that did not ask"
 fi
-# The count in that window's bar counts what it is showing now. Two cards left:
-# Home and the system drive. A bar still saying three over two cards is the same
-# mistake as a row left over a share that is gone, one widget further down.
-if printf '%s\n' "$CFRAME" | grep -qF "$(printf '\t2 items\t')"; then
+# The count in that window's bar counts what it is showing now. Three cards left:
+# Home, the desktop folder and the system drive. A bar still saying four over three
+# cards is the same mistake as a row left over a share that is gone, one widget
+# further down.
+if printf '%s\n' "$CFRAME" | grep -qF "$(printf '\t3 items\t')"; then
     ok "the other window's status line counts the cards it has left"
 else
     fail "the other window's status line counts the cards it has left"
@@ -1825,6 +1835,70 @@ PY
     else
         fail "the window painted a variety of colours (only ${colors:-0} distinct)"
     fi
+fi
+
+# --- the desktop, drawn by whoever is there -----------------------------------------
+# Optional: only when a provider binary is alongside the file manager. This is the only
+# check that exercises `--desktop-icons`, and it has to accept two honest answers, because
+# the feature behind the flag is optional — it pulls in a library the package does not
+# always carry. A build without it refuses the flag by name and exits 2; a build with it
+# claims the desktop and paints it. Either way the flag has to do something a person can
+# read about, and neither branch is allowed to open an ordinary window.
+PROVIDER=$(dirname "$BIN")/uflinux-files-provider
+if [ -x "$PROVIDER" ]; then
+    # The provider answers `renderer` from the single question it can ask itself — has
+    # anything been asked of me at all — so it has to be started first and left alone
+    # until the fallback speaks, or the fallback would be told a shell is drawing and
+    # correctly stand down.
+    "$PROVIDER" >"$ROOT/provider.log" 2>&1 &
+    PROV=$!
+    i=0
+    while [ "$i" -lt 100 ]; do
+        gdbus introspect --session --xml -d org.uflinux.FileManager.Desktop1 \
+            -o /org/uflinux/FileManager/Desktop >/dev/null 2>&1 && break
+        i=$((i + 1))
+        sleep 0.1
+    done
+
+    DESK_LOG=$ROOT/desktop.log
+    "$BIN" --desktop-icons >"$DESK_LOG" 2>&1 &
+    DESK=$!
+    # Either the desktop appears or the process gives up; a slow machine is not a broken
+    # one, and a build without the feature gives up almost at once.
+    painted=no
+    i=0
+    while [ "$i" -lt 50 ]; do
+        if ! kill -0 "$DESK" 2>/dev/null; then break; fi
+        refresh
+        if printf '%s\n' "$DUMP" | grep -qF "$(printf 'frame\t%s\t' 'uflinux-files-desktop')"; then
+            painted=yes
+            break
+        fi
+        i=$((i + 1))
+        sleep 0.2
+    done
+
+    if [ "$painted" = yes ]; then
+        ok "--desktop-icons claims the desktop when nothing else draws it"
+        has_named "desk-one.txt" "the desktop paints an icon the provider listed"
+        if printf '%s\n' "$DUMP" | grep -qF "$(printf '\t%s\t' 'desk-two.txt')"; then
+            ok "the desktop paints every icon the provider listed"
+        else
+            fail "the desktop paints every icon the provider listed"
+        fi
+    else
+        # The status the process itself left behind. `|| :` would swallow it, and the
+        # status is the half of this check that says which branch the build is in.
+        if wait "$DESK" 2>/dev/null; then code=0; else code=$?; fi
+        if [ "$code" -eq 2 ] && grep -q 'desktop-icons' "$DESK_LOG"; then
+            ok "--desktop-icons is refused by name in a build without the feature"
+        else
+            fail "--desktop-icons is refused by name in a build without the feature (exit $code)"
+            head -3 "$DESK_LOG" | sed 's/^/     /'
+        fi
+    fi
+    kill "$DESK" 2>/dev/null || :
+    kill "$PROV" 2>/dev/null || :
 fi
 
 # --- the indexer answers on the bus -------------------------------------------------

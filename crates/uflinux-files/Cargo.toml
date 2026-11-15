@@ -16,8 +16,10 @@ path = "src/main.rs"
 default = []
 # Render our own layer-shell desktop instead of talking to a renderer claimed by
 # uflinux-desktop. Off by default so the common package does not pull in
-# gtk4-layer-shell. The window itself is still to be written; the feature exists
-# so that the dependency decision is made and checked — see
+# gtk4-layer-shell: the fallback is the answer for a session where no shell has
+# claimed the renderer interface, and a build that ships uflinux-desktop never
+# needs the dependency. `--desktop-icons` is parsed either way and refused by name
+# without it. See crates/uflinux-files/src/ui/desktop.rs and
 # docs/desktop-integration.md, "Fallback without a renderer".
 desktop-icons = ["dep:gtk4-layer-shell"]
 

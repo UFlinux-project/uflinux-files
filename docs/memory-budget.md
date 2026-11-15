@@ -143,6 +143,15 @@ gtk` that compiles is a regression even when no code path reaches it.
 The same reasoning is why the mount helper has no GLib at all: a small dependency graph
 is a security property there, and a memory property here.
 
+The fallback renderer is the counter-example, and it is why that fallback is a build
+flag. `uflinux-files --desktop-icons` is a GTK4 process whose only job is the icon grid,
+and a release build with 200 icons on one headless screen measures **57 MiB** on the cairo
+renderer — the same wall the provider was moved out of, reached from the other side, and
+156 MiB on the GL renderer for the same reason the window is. The widget tree itself is a
+small part of it. On a UFlinux session the number is paid by nobody: `uflinux-desktop` is
+the renderer, the fallback asks `Status` once, sees a renderer, and exits without mapping
+a surface.
+
 ## The renderer is most of a window
 
 GTK picks its renderer at startup, and the choice is worth more than every widget

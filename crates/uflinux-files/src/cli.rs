@@ -27,6 +27,15 @@ pub enum Command {
     /// Mount the shares the user marked connect-at-login, then exit. See
     /// [`crate::runner::Runner::connect_at_login`].
     Connect(Connect),
+    /// Draw the desktop, if nothing else is drawing it. Takes no locations and
+    /// opens no window of the kind this program otherwise means. Only a build with
+    /// the `desktop-icons` feature can act on it.
+    ///
+    /// Parsed unconditionally, so that a command line asking for it is understood
+    /// the same way in every build of this binary. A build without the
+    /// `desktop-icons` feature refuses it by name rather than opening a window,
+    /// which is the same rule that makes `--provider` an error today.
+    Desktop,
     /// Open a window. The default.
     Ui(Ui),
 }
@@ -81,6 +90,7 @@ pub fn parse(args: &[String]) -> Result<Command, Usage> {
     let mut sweep = Sweep::default();
     let mut sweeping = false;
     let mut connecting = false;
+    let mut desktop = false;
     let mut json = false;
     let mut urls: Vec<String> = Vec::new();
     let mut new_window = false;
@@ -93,6 +103,7 @@ pub fn parse(args: &[String]) -> Result<Command, Usage> {
             "--version" => version = true,
             "--sweep-mounts" => sweeping = true,
             "--connect-at-login" => connecting = true,
+            "--desktop-icons" => desktop = true,
             "--json" => json = true,
             "--new-window" => new_window = true,
             "--idle-after" => {
@@ -141,6 +152,14 @@ pub fn parse(args: &[String]) -> Result<Command, Usage> {
     if connecting {
         return Ok(Command::Connect(Connect { json }));
     }
+    // Before the window, and ignoring any locations: a session starter that says
+    // "draw the desktop" means that and not "draw the desktop and then show me
+    // /tmp". Locations with it are dropped rather than refused, because the
+    // alternative is a session script failing over an argument it does not care
+    // about.
+    if desktop {
+        return Ok(Command::Desktop);
+    }
     Ok(Command::Ui(Ui { urls, new_window }))
 }
 
@@ -155,6 +174,7 @@ Usage:
   uflinux-files [PATH|URL ...]          open a window, one tab per location
   uflinux-files --sweep-mounts          clean up dead mounts and leftover files
   uflinux-files --connect-at-login      mount the shares marked connect at login
+  uflinux-files --desktop-icons         draw the desktop, if no shell is drawing it
   uflinux-files --version
 
 Options for --sweep-mounts:
@@ -206,6 +226,21 @@ mod tests {
         // report "that mode lives elsewhere now".
         let error = parse(&args(&["--provider"])).expect_err("should be refused");
         assert_eq!(error.to_string(), "unknown option --provider");
+    }
+
+    #[test]
+    fn desktop_icons_is_a_mode_of_its_own_and_takes_no_locations() {
+        assert_eq!(parse(&args(&["--desktop-icons"])), Ok(Command::Desktop));
+        // A session script that adds a location is not wrong about what it wants,
+        // so the location is dropped rather than turned into an error at login.
+        assert_eq!(
+            parse(&args(&["--desktop-icons", "/tmp"])),
+            Ok(Command::Desktop)
+        );
+        assert_eq!(
+            parse(&args(&["--desktop-icons", "--json"])),
+            Ok(Command::Desktop)
+        );
     }
 
     #[test]
@@ -329,6 +364,7 @@ mod tests {
             "--sweep-mounts",
             "--idle-after",
             "--connect-at-login",
+            "--desktop-icons",
             "--json",
             "--new-window",
         ] {

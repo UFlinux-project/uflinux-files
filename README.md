@@ -75,7 +75,9 @@ the model over D-Bus and never opens a window.
   stack, because a record that no longer matches the disk is worse than none.
 - **Desktop icons**: this program owns the model — what is on the desktop, where
   each icon sits, what happens when one is double-clicked — and
-  `uflinux-desktop` draws it, so there is no second full-screen GTK process.
+  `uflinux-desktop` draws it, so there is no second full-screen GTK process. Where
+  no shell is drawing one, `uflinux-files --desktop-icons` draws the grid itself,
+  behind the `desktop-icons` feature; a build without it refuses the flag by name.
 - **Live folders**: the folder on screen and the columns beside it are watched, so
   a file saved in an editor, a download that finished, or a folder deleted from a
   terminal appears without reloading. Watching is capped at what a window can see,

@@ -1,109 +1,183 @@
 //! The desktop we paint ourselves, for the case where nobody else will.
 //!
-//! The desktop-icons feature is really two halves. The provider answers for the
-//! model — it watches the directory, keeps the layout, and knows where every
-//! icon sits — and a renderer draws it. `uflinux-desktop` is the renderer that
-//! is supposed to claim `org.uflinux.FileManager.Desktop.Renderer` and paint the
-//! grid in the layer it already owns. When that shell is not running, or is
-//! running without the feature, the provider answers `Status` with
-//! `renderer: false` and the desktop goes blank: the files are there, the
-//! layout is there, and no window shows them.
+//! The desktop-icons feature is two halves. The provider answers for the model —
+//! it watches the directory, keeps the layout, and knows where every icon sits —
+//! and a renderer draws it. `uflinux-desktop` is the renderer that is supposed to
+//! claim the interface and paint the grid in the layer it already owns. When that
+//! shell is not running, or is running without the feature, the provider answers
+//! `Status` with `renderer: false` and the desktop goes blank: the files are
+//! there, the layout is there, and no window shows them.
 //!
 //! This module is the answer to that. It opens one layer-shell window per
-//! monitor at the background layer, reports a grid for each, draws the model
-//! the provider hands back, and forwards the handful of things an icon needs
-//! to do: launch, place, reveal, trash, a menu, a thumbnail. It is a client of
-//! the same bus a real renderer uses and adds nothing of its own — no layout
-//! of its own, no idea what a desktop directory is, no second copy of the
-//! model. Whatever it does not have to know, it does not.
+//! monitor at the background layer, reports a grid for each, draws the model the
+//! provider hands back, and forwards the handful of things an icon needs to do:
+//! launch, place, a menu, a thumbnail. It is a client of the same bus a real
+//! renderer uses and adds nothing of its own — no layout of its own, no idea what
+//! a desktop directory is, no second copy of the model. Whatever it does not have
+//! to know, it does not.
+//!
+//! # One question, asked once
+//!
+//! `Status.renderer` is answered by the provider from the only thing it can
+//! observe — has anything been asked of it at all (see
+//! `uflinux-files-provider/src/service.rs`). So this module asks exactly once per
+//! session, from the first activation, and never again. A second `Status` would
+//! answer `true` because of the first one, and the fallback would stop painting
+//! its own desktop because it had drawn one.
 //!
 //! # Cost, and why the shape is what it is
 //!
-//! The whole point of the fallback is that it runs where a full shell does
-//! not, so it is built to stay small. One window per monitor, one widget per
-//! icon, and nothing per-monitor beyond the geometry. Thumbnails are the only
-//! part of a desktop that can be expensive, and they are the provider's
-//! decision rather than ours: the model says `thumbnails: false` on a machine
-//! too small for them and we never ask for one.
+//! The fallback runs where a full shell does not, so it is built to stay small:
+//! one window per monitor, one widget per icon, and nothing per monitor beyond
+//! the geometry. Redraws reuse the widgets rather than rebuilding them, which is
+//! what keeps a rename from throwing away a decoded picture and asking for it
+//! again. Thumbnails are the provider's decision rather than ours: the model says
+//! `thumbnails: false` on a machine too small for them, and we never ask for one.
 //!
 //! # What is deliberately missing
 //!
-//! A marquee selection, keyboard grid navigation, and a live view of the
-//! directory behind the grid. Each is a feature of a file manager rather than
-//! of a fallback, and the first two are the renderer's job when there is one.
-//! What is here is the set that makes the desktop not blank.
-//!
-//! ## Feature
-//!
-//! Only compiled with `desktop-icons`, which is the only place
-//! `gtk4-layer-shell` is referenced. The provider never links it, so the
-//! daemon that is always running does not pay for a windowing dependency only
-//! the fallback needs.
+//! A marquee selection, keyboard navigation, a drag image, a drag from one
+//! monitor to another, and a live view of the directory behind the grid. Each is
+//! a feature of a renderer rather than of a fallback, and the keyboard is out for
+//! a reason the compositor decides: a background layer surface is given no focus,
+//! so Enter on an icon has nowhere to arrive. What is here is the set that makes
+//! the desktop not blank.
+
+// The prose in this module names the bus, the protocol's method names, and the
+// bindings' type names — `GetModel`, `CamelCase`, `GdkEvent` — which
+// `doc_markdown` reads as unquoted code. Backticking all of it would make the
+// comments harder to read, not easier.
+#![allow(clippy::doc_markdown)]
 
 use std::cell::{Cell as StdCell, RefCell};
+use std::collections::{HashMap, HashSet};
+use std::process::ExitCode;
 use std::rc::Rc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use glib::{ControlFlow, Priority, clone};
+use glib::variant::ToVariant;
+// Brings gio's traits with it, through gdk and gdk-pixbuf, so the bus calls and
+// the list-model helpers need no import of their own.
 use gtk::prelude::*;
-use gtk::{gio, glib, layer_shell};
+use gtk::{gio, glib};
+// The crate is a dependency of this one and not a re-export of gtk4, so it is
+// named directly. Renamed because the module is `ui::desktop` and `use
+// gtk4_layer_shell as desktop` would collide with it.
+use gtk4_layer_shell as layer_shell;
+// The trait comes separately from the module: the bindings hang every setter off
+// the window rather than passing the window to a free function, so `set_layer` on
+// a window is the trait's method and not the module's.
+use gtk4_layer_shell::LayerShell;
+use ufm_core::config::DesktopSlot;
 use ufm_desktop_ipc as ipc;
+
+use super::css;
+
+/// The application id for the desktop.
+///
+/// Deliberately not [`super::APP_ID`]. `GApplication` is single-instance per id,
+/// so a desktop started with the window's id would hand its activation to whatever
+/// window was already open and exit — the file manager would appear to start and
+/// draw nothing. A separate id also means a desktop and a window are two processes
+/// that can be restarted separately, which is what a session starter wants.
+const DESKTOP_ID: &str = "org.uflinux.FileManager.Desktop";
 
 /// How long we wait for a real renderer to claim the bus before committing to
 /// a desktop of our own.
 ///
 /// A timeout and not a poll, which is the difference between a fallback and a
-/// race. The provider starts on the bus's demand, so the first `Status`
-/// usually answers immediately; what the wait is really for is a shell that is
-/// still coming up. Give it two seconds and it wins, and we never paint a
-/// desktop we would have to stop painting. Ask again in half a second and we
-/// would sometimes steal the desktop from a panel that was half a second away.
+/// race. The provider starts on the bus's demand, so the first `Status` usually
+/// answers immediately; what the wait is really for is a shell that is still
+/// coming up. Give it two seconds and it wins, and we never paint a desktop we
+/// would have to stop painting. Ask again in half a second and we would sometimes
+/// steal the desktop from a panel that was half a second away.
 const GRACE: Duration = Duration::from_secs(2);
 
 /// How long one bus call may take before we give up on it.
 ///
-/// The provider is a small process on a local bus, so anything slower than
-/// this is not slow, it is stuck. Painting the desktop is not worth blocking
-/// the frame clock on.
+/// The provider is a small process on a local bus, so anything slower than this
+/// is not slow, it is stuck. Painting the desktop is not worth blocking the frame
+/// clock on, and the two calls that wait are both off the draw path.
 const CALL: i32 = 2_000;
 
 /// The band the provider clamps its thumbnail edge into, and so the band we
-/// reserve room for. Both ends come from someone else's constant: the small
-/// one is what the model advertises by default, the large one is what the
-/// thumbnailer will render at most.
+/// reserve room for. Both ends come from someone else's constant: the small one
+/// is what the model advertises by default, the large one is what the thumbnailer
+/// will render at most.
 const THUMB_MIN: u32 = ipc::DEFAULT_THUMBNAIL;
 const THUMB_MAX: u32 = ufm_thumb::MAX_SIZE;
 
 /// How much of a cell the label may have before the icon takes the rest.
 ///
-/// Two lines of text under an icon is what a desktop icon looks like, and a
-/// cell that cannot fit both is too small to place anything in anyway.
+/// Two lines of text under an icon is what a desktop icon looks like, and a cell
+/// that cannot fit both is too small to place anything in anyway.
 const LABEL_LINES: i32 = 2;
-const LABEL_HEIGHT: i32 = 34;
+const LABEL_CHARS: i32 = 18;
+const LABEL_GAP: i32 = 4;
+/// Room for those two lines, measured rather than guessed. It is reserved whether
+/// or not a name is long enough to use it, so that placing an icon in a cell never
+/// depends on the text it happens to have.
+const LABEL_HEIGHT: u32 = 34;
+/// A cell's edge beyond the icon's: the button's own padding and a gap, so two
+/// neighbouring icons do not read as one label with two pictures.
+const PAD: u32 = 24;
 
 /// The window class, and the string a compositor shows when it lists surfaces.
 const NAMESPACE: &str = "uflinux-files-desktop";
 
-/// What one monitor contributes: the window, the fixed container the cells
-/// live in, and the grid we told the provider about.
-///
-/// The grid is kept because a monitor change has to send a replacement for
-/// every monitor, not just the one that moved, and because the cell count is
-/// what turns a slot into a pixel.
+/// What a widget does when the user acts on it: hand the request to the bus.
+type Sender = Rc<dyn Fn(ipc::Request)>;
+
+/// What one monitor contributes: the window, the fixed container the cells live
+/// in, and the size to fall back to before the compositor has allocated one.
 struct Screen {
     window: gtk::Window,
     grid: gtk::Fixed,
-    geometry: ipc::Geometry,
+    /// The number this monitor was reported under: its position in the list GDK
+    /// gave us when the window was built, which is also the number the provider
+    /// uses to name it.
+    monitor: u8,
+    width: i32,
+    height: i32,
 }
 
-/// One icon on screen: the widget, the label whose text may arrive later with
-/// a rename, and the generation of the thumbnail currently painted.
+impl Screen {
+    /// The grid this screen offers at `edge`, sized to what it actually has.
+    ///
+    /// The size the compositor gave us and the size of the monitor differ by
+    /// exactly the exclusive zone of a panel, which is why the allocation wins
+    /// when it exists. A grid sized to the monitor and drawn inside a smaller
+    /// surface has a last row under the panel, and an icon the user placed there
+    /// is an icon they cannot see or reach.
+    fn geometry(&self, edge: u32) -> ipc::Geometry {
+        let width = self.grid.width();
+        let height = self.grid.height();
+        let (width, height) = if width > 0 && height > 0 {
+            (width, height)
+        } else {
+            (self.width, self.height)
+        };
+        grid(self.monitor, width, height, edge)
+    }
+}
+
+/// One icon on screen.
+///
+/// The pieces are kept apart because a redraw has to change the text and the
+/// position without touching the picture, which is the expensive part and the one
+/// a rename should not invalidate.
+#[derive(Clone)]
 struct Painted {
     button: gtk::Button,
+    image: gtk::Image,
     label: gtk::Label,
-    /// The generation whose thumbnail this is, so a model that moved on
-    /// retires the picture instead of leaving a stale one under a new name.
-    thumbnail: StdCell<u64>,
+    /// Which screen's grid this widget is in, so a move to another monitor can
+    /// take it out of the one it was in. `usize::MAX` before the first placement.
+    ///
+    /// An index and not a monitor number, because a rebuild that changes the number
+    /// of screens throws away every widget with it: there is no window a widget can
+    /// outlive here, and so no index that can go stale under it.
+    screen: Rc<StdCell<usize>>,
 }
 
 /// The fallback's view of the desktop: the last model we were given, plus the
@@ -111,19 +185,27 @@ struct Painted {
 struct View {
     model: Option<ipc::Model>,
     screens: Vec<Screen>,
-    cells: Vec<(String, Painted)>,
+    /// The grids we told the provider about, in screen order. Shared with every
+    /// drag gesture, which is what lets a drop be turned into a cell after the
+    /// grid has been reported again underneath it. A `RefCell` and not a `Cell`
+    /// because a vector of grids is not `Copy`, and copying one per drag would be
+    /// an allocation on the pointer path.
+    grids: Rc<RefCell<Vec<ipc::Geometry>>>,
+    cells: HashMap<String, Painted>,
     /// The newest generation we have drawn. `Changed` carries a generation
     /// precisely so that two changes can collapse into one repaint, which only
     /// works if we can tell a repaint we already did from one we owe.
     drawn: u64,
-    /// The newest generation we have asked for. A repaint in flight makes any
-    /// older answer stale, and out-of-order replies on a local bus are rare
-    /// but not impossible.
-    requested: u64,
     /// Whether the model said thumbnails are a thing here at all.
     thumbnails: bool,
-    /// The edge we ask for, clamped once from the model rather than per cell.
+    /// The edge our current grids were built for, clamped once from the model
+    /// rather than per cell.
     edge: u32,
+    /// The icons we have already asked a picture for at this generation. Cleared
+    /// when a new model arrives, because that is the point at which a picture may
+    /// have changed, and when the windows are rebuilt, because the widgets that
+    /// held the old ones are gone.
+    asked: HashSet<String>,
 }
 
 impl View {
@@ -131,664 +213,782 @@ impl View {
         View {
             model: None,
             screens: Vec::new(),
-            cells: Vec::new(),
+            grids: Rc::new(RefCell::new(Vec::new())),
+            cells: HashMap::new(),
             drawn: 0,
-            requested: 0,
             thumbnails: false,
             edge: THUMB_MIN,
+            asked: HashSet::new(),
         }
     }
 
-    /// Where an icon goes, in pixels, or nowhere.
+    /// Put one widget in the grid for `index`, moving it out of whatever grid it
+    /// was in before.
     ///
-    /// Three separate reasons to have no answer, and the caller reports all
-    /// three the same way: the model does not know the id, the icon has no
-    /// cell, the cell names a monitor we have no window for, or the grid is
-    /// too small to hold the row it is in.
-    fn spot(&self, cell: &ipc::Cell) -> Option<(usize, i32, i32)> {
-        let index = self
-            .screens
-            .iter()
-            .position(|screen| screen.geometry.monitor == cell.monitor)?;
-        let geometry = self.screens[index].geometry;
-        let x = i32::from(cell.col) * i32::from(geometry.cell_w);
-        let y = i32::from(cell.row) * i32::from(geometry.cell_h);
-        if x >= geometry.usable() || y >= geometry.rows as i32 * geometry.cell_h {
-            return None;
+    /// The screen a widget was on is looked up rather than trusted, and its
+    /// absence is not an error: a redraw can reach a widget whose screen went away
+    /// while the model was on the bus, and the right answer then is to draw it on
+    /// its new screen and let the old window go with it.
+    fn place(&self, painted: &Painted, index: usize, x: f64, y: f64) {
+        let from = painted.screen.get();
+        if from != usize::MAX
+            && from != index
+            && let Some(previous) = self.screens.get(from)
+        {
+            previous.grid.remove(&painted.button);
         }
-        Some((index, x, y))
+        let Some(screen) = self.screens.get(index) else {
+            return;
+        };
+        if from == index {
+            screen.grid.move_(&painted.button, x, y);
+        } else {
+            screen.grid.put(&painted.button, x, y);
+        }
+        painted.screen.set(index);
     }
 
-    fn take_cells(&mut self) -> Vec<(String, Painted)> {
-        std::mem::take(&mut self.cells)
+    /// Take a widget out of the grid it is in, for an item that is no longer on
+    /// the desktop at all.
+    fn unplace(&self, painted: &Painted) {
+        if let Some(screen) = self.screens.get(painted.screen.get()) {
+            screen.grid.remove(&painted.button);
+        }
     }
 }
 
-/// The fallback, behind the one handle `main` keeps.
-pub struct Desktop {
-    app: gtk::Application,
-}
-
-/// Everything the drawing knows. One of these per process, shared by the
-/// monitor handler, the `Changed` handler, and every gesture on every icon.
+/// Everything the drawing knows. One of these per process, shared by the monitor
+/// handler, the `Changed` handler, and every gesture on every icon.
 struct Inner {
     app: gtk::Application,
     connection: gio::DBusConnection,
     view: RefCell<View>,
+    /// A `GetModel` is on the bus. One at a time, because two in flight can come
+    /// back in the wrong order and paint an older desktop over a newer one.
+    fetching: StdCell<bool>,
+    /// A `Changed` arrived while one was in flight, so another is owed as soon as
+    /// this one lands.
+    stale: StdCell<bool>,
+    /// We have stopped drawing, so a signal that arrives on the way out is noise.
+    dead: StdCell<bool>,
     /// Subscriptions live here. Dropping one unsubscribes, which would leave a
     /// desktop that never notices a file landing on it.
-    _signals: Vec<gio::SignalSubscription>,
+    signals: RefCell<Vec<gio::SignalSubscription>>,
 }
 
-impl Desktop {
-    /// Connect to the session bus and take over the desktop if nobody else
-    /// has, and never come back.
-    ///
-    /// The connect is async on purpose. A bus that is not up yet is a normal
-    /// thing during login, and blocking here would hold up the rest of the
-    /// session for a service that may not even be wanted.
-    pub fn run(app: &gtk::Application) {
-        let app = app.clone();
-        gio::bus_get(
-            gio::BusType::Session,
-            gio::Cancellable::NONE,
-            clone!(@strong app, move |result| {
-                let connection = match result {
-                    Ok(gio::DBusConnection::Session(c)) => c,
-                    Ok(_) => {
-                        eprintln!("uflinux-files: the desktop needs a session bus");
-                        app.quit();
-                        return;
-                    }
-                    Err(e) => {
-                        eprintln!("uflinux-files: no session bus for the desktop: {e}");
-                        app.quit();
-                        return;
-                    }
-                };
-                Desktop::attach(&app, &connection);
-            }),
-        );
-        app.run()
-    }
-
-    /// Hand the desktop an open connection. Split out so a test can hand it a
-    /// connection of its own and watch what it does with it.
-    fn attach(app: &gtk::Application, connection: &gio::DBusConnection) {
-        let inner = Rc::new(Inner {
-            app: app.clone(),
-            connection: connection.clone(),
-            view: RefCell::new(View::new()),
-            _signals: Vec::new(),
-        });
-        // The monitor list is what makes this a fallback rather than a
-        // screensaver: a monitor plugged in after login has to be told about,
-        // and the provider cannot place an icon on a grid it has never seen.
-        // GDK has no `monitors-changed` signal in this version, so the list
-        // model is what reports the change.
-        let monitors = gtk::gdk::Display::default().map(|d| d.monitors());
-        if let Some(model) = monitors {
-            let later = inner.clone();
-            model.connect_items_changed(clone!(@strong later, move |_, _, _, _| {
-                // A monitor that appeared needs a window and a grid, and a
-                // monitor that vanished needs its icons moved, which is the
-                // provider's job. Either way the answer is to re-report and
-                // redraw; the provider never deletes an icon over a geometry
-                // change, so nothing is lost by doing it eagerly.
-                glib::idle_add_once(clone!(@strong later, move || {
-                    report(&later);
-                    redraw(&later, true);
-                }));
-            }));
-        }
-        ask(&inner);
-    }
-
-    /// Keep the process alive for the desktop. Called by `main` before the
-    /// application runs, so a desktop with no windows in it is not read as a
-    /// session that is over.
-    pub fn hold(&self) -> glib::IdleHandle {
-        let source = glib::IdleSource::new(|_| ControlFlow::Continue);
-        let handle = source.attach(None);
-        let app = self.app.clone();
-        handle.set_callback(move |_| {
-            let _ = &app;
-            ControlFlow::Continue
-        });
-        handle
-    }
+/// Draw the desktop until the session ends.
+#[must_use]
+pub fn run() -> ExitCode {
+    // Before GTK opens a display, which is the only context in which writing the
+    // environment is sound. The same argument the window makes: a machine with no
+    // render node cannot afford Mesa's software pipeline, and a desktop is the
+    // worst possible thing to paint with it. See [`super::pick_renderer`].
+    super::pick_renderer();
+    let app = gtk::Application::builder()
+        .application_id(DESKTOP_ID)
+        .build();
+    app.connect_activate(start);
+    // The process is kept alive by the hold rather than by a window. A desktop
+    // with no monitor to draw on is still a desktop waiting for one, and a window
+    // count of zero would read as a session that is over.
+    let hold = app.hold();
+    // The program name and nothing else: `GApplication` parses what it is handed,
+    // and `--desktop-icons` is our option rather than its option to know about.
+    let argv = vec![
+        std::env::args()
+            .next()
+            .unwrap_or_else(|| String::from("uflinux-files")),
+    ];
+    let code = app.run_with_args(&argv);
+    drop(hold);
+    ExitCode::from(code.get())
 }
 
-/// Ask the provider who is rendering this desktop, and take it over if the
-/// answer is nobody.
-fn ask(inner: &Rc<Inner>) {
-    let body = ipc::Request::Status.encode();
-    let answer = call(inner, "Status", Some(&(&body,).to_variant()));
-    let status = match answer.and_then(|reply| ipc::Reply::decode(&reply).ok()) {
-        Some(ipc::Reply::Status(status)) => status,
-        _ => {
-            // No answer at all means no provider, and a fallback with nothing
-            // to fall back to should say so and leave. Retrying would be a
-            // poll, and the bus activates the service on the first call
-            // anyway, so a refusal here is a real answer.
-            eprintln!("uflinux-files: the desktop provider did not answer; not drawing a desktop");
-            inner.app.quit();
+/// The first activation: find out whether anyone else is drawing this, and if
+/// not, start.
+fn start(app: &gtk::Application) {
+    // A second activation of the same process must not ask again. See the note on
+    // [`GRACE`] and on `Status.renderer`: the provider's answer means "has
+    // anything been asked", so asking twice reports a renderer because we asked.
+    static ASKED: std::sync::Once = std::sync::Once::new();
+    ASKED.call_once(|| {
+        css::install();
+        if !layer_shell::is_supported() {
+            // Without the protocol every window is an ordinary one, and an
+            // ordinary full-screen window is a rectangle that hides the desktop
+            // rather than a part of it. Declining is the honest answer.
+            eprintln!(
+                "uflinux-files: this compositor has no layer-shell protocol, so it cannot \
+                 show a desktop"
+            );
+            app.quit();
             return;
         }
-    };
-    if status.renderer {
-        // Someone else paints this. Leaving is the whole point of the flag.
-        inner.app.quit();
-        return;
-    }
-    let later = inner.clone();
-    glib::timeout_add_local(GRACE, move || {
-        take_over(&later);
-        ControlFlow::Break
+        let Some(display) = gtk::gdk::Display::default() else {
+            eprintln!("uflinux-files: the desktop has no display to draw on");
+            app.quit();
+            return;
+        };
+        // The bus is asked for synchronously. It is up before the session starter
+        // runs anything, and if it is not, saying so and leaving beats a desktop
+        // that retries forever without ever explaining what it is waiting for.
+        let connection = match gio::bus_get_sync(gio::BusType::Session, gio::Cancellable::NONE) {
+            Ok(connection) => connection,
+            Err(e) => {
+                eprintln!("uflinux-files: no session bus for the desktop: {e}");
+                app.quit();
+                return;
+            }
+        };
+        let inner = Rc::new(Inner {
+            app: app.clone(),
+            connection,
+            view: RefCell::new(View::new()),
+            fetching: StdCell::new(false),
+            stale: StdCell::new(false),
+            dead: StdCell::new(false),
+            signals: RefCell::new(Vec::new()),
+        });
+        // A screen plugged in after login has to be told about: the provider
+        // cannot place an icon on a grid it has never seen, and an icon on a
+        // screen that went away has to be moved rather than hidden. Gdk has no
+        // `monitors-changed` signal to connect to at this version; the list model
+        // behind it is what reports the change.
+        display.monitors().connect_items_changed({
+            let later = Rc::clone(&inner);
+            move |_, _, _, _| {
+                let later = Rc::clone(&later);
+                // Idle rather than here: the list is mid-change, and a new monitor
+                // has no geometry worth reporting until the compositor is done
+                // with it. Local and not the plain form because `Inner` is `Rc`,
+                // which is the whole point of a single-threaded UI.
+                glib::idle_add_local_once(move || {
+                    take_over(&later);
+                });
+            }
+        });
+        ask(&inner);
     });
 }
 
-/// The grace period is over and nobody claimed the renderer: build the
-/// windows, report the grids, draw what the provider knows.
-fn take_over(inner: &Rc<Inner>) {
-    build(inner);
-    if !report(inner) {
-        return;
-    }
-    subscribe(inner);
-    redraw(inner, true);
-}
-
-/// One background window per monitor, each holding a `gtk::Fixed`.
-///
-/// The windows are undecorated, non-focusable, and at the background layer
-/// with every anchor on, which is how a desktop is spelled in layer-shell:
-/// they cover a monitor, they cannot take focus from a real window, and a
-/// compositor that shows a desktop shows them.
-fn build(inner: &Rc<Inner>) {
-    let Some(display) = gtk::gdk::Display::default() else {
+/// Ask the provider who is rendering this desktop, and take it over if the answer
+/// is nobody.
+fn ask(inner: &Rc<Inner>) {
+    let Some(body) = body_of(&ipc::Request::Status) else {
         return;
     };
+    let text = match call(inner, "Status", &body) {
+        Ok(text) => text,
+        Err(e) => {
+            // No answer at all means no provider, and a fallback with nothing to
+            // fall back to should say so and leave. Retrying would be a poll, and
+            // the bus activates the service on the first call anyway, so a refusal
+            // here is a real answer.
+            eprintln!("uflinux-files: the desktop provider did not answer ({e}); not drawing");
+            quit(inner);
+            return;
+        }
+    };
+    // An answer that is not a status is a provider from some other version of this
+    // protocol, and guessing at a desktop from one is how an icon comes to be drawn
+    // twice.
+    let Ok(ipc::Reply::Status(status)) = ipc::Reply::decode(text.as_bytes()) else {
+        eprintln!("uflinux-files: the desktop provider answered something unreadable");
+        quit(inner);
+        return;
+    };
+    if !should_paint(&status) {
+        // Someone else paints this. Leaving is the whole point of the flag.
+        quit(inner);
+        return;
+    }
+    retry(inner);
+}
+
+/// Wait out the grace period, then take the desktop if it is still unclaimed.
+///
+/// Re-armed rather than given up on when there is no screen to draw on yet: a
+/// session starter can run before the compositor has finished enumerating outputs,
+/// and a desktop that exited at that moment would leave a blank screen for the
+/// rest of the session. The provider goes on answering for the model either way,
+/// so nothing is lost by waiting.
+fn retry(inner: &Rc<Inner>) {
+    let later = Rc::clone(inner);
+    glib::timeout_add_local_once(GRACE, move || {
+        if !take_over(&later) {
+            retry(&later);
+        }
+    });
+}
+
+/// Whether we should draw the desktop, given what the provider says about itself.
+///
+/// Split out because it is the whole decision the feature makes, and a rule this
+/// short is worth stating as a rule rather than leaving inside a bus call.
+fn should_paint(status: &ipc::StatusReply) -> bool {
+    !status.renderer
+}
+
+/// The grace period is over and nobody claimed the renderer: build the windows,
+/// report the grids, draw what the provider knows. `false` when there was nothing
+/// to draw on.
+///
+/// Idempotent, which is what lets the monitor handler call it again. Subscribing
+/// twice is a no-op, rebuilding the windows is skipped when the count has not
+/// changed, and reporting is always worth doing.
+fn take_over(inner: &Rc<Inner>) -> bool {
+    if !build(inner) {
+        return false;
+    }
+    subscribe(inner);
+    report(inner);
+    true
+}
+
+/// One background window per monitor, each holding a `gtk::Fixed`. `false` when
+/// there is no monitor to put one on.
+///
+/// The windows are undecorated, cannot be focused, and have every anchor on, which
+/// is how a desktop is spelled in layer-shell: they cover a monitor, the
+/// compositor shrinks them by whatever a panel reserves, and they cannot take
+/// focus away from a real window.
+fn build(inner: &Rc<Inner>) -> bool {
+    let Some(display) = gtk::gdk::Display::default() else {
+        return false;
+    };
+    // A snapshot rather than an iterator: the borrow an iterator holds is on the
+    // list model itself, and a monitor that appears mid-list while we are walking
+    // it makes that borrow panic.
+    let monitors: Vec<gtk::gdk::Monitor> = display
+        .monitors()
+        .snapshot()
+        .into_iter()
+        .filter_map(|item| item.downcast::<gtk::gdk::Monitor>().ok())
+        .collect();
+    {
+        let view = inner.view.borrow();
+        // The same number of screens is not a change worth rebuilding for: a new
+        // resolution arrives here too, and throwing away every window to find out
+        // the grid is a different size is a lot of pictures to destroy. `report`
+        // measures what we have instead.
+        if !view.screens.is_empty() && view.screens.len() == monitors.len() {
+            return true;
+        }
+    }
     let mut view = inner.view.borrow_mut();
     for screen in view.screens.drain(..) {
         screen.window.destroy();
     }
-    for monitor in display.monitors().iter::<gtk::gdk::Monitor>() {
-        let Ok(monitor) = monitor else {
-            continue;
-        };
-        let window = gtk::WindowBuilder::new()
+    // The widgets went with the windows, so every picture has to be asked for
+    // again and every cell built from scratch.
+    view.cells.clear();
+    view.asked.clear();
+    for (index, monitor) in monitors
+        .iter()
+        .enumerate()
+        .take(ipc::MAX_MONITORS)
+        .collect::<Vec<_>>()
+    {
+        // A gdk::Rectangle, which is integers and not the f32 graphene one: the
+        // grid we report is in whole pixels, and so is the surface the compositor
+        // gives us back.
+        let geometry = monitor.geometry();
+        let window = gtk::Window::builder()
             .application(&inner.app)
-            .title("uflinux-files-desktop")
+            .title(NAMESPACE)
             .decorated(false)
-            .can_focus(false)
             .build();
+        window.set_can_focus(false);
+        window.set_default_size(geometry.width(), geometry.height());
+        // On the window and not on the container: the rule that matters is the one
+        // that takes the theme's opaque background away, and that background is on
+        // the window node. See the comment on `.ufm-desktop` in [`super::css`].
+        window.add_css_class("ufm-desktop");
         let grid = gtk::Fixed::new();
-        grid.add_css_class("ufm-desktop");
         window.set_child(Some(&grid));
-        window.set_default_size(monitor.geometry().width, monitor.geometry().height);
-        layer_shell::init_for_window(&window);
-        layer_shell::set_monitor(&window, &monitor);
-        layer_shell::set_layer(&window, layer_shell::Layer::Background);
+        // The layer-shell setters are methods of one trait rather than free
+        // functions, so they read like the widget's own properties — which is what
+        // they are, as far as GTK is concerned.
+        window.init_layer_shell();
+        window.set_monitor(Some(monitor));
+        window.set_layer(layer_shell::Layer::Background);
         for edge in [
-            layer_shell::Edge::Left,
-            layer_shell::Edge::Right,
             layer_shell::Edge::Top,
             layer_shell::Edge::Bottom,
+            layer_shell::Edge::Left,
+            layer_shell::Edge::Right,
         ] {
-            layer_shell::anchor(&window, edge, 0);
+            window.set_anchor(edge, true);
         }
-        // No keyboard focus, ever. A desktop that can be focused is a desktop
-        // that steals it, and Enter on an icon is handled by the icon.
-        layer_shell::set_keyboard_mode(&window, layer_shell::KeyboardMode::None);
-        layer_shell::set_namespace(&window, NAMESPACE);
+        // No keyboard, ever. A desktop that can be focused is a desktop that can
+        // steal it, and a background surface is not going to be given it anyway.
+        window.set_keyboard_mode(layer_shell::KeyboardMode::None);
+        window.set_namespace(Some(NAMESPACE));
         view.screens.push(Screen {
             window,
             grid,
-            geometry: ipc::Geometry::new(
-                view.screens.len() as u8,
-                1,
-                1,
-                grid_reserve(THUMB_MIN).0 as u16,
-                grid_reserve(THUMB_MIN).1 as u16,
-            ),
+            monitor: index as u8,
+            width: geometry.width().max(1),
+            height: geometry.height().max(1),
         });
     }
     for screen in &view.screens {
-        screen.window.show();
+        let window = screen.window.clone();
+        // The size we were given is the size the grid has, and it is only known
+        // once the compositor has placed us. So the map is the moment at which the
+        // grids get reported properly and the panel's exclusive zone stops being a
+        // guess.
+        let inner = Rc::clone(inner);
+        window.connect_map(move |_| {
+            report(&inner);
+        });
     }
+    let windows = view
+        .screens
+        .iter()
+        .map(|screen| screen.window.clone())
+        .collect::<Vec<_>>();
+    // Before showing: mapping runs `report`, which wants the view to itself.
+    drop(view);
+    for window in windows {
+        window.set_visible(true);
+    }
+    !inner.view.borrow().screens.is_empty()
 }
 
-/// The grid to report for one screen, given the thumbnail edge the model wants.
+/// Tell the provider about every screen we have, then pull the model.
 ///
-/// The cell has to hold the icon and two lines of name, so the grid follows
-/// from the edge rather than from the monitor: a desktop configured for 256px
-/// previews wants bigger cells than one configured for 128px ones. The panel
-/// reservation is a margin we choose, not a work-area query — GDK 4 does not
-/// expose one — and it is the same on every edge so an icon row never starts
-/// under a panel.
-fn grid_for(screen: &Screen, edge: u32, index: u8) -> ipc::Geometry {
-    let _ = screen;
-    let (cell_w, cell_h) = grid_reserve(edge);
-    ipc::Geometry::new(index, 1, 1, cell_w as u16, cell_h as u16)
-}
-
-/// The cell a given thumbnail edge needs, in pixels: the icon, the label, and
-/// the gap between them.
-fn grid_reserve(edge: u32) -> (i32, i32) {
-    let edge = edge.clamp(THUMB_MIN, THUMB_MAX);
-    (
-        i32::try_from(edge).unwrap_or(i32::MAX) + 24,
-        i32::try_from(edge).unwrap_or(i32::MAX) + 24 + LABEL_HEIGHT,
-    )
-}
-
-/// Tell the provider about every screen we have, and keep what it answers.
-///
-/// Geometry is reported as one complete set, which is what the provider
-/// requires: a partial set would leave a monitor with a grid nobody owns.
-/// Returns whether the provider took it, because a desktop with no grids is
-/// not a desktop.
-fn report(inner: &Rc<Inner>) -> bool {
-    let monitors: Vec<ipc::Geometry> = {
+/// Geometry is reported as one complete set, which is what the provider requires:
+/// a partial set would leave a monitor with a grid nobody owns. A refusal is
+/// printed and survived rather than fatal — the next monitor change reports again,
+/// and a desktop that quit because one report was refused would have taken the
+/// panel's word for it.
+fn report(inner: &Rc<Inner>) {
+    let grids = {
         let view = inner.view.borrow();
+        if view.screens.len() > ipc::MAX_MONITORS {
+            eprintln!(
+                "uflinux-files: {} screens, the desktop protocol takes {}; the rest stay empty",
+                view.screens.len(),
+                ipc::MAX_MONITORS
+            );
+        }
         view.screens
             .iter()
-            .enumerate()
-            .map(|(index, _)| grid_for(&view.screens[index], view.edge, index as u8))
-            .collect()
+            .take(ipc::MAX_MONITORS)
+            .map(|screen| screen.geometry(view.edge))
+            .collect::<Vec<_>>()
     };
-    if monitors.is_empty() {
+    if grids.is_empty() {
         eprintln!("uflinux-files: no monitor to draw a desktop on");
-        return false;
+        return;
     }
-    let body = ipc::Request::SetGeometry { monitors }.encode();
-    match call(inner, "SetGeometry", Some(&(&body,).to_variant())) {
-        Some(reply) => {
-            remember(inner, &reply);
-            true
-        }
-        None => {
-            eprintln!("uflinux-files: the desktop provider refused our geometry; not drawing");
-            inner.app.quit();
-            false
-        }
-    }
-}
-
-/// Pull the model into the view without drawing it.
-fn remember(inner: &Rc<Inner>, reply: &str) {
-    let Ok(ipc::Reply::Model(model)) = ipc::Reply::decode(reply) else {
+    let Some(body) = body_of(&ipc::Request::SetGeometry {
+        monitors: grids.clone(),
+    }) else {
         return;
     };
-    let edge = model
-        .thumbnail_size
-        .clamp(THUMB_MIN, THUMB_MAX)
-        .min(ipc::MAX_CELL as u32) as u32;
-    let mut view = inner.view.borrow_mut();
-    view.thumbnails = model.thumbnails;
-    view.edge = edge;
-    view.requested = model.generation;
-    view.model = Some(model);
-}
-
-/// Redraw the whole desktop from the model we hold.
-///
-/// Whole, not incremental. The model is a flat list with a cell per item and
-/// the whole thing is capped at a couple of thousand entries, so diffing it
-/// would cost about as much as rebuilding it, and rebuilding is the version
-/// with no way to leak a widget.
-fn redraw(inner: &Rc<Inner>, repaint: bool) {
-    if !repaint {
+    if let Err(e) = call(inner, "SetGeometry", &body) {
+        eprintln!("uflinux-files: the desktop provider refused our grids: {e}");
         return;
     }
-    let edge = {
-        let view = inner.view.borrow();
-        let Some(model) = view.model.as_ref() else {
-            return;
-        };
-        view.edge
-    };
-    let (cell_w, cell_h) = grid_reserve(edge);
-    // Re-report before drawing: the cell size follows the thumbnail edge, and
-    // an edge we advertise without telling the provider about would place
-    // icons into cells we then do not draw.
-    let _ = report(inner);
-    let stale = inner.view.borrow_mut().take_cells();
-    let mut view = inner.view.borrow_mut();
-    let Some(model) = view.model.clone() else {
-        drop(stale);
+    // What we just said is what the drawing lays out against, so the two cannot
+    // disagree even when a refusal or a resize lands between them.
+    *inner.view.borrow().grids.borrow_mut() = grids;
+    fetch(inner);
+}
+
+/// Pull the model, unless one is already on the bus.
+fn fetch(inner: &Rc<Inner>) {
+    if inner.fetching.replace(true) {
+        inner.stale.set(true);
+        return;
+    }
+    let Some(body) = body_of(&ipc::Request::GetModel) else {
+        inner.fetching.set(false);
         return;
     };
-    for screen in &view.screens {
-        while let Some(child) = screen.grid.first_child() {
-            screen.grid.remove(&child);
-        }
-    }
-    let generation = model.generation;
-    let thumbnails = view.thumbnails;
-    let mut cells = Vec::with_capacity(model.items.len());
-    for item in &model.items {
-        let Some(cell) = item.at.as_ref() else {
-            continue;
-        };
-        let Some((index, x, y)) = view.spot(cell) else {
-            continue;
-        };
-        let label = gtk::Label::new(Some(item.label().as_str()));
-        label.set_lines(LABEL_LINES);
-        label.set_ellipsize(pango::EllipsizeMode::End);
-        label.set_justify(gtk::Justification::Center);
-        label.set_wrap(true);
-        label.set_max_width_chars(18);
-        label.add_css_class("ufm-name");
-        let tile = tile(&label, item, cell_w, cell_h);
-        let button = gtk::Button::new();
-        button.set_child(Some(&tile));
-        button.set_has_frame(false);
-        button.set_tooltip_text(item.tooltip.as_deref());
-        button.set_size_request(i32::from(model.thumbnail_size.min(ipc::MAX_CELL as u32)) + 24, 0);
-        button.add_css_class("ufm-cell");
-        button.connect_clicked({
-            let inner = inner.clone();
-            let id = item.id.clone();
-            move |_| {
-                act(&inner, ipc::Request::Launch { id: id.clone() });
-            }
-        });
-        let pressed = gtk::GestureClick::new();
-        pressed.set_button(3);
-        let menu = gtk::GestureClick::new();
-        menu.connect_pressed({
-            let inner = inner.clone();
-            let id = item.id.clone();
-            move |_, _, _, _| {
-                act(&inner, ipc::Request::ContextMenu { id: id.clone() });
-            }
-        });
-        let _ = pressed;
-        button.add_controller(menu);
-        let drag = gtk::GestureDrag::new();
-        drag.connect_drag_end({
-            let inner = inner.clone();
-            let id = item.id.clone();
-            move |gesture, dx, dy| {
-                let (start_x, start_y) = gesture.start_coords().unwrap_or((dx, dy));
-                let Some(monitor) = drop_target(&inner, &button, dx, dy) else {
-                    return;
-                };
-                let Some((col, row)) = drop_slot(&inner, monitor, start_x + dx, start_y + dy)
-                else {
-                    return;
-                };
-                act(
-                    &inner,
-                    ipc::Request::Place {
-                        id: id.clone(),
-                        monitor,
-                        col,
-                        row,
-                    },
-                );
-            }
-        });
-        button.add_controller(drag);
-        view.screens[index].grid.put(&button, x as f64, y as f64);
-        button.show();
-        cells.push((
-            item.id.clone(),
-            Painted {
-                button,
-                label,
-                thumbnail: StdCell::new(0),
-            },
-        ));
-    }
-    view.cells = cells;
-    view.drawn = generation;
-    if thumbnails {
-        fetch(inner.clone(), generation);
-    }
-}
-
-/// The picture inside one icon: the thumbnail once there is one, the theme
-/// icon until then, and the name under both.
-fn tile(label: &gtk::Label, item: &ipc::Item, cell_w: i32, cell_h: i32) -> gtk::Box {
-    let image = gtk::Image::from_icon_name(item.icon_name());
-    image.set_pixel_size(THUMB_MIN as i32);
-    image.set_halign(gtk::Align::Center);
-    image.set_overflow_hidden(true);
-    image.set_widget_name("ufm-desktop-icon");
-    let box_ = gtk::Box::new(gtk::Orientation::Vertical, 4);
-    box_.set_halign(gtk::Align::Center);
-    box_.set_valign(gtk::Align::Start);
-    box_.set_size_request(cell_w, cell_h);
-    box_.append(&image);
-    box_.append(label);
-    box_
-}
-
-/// Which monitor a drop landed on, by way of the window under the pointer.
-fn drop_target(inner: &Rc<Inner>, button: &gtk::Button, dx: f64, dy: f64) -> Option<u8> {
-    let (x, y) = (dx, dy);
-    let surface = button.surface()?;
-    let (local_x, local_y) = button.translate_coordinates(&surface, x, y).unwrap_or((x, y));
-    let _ = local_y;
-    let window = surface.upcast::<gtk::Widget>().toplevel()?;
-    inner
-        .view
-        .borrow()
-        .screens
-        .iter()
-        .position(|screen| screen.window == window)
-        .and_then(|index| inner.view.borrow().screens[index].geometry.monitor.into())
-        .map(|monitor: u8| monitor)
-}
-
-/// Which cell of a monitor a drop point falls in.
-fn drop_slot(inner: &Rc<Inner>, monitor: u8, x: f64, y: f64) -> Option<(u16, u16)> {
-    let view = inner.view.borrow();
-    let geometry = view
-        .screens
-        .iter()
-        .find(|screen| screen.geometry.monitor == monitor)?
-        .geometry;
-    let col = (x / i32::from(geometry.cell_w) as f64).floor();
-    let row = (y / i32::from(geometry.cell_h) as f64).floor();
-    if col < 0.0 || row < 0.0 {
-        return None;
-    }
-    let col = u16::try_from(col as i64).unwrap_or(u16::MAX);
-    let row = u16::try_from(row as i64).unwrap_or(u16::MAX);
-    geometry.fits(geometry.slot(ipc::Cell::new(monitor, col, row).slot()))?;
-    Some((col, row))
-}
-
-/// Start listening for the provider's news.
-fn subscribe(inner: &Rc<Inner>) {
-    let signals = [ipc::CHANGED, ipc::PROGRESS]
-        .iter()
-        .filter_map(|signal| {
-            let name = (*signal).to_string();
-            let handler = inner.clone();
-            inner
-                .connection
-                .subscribe_to_signal(
-                    Some(ipc::SESSION_NAME),
-                    Some(ipc::SESSION_NAME),
-                    Some(&name),
-                    Some(ipc::OBJECT_PATH),
-                    None,
-                    gio::DBusSignalFlags::NONE,
-                    move |signal| changed(&handler, &name, signal),
-                )
-                .ok()
-        })
-        .collect::<Vec<_>>();
-    inner.view.borrow_mut().screens.first()?;
-    let mut inner = match Rc::get_mut(&mut inner.clone()) {
-        Some(_) => Vec::new(),
-        None => Vec::new(),
-    };
-    inner.extend(signals);
-}
-
-/// A `Changed` is a hint to fetch, not a model to apply. The generation is the
-/// interesting part: two changes before we finish one repaint are one repaint.
-fn changed(inner: &Rc<Inner>, name: &str, signal: &gio::DBusMessage) {
-    if name != ipc::CHANGED {
-        return;
-    }
-    let body = signal.body().and_then(|parameters| {
-        parameters
-            .str::<0>()
-            .map(|text| text.as_str().to_string())
-            .ok()
-    });
-    let Some(text) = body else { return };
-    let Ok(ipc::Changed { generation, .. }) = ipc::Changed::decode(&text) else {
-        return;
-    };
-    let view = inner.view.borrow();
-    if generation <= view.drawn || generation <= view.requested {
-        return;
-    }
-    drop(view);
-    fetch(inner.clone(), generation);
-}
-
-/// Ask for the model, and repaint when it arrives.
-fn fetch(inner: Rc<Inner>, generation: u64) {
-    if generation <= inner.view.borrow().requested {
-        return;
-    }
-    inner.view.borrow_mut().requested = generation;
-    let body = ipc::Request::GetModel.encode();
-    let later = inner.clone();
     inner.connection.call(
         Some(ipc::SESSION_NAME),
         ipc::OBJECT_PATH,
         ipc::SESSION_NAME,
         "GetModel",
-        Some(&(&body,).to_variant()),
+        Some(&(body,).to_variant()),
         Some(glib::VariantTy::TUPLE),
         gio::DBusCallFlags::NONE,
         CALL,
         gio::Cancellable::NONE,
-        move |result| {
-            let Ok(reply) = result else { return };
-            if let Some(text) = reply.str::<0>() {
-                remember(&later, text.as_str());
+        {
+            let inner = Rc::clone(inner);
+            move |result| {
+                let stale = inner.stale.replace(false);
+                inner.fetching.set(false);
+                let reshaped = match result {
+                    Ok(reply) => apply(&inner, &reply),
+                    Err(_) => false,
+                };
+                if reshaped {
+                    // The cell size follows the picture size, so a model that wants
+                    // a different edge wants new grids reported. This does not
+                    // recurse into itself: the call below is asynchronous, and the
+                    // edge is already stored, so the reply it brings back reports no
+                    // change and the loop ends after one extra round trip.
+                    report(&inner);
+                } else {
+                    redraw(&inner);
+                }
+                if stale {
+                    fetch(&inner);
+                }
             }
-            redraw(&later, true);
         },
     );
 }
 
-/// Ask for one thumbnail, and paint it when it arrives.
+/// Take a model off the bus. `true` when it wants a different cell size than the
+/// one the grids we reported were built for.
+fn apply(inner: &Rc<Inner>, reply: &glib::Variant) -> bool {
+    let Some((text,)) = reply.get::<(String,)>() else {
+        return false;
+    };
+    let Ok(ipc::Reply::Model { model }) = ipc::Reply::decode(text.as_bytes()) else {
+        return false;
+    };
+    let edge = edge_for(&model);
+    let mut view = inner.view.borrow_mut();
+    let reshaped = edge != view.edge;
+    view.edge = edge;
+    view.thumbnails = model.thumbnails;
+    view.drawn = model.generation;
+    view.asked.clear();
+    view.model = Some(model);
+    reshaped
+}
+
+/// The edge to ask for: what the model says, inside the band the provider will
+/// decode at. A model that names nothing gets the default rather than zero.
+fn edge_for(model: &ipc::Model) -> u32 {
+    model.thumbnail_size.clamp(THUMB_MIN, THUMB_MAX)
+}
+
+/// Redraw the desktop from the model we hold.
 ///
-/// Only called for cells that are on screen, which after the initial draw is
-/// every cell we have — the saving is not in skipping off-screen icons, it is
-/// in never asking for a picture the model said not to ask for.
-fn thumbnail(inner: Rc<Inner>, index: usize, path: String, size: u32, generation: u64) {
-    let Some(button) = inner
-        .view
-        .borrow()
-        .cells
-        .get(index)
-        .map(|cell| cell.painted.button.clone())
-    else {
+/// Every icon is accounted for, but the widgets are reused rather than rebuilt:
+/// the model is a flat list with a cell per item, so the work is the same, and
+/// reuse is the version where a rename does not throw away a decoded picture.
+fn redraw(inner: &Rc<Inner>) {
+    // Out of the view rather than borrowed out of it: the loop below both reads the
+    // items and writes the sets the widgets are kept in, and a model that is a
+    // local value makes that an ordinary sequence instead of a borrow argument.
+    let Some(model) = inner.view.borrow_mut().model.take() else {
         return;
     };
-    let body = ipc::Request::RequestThumbnail { path, size }.encode();
-    inner
-        .connection
-        .call_with_unix_fd_list(
-            Some(ipc::SESSION_NAME),
-            ipc::OBJECT_PATH,
-            ipc::SESSION_NAME,
-            "RequestThumbnail",
-            Some(&(&body,).to_variant()),
-            Some(glib::VariantTy::TUPLE),
-            gio::DBusCallFlags::NONE,
-            CALL,
-            None::<&gio::UnixFDList>,
-            gio::Cancellable::NONE,
+    let send: Sender = {
+        let inner = Rc::clone(inner);
+        Rc::new(move |request| act(&inner, request))
+    };
+    let mut pictures: Vec<(gtk::Image, String)> = Vec::new();
+    let edge;
+    {
+        let mut borrowed = inner.view.borrow_mut();
+        let view = &mut *borrowed;
+        edge = view.edge;
+        let grids = view.grids.borrow().clone();
+        let reserve = grid_reserve(edge).0;
+        let old = std::mem::take(&mut view.cells);
+        let mut next: HashMap<String, Painted> = HashMap::with_capacity(model.items.len());
+        for item in &model.items {
+            // An item with no cell is real and simply has nowhere to be drawn; an
+            // item whose cell names a screen we have no window for is the same
+            // problem one step later, and the provider will move it when it can.
+            // A cell is `Copy`, so the option can be taken by value out of the item.
+            let Some((index, x, y)) = item.at.and_then(|cell| spot(&grids, cell)) else {
+                continue;
+            };
+            let painted = match old.get(&item.id) {
+                Some(painted) => painted.clone(),
+                None => cell_widget(
+                    item,
+                    i32::try_from(edge).unwrap_or(i32::MAX),
+                    reserve,
+                    Rc::clone(&view.grids),
+                    Rc::clone(&send),
+                ),
+            };
+            painted.label.set_text(item.label());
+            painted.button.set_tooltip_text(item.tooltip.as_deref());
+            view.place(&painted, index, x, y);
+            if view.thumbnails
+                && !view.asked.contains(&item.id)
+                && let Some(path) = model.path_in(&item.id)
+            {
+                view.asked.insert(item.id.clone());
+                pictures.push((painted.image.clone(), path.display().to_string()));
+            }
+            next.insert(item.id.clone(), painted);
+        }
+        for (id, painted) in &old {
+            if !next.contains_key(id) {
+                view.unplace(painted);
+            }
+        }
+        view.cells = next;
+        view.model = Some(model);
+    }
+    for (image, path) in pictures {
+        thumbnail(inner, &image, path, edge);
+    }
+}
+
+/// The widget for one icon: a picture, a name, and the gestures that act on it.
+///
+/// Split out from [`redraw`] so a test can build one with nothing on the bus. The
+/// `send` closure is the only way out, which is what keeps a widget from needing
+/// to know that a bus exists.
+fn cell_widget(
+    item: &ipc::Item,
+    edge: i32,
+    reserve: u32,
+    grids: Rc<RefCell<Vec<ipc::Geometry>>>,
+    send: Sender,
+) -> Painted {
+    let image = gtk::Image::from_icon_name(item.icon_name());
+    // The pixel size rather than a size request: an icon name has to be rendered at
+    // the cell's size and not at the theme default, and `set_pixel_size` is what
+    // asks for that without a scale factor in the way.
+    image.set_pixel_size(edge);
+    image.set_halign(gtk::Align::Center);
+    let label = gtk::Label::new(Some(item.label()));
+    label.set_wrap(true);
+    label.set_lines(LABEL_LINES);
+    label.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    label.set_justify(gtk::Justification::Center);
+    label.set_max_width_chars(LABEL_CHARS);
+    label.add_css_class("ufm-name");
+    let tile = gtk::Box::new(gtk::Orientation::Vertical, LABEL_GAP);
+    tile.set_halign(gtk::Align::Center);
+    tile.append(&image);
+    tile.append(&label);
+    let button = gtk::Button::new();
+    button.set_child(Some(&tile));
+    button.set_has_frame(false);
+    button.set_can_focus(false);
+    button.set_tooltip_text(item.tooltip.as_deref());
+    button.add_css_class("ufm-cell");
+    // The cell's width and not its height: the grid positions the button and the
+    // label decides how tall it is, and asking for a height too would clip a name
+    // that needs both of its lines.
+    button.set_size_request(i32::try_from(reserve).unwrap_or(i32::MAX), 0);
+    let screen: Rc<StdCell<usize>> = Rc::new(StdCell::new(usize::MAX));
+
+    // Double-click, not single: a desktop icon that opens on a click cannot be
+    // selected, and there is no `GestureMultiPress` at this version of the
+    // bindings to get it any other way.
+    let click = gtk::GestureClick::new();
+    {
+        let send = Rc::clone(&send);
+        let id = item.id.clone();
+        click.connect_pressed(move |_, n_press, _, _| {
+            if n_press == 2 {
+                send(ipc::Request::Launch { id: id.clone() });
+            }
+        });
+    }
+    let menu = gtk::GestureClick::new();
+    menu.set_button(3);
+    {
+        let send = Rc::clone(&send);
+        let id = item.id.clone();
+        menu.connect_pressed(move |_, n_press, _, _| {
+            if n_press == 1 {
+                send(ipc::Request::ContextMenu { id: id.clone() });
+            }
+        });
+    }
+    let drag = gtk::GestureDrag::new();
+    let origin: Rc<StdCell<(f64, f64)>> = Rc::new(StdCell::new((0.0, 0.0)));
+    {
+        let origin = Rc::clone(&origin);
+        drag.connect_drag_begin(move |_, x, y| origin.set((x, y)));
+    }
+    {
+        let send = Rc::clone(&send);
+        let id = item.id.clone();
+        let screen = Rc::clone(&screen);
+        drag.connect_drag_end(move |gesture, dx, dy| {
+            let Some(button) = gesture
+                .widget()
+                .and_then(|widget| widget.downcast::<gtk::Button>().ok())
+            else {
+                return;
+            };
+            let Some(grid) = button
+                .parent()
+                .and_then(|parent| parent.downcast::<gtk::Fixed>().ok())
+            else {
+                return;
+            };
+            // The gesture's coordinates are the button's own, and `GdkEvent` has no
+            // root coordinates at this version, so the drop point is built from
+            // where the button sits in the grid. That is also why a drag cannot
+            // cross a monitor: there is nothing here to say which one the pointer
+            // is over once it has left.
+            let (x, y) = grid.child_position(&button);
+            let (start_x, start_y) = origin.get();
+            let Some(geometry) = grids.borrow().get(screen.get()).copied() else {
+                return;
+            };
+            let Some(slot) = slot_of(&geometry, x + start_x + dx, y + start_y + dy) else {
+                return;
+            };
+            send(ipc::Request::Place {
+                id: id.clone(),
+                monitor: geometry.monitor,
+                col: slot.col,
+                row: slot.row,
+            });
+        });
+    }
+    button.add_controller(click);
+    button.add_controller(menu);
+    button.add_controller(drag);
+    Painted {
+        button,
+        image,
+        label,
+        screen,
+    }
+}
+
+/// Ask for one picture, and paint it over the icon name when it arrives.
+///
+/// Asked for once per icon per generation, and only while the model says pictures
+/// are wanted here at all. The fallback has no scrolling, so every cell it has
+/// drawn is a visible one — the saving is not in skipping icons below the fold, it
+/// is in never asking for a picture the model said not to ask for.
+fn thumbnail(inner: &Rc<Inner>, image: &gtk::Image, path: String, size: u32) {
+    let Some(body) = body_of(&ipc::Request::RequestThumbnail { path, size }) else {
+        return;
+    };
+    inner.connection.call_with_unix_fd_list(
+        Some(ipc::SESSION_NAME),
+        ipc::OBJECT_PATH,
+        ipc::SESSION_NAME,
+        "RequestThumbnail",
+        Some(&(body,).to_variant()),
+        Some(glib::VariantTy::TUPLE),
+        gio::DBusCallFlags::NONE,
+        CALL,
+        None::<&gio::UnixFDList>,
+        gio::Cancellable::NONE,
+        {
+            let image = image.clone();
             move |result| {
-                let (reply, fds) = match result {
-                    Ok(pair) => pair,
-                    Err(_) => return,
-                };
-                let Some(text) = reply.str::<0>() else {
+                let Ok((reply, descriptors)) = result else {
                     return;
                 };
-                let Ok(ipc::Reply::Thumbnail(thumb)) = ipc::Reply::decode(text.as_str()) else {
+                let Some((text,)) = reply.get::<(String,)>() else {
                     return;
                 };
-                let Some(list) = fds else { return };
-                let Some(index) = thumb.fd.and_then(|fd| list.get(fd).ok()) else {
+                let Ok(ipc::Reply::Thumbnail(picture)) = ipc::Reply::decode(text.as_bytes()) else {
                     return;
                 };
-                let stream = gio::UnixInputStream::take_fd(index);
-                let Ok(pixbuf) = gdk_pixbuf::Pixbuf::from_stream_at_scale(
+                // No descriptor is a real answer and not a failure: the provider
+                // sends an icon instead of a picture for anything it will not
+                // decode, and the icon we already painted is the right thing to
+                // leave showing.
+                let (Some(index), Some(list)) = (picture.fd, descriptors) else {
+                    return;
+                };
+                let Ok(descriptor) = list.get(i32::from(index)) else {
+                    return;
+                };
+                let stream = gio::UnixInputStream::take_fd(descriptor);
+                // `0, 0` rather than the edge we asked for: the provider already
+                // decoded at the size we requested, and scaling it again here would
+                // only blur a picture that is already right.
+                let Ok(pixbuf) = gtk::gdk_pixbuf::Pixbuf::from_stream_at_scale(
                     &stream,
-                    size as i32,
-                    size as i32,
-                    true,
+                    0,
+                    0,
+                    false,
                     None::<&gio::Cancellable>,
                 ) else {
                     return;
                 };
-                let Some(image) = button
-                    .child()
-                    .and_then(|tile| tile.downcast::<gtk::Box>().ok())
-                    .and_then(|tile| tile.first_child())
-                    .and_then(|first| first.downcast::<gtk::Image>().ok())
-                else {
-                    return;
-                };
-                image.set_from_paintable(Some(&gtk::gdk::Texture::for_pixbuf(&pixbuf)));
-                let _ = generation;
-            },
-        );
+                image.set_paintable(Some(&gtk::gdk::Texture::for_pixbuf(&pixbuf)));
+            }
+        },
+    );
 }
 
-/// Ask for thumbnails for every visible cell, once per generation.
-fn fetch_thumbnails(inner: Rc<Inner>, generation: u64) {
-    let (requests, edge) = {
-        let view = inner.view.borrow();
-        let Some(model) = view.model.as_ref() else {
-            return;
-        };
-        if !view.thumbnails {
-            return;
-        }
-        let edge = view.edge;
-        let requests = model
-            .items
-            .iter()
-            .enumerate()
-            .filter(|(_, item)| item.at.is_some())
-            .map(|(index, item)| (index, item.id.clone(), edge))
-            .collect::<Vec<_>>();
-        (requests, edge)
-    };
-    for (index, id, size) in requests {
-        thumbnail(inner.clone(), index, id, size, generation);
+/// Start listening for the provider's news, once.
+///
+/// Only `Changed`. `Progress` is real and this client has nowhere to put it: a grid
+/// of icons on a wallpaper does not get a spinner, and subscribing to a signal in
+/// order to drop it is a subscription that lies about what the client does.
+fn subscribe(inner: &Rc<Inner>) {
+    if !inner.signals.borrow().is_empty() {
+        return;
     }
+    let subscription = inner.connection.subscribe_to_signal(
+        Some(ipc::SESSION_NAME),
+        Some(ipc::SESSION_NAME),
+        Some(ipc::CHANGED),
+        Some(ipc::OBJECT_PATH),
+        None,
+        gio::DBusSignalFlags::NONE,
+        {
+            let inner = Rc::clone(inner);
+            move |signal| on_changed(&inner, &signal)
+        },
+    );
+    inner.signals.borrow_mut().push(subscription);
 }
 
-/// One request, fired and forgotten. The desktop is not a place where a failed
-/// call has anywhere to be reported.
+/// A `Changed` is a hint to fetch, not a model to apply. The generation is the
+/// interesting part: two changes before we finish one repaint are one repaint.
+fn on_changed(inner: &Rc<Inner>, signal: &gio::DBusSignalRef) {
+    if inner.dead.get() {
+        return;
+    }
+    // The body is parsed rather than ignored: a signal this client cannot read
+    // should not cause work.
+    let Some(changed) = signal_body::<ipc::Changed>(signal) else {
+        return;
+    };
+    // Older than what is drawn is a reply that lost the race, and dropping it is
+    // the whole reason the generation travels with the signal. Equal is not
+    // dropped: the model may have been refetched since, and repainting from the
+    // model we hold costs the widgets we already have.
+    if changed.generation < inner.view.borrow().drawn {
+        return;
+    }
+    fetch(inner);
+}
+
+/// The JSON body of a signal, or `None` when it is not one this client knows.
+fn signal_body<T>(signal: &gio::DBusSignalRef) -> Option<T>
+where
+    T: serde::de::DeserializeOwned,
+{
+    let (text,) = signal.parameters.get::<(String,)>()?;
+    serde_json::from_str(&text).ok()
+}
+
+/// One request, fired and forgotten. The desktop is not a place where a failed call
+/// has anywhere to be reported beyond the terminal it was started from.
 fn act(inner: &Rc<Inner>, request: ipc::Request) {
     let method = bus_method(&request);
-    let body = request.encode();
+    let Some(body) = body_of(&request) else {
+        return;
+    };
     inner.connection.call(
         Some(ipc::SESSION_NAME),
         ipc::OBJECT_PATH,
         ipc::SESSION_NAME,
         method,
-        Some(&(&body,).to_variant()),
+        Some(&(body,).to_variant()),
         Some(glib::VariantTy::TUPLE),
         gio::DBusCallFlags::NONE,
         CALL,
@@ -801,9 +1001,17 @@ fn act(inner: &Rc<Inner>, request: ipc::Request) {
     );
 }
 
-/// One request, and wait for the answer. `None` is any error, and every caller
-/// treats "no answer" the same way: give up on the desktop.
-fn call(inner: &Rc<Inner>, method: &str, parameters: Option<&glib::Variant>) -> Option<String> {
+/// A request as the one string this protocol sends, or `None` when it is too large
+/// to send at all.
+fn body_of(request: &ipc::Request) -> Option<String> {
+    let body = serde_json::to_string(request).ok()?;
+    (body.len() <= ipc::MAX_REQUEST).then_some(body)
+}
+
+/// One request, and wait for the answer. `Err` carries the bus's own message, which
+/// is the part worth printing; an answer that is not one string is the provider's
+/// fault and says so without pretending otherwise.
+fn call(inner: &Rc<Inner>, method: &str, body: &str) -> Result<String, String> {
     let reply = inner
         .connection
         .call_sync(
@@ -811,22 +1019,27 @@ fn call(inner: &Rc<Inner>, method: &str, parameters: Option<&glib::Variant>) -> 
             ipc::OBJECT_PATH,
             ipc::SESSION_NAME,
             method,
-            parameters,
+            Some(&(body,).to_variant()),
             Some(glib::VariantTy::TUPLE),
             gio::DBusCallFlags::NONE,
             CALL,
             gio::Cancellable::NONE,
         )
-        .ok()?;
-    reply.str::<0>().map(|text| text.as_str().to_string())
+        .map_err(|e| e.to_string())?;
+    reply
+        .get::<(String,)>()
+        .map(|(text,)| text)
+        .ok_or_else(|| String::from("the answer is not one this program can read"))
 }
 
 /// The bus name for a request. The wire spells methods in kebab-case and D-Bus
-/// wants CamelCase, so this cannot be derived.
+/// wants CamelCase, so this cannot be derived — and it is the same mapping the
+/// provider checks the other way round, which is what a test below takes advantage
+/// of.
 fn bus_method(request: &ipc::Request) -> &'static str {
     match request {
-        ipc::Request::Status { .. } => "Status",
-        ipc::Request::GetModel { .. } => "GetModel",
+        ipc::Request::Status => "Status",
+        ipc::Request::GetModel => "GetModel",
         ipc::Request::SetGeometry { .. } => "SetGeometry",
         ipc::Request::Place { .. } => "Place",
         ipc::Request::Launch { .. } => "Launch",
@@ -837,5 +1050,346 @@ fn bus_method(request: &ipc::Request) -> &'static str {
     }
 }
 
-/// Keep the unused-import lint honest about the priority we do not use yet.
-const _: Priority = Priority::DEFAULT;
+/// Stop drawing and say goodbye to the bus. The subscriptions go first: a desktop
+/// that is leaving should not notice another change on its way out, and dropping
+/// them is what makes that true rather than a matter of ordering.
+fn quit(inner: &Rc<Inner>) {
+    if inner.dead.replace(true) {
+        return;
+    }
+    inner.signals.borrow_mut().clear();
+    inner.app.quit();
+}
+
+/// The grid one screen of `width` by `height` offers at `edge`.
+fn grid(monitor: u8, width: i32, height: i32, edge: u32) -> ipc::Geometry {
+    let (cell_w, cell_h) = grid_reserve(edge);
+    // Each axis is capped by its own limit, and they are not the same number: the
+    // protocol allows a far taller grid than a wider one, because a screen is wide
+    // and short. Taking the larger of the two for both would have us report a grid
+    // the provider then refuses.
+    let columns = divide(width, cell_w, ipc::MAX_COLUMNS);
+    let rows = divide(height, cell_h, ipc::MAX_ROWS);
+    ipc::Geometry::new(monitor, columns, rows, cell_w, cell_h)
+}
+
+/// How many cells of `cell` fit in `pixels`, with a floor of one and a ceiling of
+/// `cap`, which is the protocol's own for this axis.
+///
+/// The floor matters more than it looks: the provider refuses a zero-sized grid
+/// rather than reading it as an empty one, because an empty grid silently swallows
+/// every icon on that screen. A monitor that reports no size yet — one that is
+/// still being configured — therefore gets a grid of one cell, and the icons on it
+/// come back as soon as it reports a real size.
+fn divide(pixels: i32, cell: u32, cap: u16) -> u16 {
+    let cells = u32::try_from(pixels.max(0)).unwrap_or(u32::MAX) / cell.max(1);
+    cells.clamp(1, u32::from(cap)) as u16
+}
+
+/// The cell an icon with an `edge`-pixel picture needs, in pixels: the picture, the
+/// two lines under it, and the gap that keeps neighbours apart.
+fn grid_reserve(edge: u32) -> (u32, u32) {
+    let edge = edge.clamp(THUMB_MIN, THUMB_MAX);
+    (edge + PAD, edge + PAD + LABEL_HEIGHT)
+}
+
+/// Where an icon goes, in pixels, and in which screen.
+///
+/// Two separate reasons to have no answer, and the caller treats them the same: the
+/// cell names a monitor we have no window for, or the cell is outside the grid we
+/// reported for it. An icon with no cell at all never reaches here — the model says
+/// so by leaving `at` empty, and such an icon is real and simply not drawn.
+fn spot(grids: &[ipc::Geometry], cell: ipc::Cell) -> Option<(usize, f64, f64)> {
+    let index = grids.iter().position(|grid| grid.monitor == cell.monitor)?;
+    let geometry = grids[index];
+    if !geometry.fits(cell.slot()) {
+        return None;
+    }
+    let x = f64::from(u32::from(cell.col)) * f64::from(geometry.cell_w);
+    let y = f64::from(u32::from(cell.row)) * f64::from(geometry.cell_h);
+    Some((index, x, y))
+}
+
+/// Which cell of a grid a point in its own pixels falls in, or `None` when the point
+/// is outside it. A drop outside the grid is not a place, and the icon goes back
+/// where it was rather than to the nearest edge.
+fn slot_of(geometry: &ipc::Geometry, x: f64, y: f64) -> Option<DesktopSlot> {
+    let col = (x / f64::from(geometry.cell_w.max(1))).floor();
+    let row = (y / f64::from(geometry.cell_h.max(1))).floor();
+    // Finite first: `floor` of a NaN is a NaN, which is neither negative nor a
+    // number `try_from` would reject, and a pointer that reported no position
+    // should not place an icon in the corner of a screen.
+    if !col.is_finite() || !row.is_finite() || col < 0.0 || row < 0.0 {
+        return None;
+    }
+    let slot = DesktopSlot {
+        col: u16::try_from(col as i64).ok()?,
+        row: u16::try_from(row as i64).ok()?,
+    };
+    geometry.fits(slot).then_some(slot)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ui::tk;
+
+    /// An item with a cell, which is the only kind that gets drawn.
+    fn placed(kind: ipc::Kind, name: &str, monitor: u8, col: u16, row: u16) -> ipc::Item {
+        ipc::Item {
+            at: Some(ipc::Cell::new(monitor, DesktopSlot { col, row })),
+            ..ipc::Item::new(name, name, kind)
+        }
+    }
+
+    #[test]
+    fn a_grid_is_the_screen_divided_by_the_cell_an_icon_needs() {
+        let geometry = grid(0, 1920, 1080, THUMB_MIN);
+        let (cell_w, cell_h) = grid_reserve(THUMB_MIN);
+        assert_eq!(geometry.cell_w, cell_w);
+        assert_eq!(geometry.cell_h, cell_h);
+        assert_eq!(
+            geometry.columns,
+            (1920 / i32::try_from(cell_w).unwrap()) as u16
+        );
+        assert_eq!(
+            geometry.rows,
+            (1080 / i32::try_from(cell_h).unwrap()) as u16
+        );
+        assert!(geometry.usable(), "the provider refuses one that is not");
+    }
+
+    #[test]
+    fn a_grid_never_has_zero_cells_and_never_passes_the_caps() {
+        // Zero would be refused by the provider, and a screen that has not been
+        // configured yet is not a screen with no room on it.
+        assert_eq!(grid(0, 0, 0, THUMB_MIN).cells(), 1);
+        assert_eq!(grid(0, -4000, -4000, THUMB_MIN).cells(), 1);
+        let huge = grid(0, i32::MAX, i32::MAX, THUMB_MIN);
+        assert!(huge.columns <= ipc::MAX_COLUMNS);
+        assert!(huge.rows <= ipc::MAX_ROWS);
+        assert!(huge.usable());
+    }
+
+    #[test]
+    fn the_cell_grows_with_the_picture_the_model_asks_for() {
+        let small = grid(0, 1920, 1080, THUMB_MIN);
+        let large = grid(0, 1920, 1080, THUMB_MAX);
+        assert!(large.cell_w > small.cell_w);
+        assert!(large.columns < small.columns, "bigger icons, fewer columns");
+    }
+
+    #[test]
+    fn the_edge_is_clamped_into_the_band_the_provider_decodes_in() {
+        let model = |size| ipc::Model {
+            thumbnail_size: size,
+            ..ipc::Model::default()
+        };
+        assert_eq!(edge_for(&model(0)), THUMB_MIN);
+        assert_eq!(edge_for(&model(200)), 200);
+        assert_eq!(edge_for(&model(4096)), THUMB_MAX);
+        assert_eq!(grid_reserve(4096).0, THUMB_MAX + PAD);
+    }
+
+    #[test]
+    fn an_icon_lands_in_the_grid_its_cell_names_or_nowhere() {
+        // The second screen is tall rather than square: a cell is taller than it is
+        // wide by the height of a two-line label, and a 500 px square only has room
+        // for two rows, which is not enough to name a row at all.
+        let grids = vec![grid(0, 1000, 1000, THUMB_MIN), grid(1, 500, 800, THUMB_MIN)];
+        let item = placed(ipc::Kind::File, "b.txt", 1, 2, 3);
+        let (index, x, y) =
+            spot(&grids, item.at.expect("it has a cell")).expect("monitor 1 has a window");
+        assert_eq!(index, 1);
+        // Compared as whole pixels: a cell's offset is a product of integers, and
+        // asserting on it as a float would be testing the representation.
+        assert_eq!(x as i64, i64::from(grids[1].cell_w) * 2);
+        assert_eq!(y as i64, i64::from(grids[1].cell_h) * 3);
+        let gone = placed(ipc::Kind::File, "c.txt", 2, 0, 0);
+        assert!(
+            spot(&grids, gone.at.unwrap()).is_none(),
+            "no window for that monitor"
+        );
+        let past = placed(ipc::Kind::File, "d.txt", 0, grids[0].columns, 0);
+        assert!(
+            spot(&grids, past.at.unwrap()).is_none(),
+            "one past the last column is not a cell"
+        );
+    }
+
+    #[test]
+    fn a_drop_outside_the_grid_is_not_a_place() {
+        let geometry = grid(0, 1000, 1000, THUMB_MIN);
+        assert_eq!(
+            slot_of(&geometry, 1.0, 1.0),
+            Some(DesktopSlot { col: 0, row: 0 })
+        );
+        assert_eq!(
+            slot_of(&geometry, -1.0, 10.0),
+            None,
+            "a drag that left the top edge"
+        );
+        assert_eq!(
+            slot_of(&geometry, 1e9, 10.0),
+            None,
+            "a column far past the last"
+        );
+        assert_eq!(
+            slot_of(&geometry, f64::NAN, 10.0),
+            None,
+            "a pointer that reported no position"
+        );
+    }
+
+    #[test]
+    fn a_renderer_that_already_exists_means_we_do_not_paint() {
+        let status = ipc::StatusReply {
+            renderer: true,
+            ..ipc::StatusReply::default()
+        };
+        assert!(!should_paint(&status), "someone else owns the desktop");
+        assert!(
+            should_paint(&ipc::StatusReply::default()),
+            "nobody has asked, so nobody is drawing"
+        );
+    }
+
+    #[test]
+    fn the_grace_period_is_the_one_the_documents_promise() {
+        // docs/desktop-integration.md states the figure. A fallback that polls
+        // instead of waiting, or that waits long enough to be noticed, is a
+        // different design and should have to say so here too.
+        assert_eq!(GRACE, Duration::from_secs(2));
+    }
+
+    #[test]
+    fn the_desktop_is_its_own_application() {
+        // Sharing the window's id would make a desktop forward its activation to an
+        // open window and exit, which looks exactly like the feature doing nothing
+        // at all.
+        assert_ne!(DESKTOP_ID, super::super::APP_ID);
+    }
+
+    #[test]
+    fn every_request_names_the_method_the_bus_answers() {
+        // The provider refuses a call whose method does not match the body's own
+        // tag, so a mapping that drifts is a desktop that silently stops answering.
+        // The wire's kebab-case name and this CamelCase one have to agree for every
+        // request there is, which is why the expected names are written out here
+        // rather than computed from them.
+        let requests = [
+            (ipc::Request::Status, "Status"),
+            (ipc::Request::GetModel, "GetModel"),
+            (
+                ipc::Request::SetGeometry {
+                    monitors: vec![grid(0, 100, 100, THUMB_MIN)],
+                },
+                "SetGeometry",
+            ),
+            (
+                ipc::Request::Place {
+                    id: "a.txt".into(),
+                    monitor: 0,
+                    col: 1,
+                    row: 2,
+                },
+                "Place",
+            ),
+            (ipc::Request::Launch { id: "a.txt".into() }, "Launch"),
+            (ipc::Request::Reveal { id: "a.txt".into() }, "Reveal"),
+            (
+                ipc::Request::ContextMenu { id: "a.txt".into() },
+                "ContextMenu",
+            ),
+            (ipc::Request::Trash { id: "a.txt".into() }, "Trash"),
+            (
+                ipc::Request::RequestThumbnail {
+                    path: "/tmp/Desktop/a.txt".into(),
+                    size: THUMB_MIN,
+                },
+                "RequestThumbnail",
+            ),
+        ];
+        assert_eq!(requests.len(), 9, "a new request needs a method name");
+        for (request, method) in &requests {
+            assert_eq!(bus_method(request), *method);
+            assert_eq!(
+                camel(request.kind()),
+                *method,
+                "{} is sent by the wrong name",
+                request.kind()
+            );
+        }
+    }
+
+    /// The CamelCase form of a kebab-case method name.
+    fn camel(kind: &str) -> String {
+        kind.split('-')
+            .map(|part| {
+                let mut letters = part.chars();
+                match letters.next() {
+                    Some(first) => first.to_uppercase().collect::<String>() + letters.as_str(),
+                    None => String::new(),
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn an_icon_is_a_picture_a_name_and_a_button() {
+        tk::ui(|| {
+            let item = ipc::Item {
+                tooltip: Some("a note".into()),
+                ..ipc::Item::new("notes.txt", "Notes", ipc::Kind::File)
+            };
+            let grids: Rc<RefCell<Vec<ipc::Geometry>>> =
+                Rc::new(RefCell::new(vec![grid(0, 1000, 1000, THUMB_MIN)]));
+            let sent = Rc::new(RefCell::new(Vec::new()));
+            let send: Sender = {
+                let sent = Rc::clone(&sent);
+                Rc::new(move |request| sent.borrow_mut().push(request))
+            };
+            let painted = cell_widget(
+                &item,
+                i32::try_from(THUMB_MIN).unwrap(),
+                grid_reserve(THUMB_MIN).0,
+                grids,
+                send,
+            );
+            assert_eq!(painted.label.text(), "Notes");
+            assert!(painted.label.wraps());
+            assert_eq!(painted.label.lines(), LABEL_LINES);
+            assert_eq!(
+                painted.label.ellipsize(),
+                gtk::pango::EllipsizeMode::End,
+                "a long name has to be cut, not push the grid apart"
+            );
+            assert!(painted.button.has_css_class("ufm-cell"));
+            assert!(
+                !painted.button.can_focus(),
+                "a surface that cannot be focused should not offer a widget that can"
+            );
+            assert_eq!(painted.button.tooltip_text().as_deref(), Some("a note"));
+            assert_eq!(
+                painted.screen.get(),
+                usize::MAX,
+                "a widget that has not been placed says so"
+            );
+            assert!(sent.borrow().is_empty(), "building one asks for nothing");
+        });
+    }
+
+    #[test]
+    fn an_icon_with_no_icon_of_its_own_still_shows_something() {
+        // The fallback name comes from the model's own rule, so a desktop and a
+        // window cannot disagree about what an unknown file looks like.
+        for (kind, name) in [
+            (ipc::Kind::Directory, "folder"),
+            (ipc::Kind::File, "text-x-generic"),
+            (ipc::Kind::Launcher, "application-x-executable"),
+        ] {
+            let item = ipc::Item::new("x", "X", kind);
+            assert_eq!(item.icon_name(), name);
+        }
+    }
+}

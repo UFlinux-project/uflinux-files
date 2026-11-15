@@ -144,21 +144,41 @@ never links it either way: it has no window to place on a layer.
 ## Fallback without a renderer
 
 If no renderer claims the interface, the desktop has no icons and no error: the provider
-answers `Status` with `renderer: false` and waits. The intended answer is for the file
-manager to draw the grid itself, in a layer-shell window of its own, behind the
+answers `Status` with `renderer: false` and waits. The answer for that case is the file
+manager drawing the grid itself, in a layer-shell window of its own, behind the
 `desktop-icons` feature — an extra build flag rather than a second package, so the
-feature works on any compositor while the default install pays nothing for it.
+feature works on any compositor while the default install pays nothing for it. Run it as
+`uflinux-files --desktop-icons`; a build without the feature refuses the flag by name and
+exits `2` rather than opening an ordinary window and looking like it worked.
 
-**That fallback is not implemented.** What exists today is the dependency, the feature,
-and the `renderer: false` answer that a shell or a person can act on. The reason for
-saying so here rather than describing the window as if it were built: the check that
-would catch a missing renderer is a check on `Status`, and a reader who believed the
-fallback existed would look for a bug in the provider instead of a missing feature in the
-UI. The 2 s figure below is what the fallback is specified to wait, not a timer that runs.
+It is a fallback and not a second shell, so it implements the four steps above and
+deliberately stops there. One `gtk::Window` per monitor, at `Layer::Background` with all
+four anchors and `KeyboardMode::None` — the same layer the panel already uses, so no new
+surface type appears. `Status` is asked **once** per session, because the provider's
+answer means only "has anything been asked of me yet": asking twice would tell the second
+question yes. If the answer is that a renderer is there, this process exits; if it is
+that nobody is, it waits two seconds and asks to take over, so a shell that is still
+starting wins without anything having to poll. Grids are reported from each surface's own
+allocation once it is mapped rather than from the monitor geometry, which is what makes a
+panel's exclusive zone subtract itself for free, and they are recomputed on
+`monitors-changed`. Columns are capped by the protocol's column cap and rows by its row
+cap separately; they differ by eight times, because a screen is wide and short, and one
+cap for both would report a grid the provider is entitled to refuse.
 
-The timeout is specified as a timeout and not a poll: the provider starts on the bus's
-demand, and a shell that is still starting should win without the file manager having
-committed to painting a desktop it will have to stop painting.
+Input is what a background surface can actually receive: double-click `Launch`,
+right-click `ContextMenu`, drag-end `Place` inside the monitor the drag started on.
+`Changed` is the only signal subscribed to, and a generation already drawn is ignored;
+`Progress` is left alone, since a spinner needs a focusable surface and this one has
+none. Thumbnails are asked for every icon drawn rather than only the visible ones, which
+is the one place the fallback is lazier-looking than the contract asks for — the reason
+is that it has no scrolling, so "visible" and "drawn" are the same set here. What it does
+not have: marquee selection, keyboard navigation, a drag image, cross-monitor drag, or a
+live view. The keyboard is out because a surface that never takes focus receives no
+key events, and pretending otherwise would mean stealing focus from the panel.
+
+The 2 s figure is a timeout and not a poll: the provider starts on the bus's demand, and
+a shell that is still starting should win without the file manager having committed to
+painting a desktop it will have to stop painting.
 
 ## Cost
 
@@ -166,3 +186,13 @@ The model is tens of items and every field a renderer skips when absent is skipp
 the wire. The one payload that could be large — a thumbnail — travels as a file
 descriptor. Budget: **≤12 MiB added inside `uflinux-desktop` for 200 icons** with
 thumbnails off, and ≤10 MiB for the provider process.
+
+The fallback pays for being a process of its own. Measured in a release build in the SDK
+container, with headless `labwc`, the Cairo renderer and 200 icons on one screen: **57
+MiB** proportional for the fallback, of which the widget tree is a small part — it is a
+GTK4 process with a GL driver loaded, which is exactly what the provider was moved out of
+(see `docs/memory-budget.md`), and the provider alongside it measures 3.1 MiB. With the GL
+renderer instead of Cairo the same process is 156 MiB, the same multiple the window costs
+for the same reason. That number is why the fallback is a flag and not the default: on a
+machine where `uflinux-desktop` is running, which is every UFlinux session, it asks once,
+sees a renderer, and exits without ever mapping a surface.

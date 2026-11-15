@@ -41,6 +41,7 @@ fn main() -> ExitCode {
         }
         Ok(cli::Command::Sweep(options)) => sweep(&options),
         Ok(cli::Command::Connect(options)) => connect(options),
+        Ok(cli::Command::Desktop) => desktop(),
         Ok(cli::Command::Ui(options)) => ui(&options),
         Err(usage) => {
             eprintln!("uflinux-files: {usage}");
@@ -162,4 +163,27 @@ fn verb(action: &Action) -> &'static str {
 /// of the program.
 fn ui(options: &cli::Ui) -> ExitCode {
     ui::run(options)
+}
+
+/// Draw the desktop. See [`cli::Command::Desktop`] for why this is a mode of a
+/// window program rather than a third binary, and [`ui::desktop`] for what it
+/// costs to find out that nobody wanted it drawn.
+#[cfg(feature = "desktop-icons")]
+fn desktop() -> ExitCode {
+    ui::desktop::run()
+}
+
+/// The same command in a build without the feature, refused by name.
+///
+/// The flag is parsed in every build, so the failure is "this build does not have
+/// that" and not "that is not an option", which is the difference between a
+/// package that needs rebuilding and a script with a typo in it. Exit code 2 is
+/// the one this program already uses for a command line it cannot act on.
+#[cfg(not(feature = "desktop-icons"))]
+fn desktop() -> ExitCode {
+    eprintln!(
+        "uflinux-files: this build has no desktop icons; it needs the `desktop-icons` \n\
+         feature, which pulls in gtk4-layer-shell. Nothing was drawn."
+    );
+    ExitCode::from(2)
 }

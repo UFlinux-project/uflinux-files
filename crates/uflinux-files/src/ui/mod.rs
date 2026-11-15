@@ -27,7 +27,14 @@ mod columns;
 mod computer;
 mod conflict;
 mod connect;
+// The desktop we paint ourselves when no shell claims the renderer interface. Not
+// compiled by default: the feature pulls in gtk4-layer-shell, and a build without
+// it still parses `--desktop-icons` and refuses it by name. Reachable from `main`
+// rather than from an activation of the window's application, which is why it is
+// `pub(crate)` and not plain `mod`.
 mod css;
+#[cfg(feature = "desktop-icons")]
+pub(crate) mod desktop;
 mod extract;
 mod job;
 mod jobs;

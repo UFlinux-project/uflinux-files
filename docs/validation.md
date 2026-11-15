@@ -21,6 +21,12 @@ and graphene-sys, which need `pkg-config` to find GTK4, and `-p uflinux-files-pr
 needs `glib-dev`. Packaging builds `--workspace` inside the Alpine chroot where those
 exist.
 
+Where GTK4 is available, `test` and `clippy` run **twice**: once on the default feature
+set, and once with `--features uflinux-files/desktop-icons`. The reason is that the
+feature defaults to off, so a plain `--workspace` run never compiles the fallback
+renderer at all and would stay green while it stopped building — and it is the build the
+image ships.
+
 Clippy runs at `pedantic` level with `-D warnings` in CI. The allows are narrow and
 each one is a decision, not a convenience: `cast_possible_truncation` and friends for
 sizes that are bounded by construction, `missing_errors_doc` because a `Result` whose
@@ -54,6 +60,7 @@ no rows at all, which opens no popover. |
 | `ufm-core` (stars) | a star list round-trips through its file and a half-written file is read as empty rather than as an error; starring is idempotent and does not re-order, so a row does not jump to the top of the collection because the action fired twice; `toggle` reports the state afterwards, which is what makes the two directions agree; stamping *sets* a row's flag, so a listing stamped against an empty list has every badge taken off and an un-star is visible without a re-read; `forget` drops only the locations a discard destroyed and leaves a trashed row alone; `prune` and `prune_under` drop a star whose folder is gone, including one nested below it; a corrupt or newer-version file is replaced rather than trusted. |
 | `ufm-core` (bookmarks) | a bookmark list round-trips through its file, including a location that is an archive inside an archive; `add` dedupes by location rather than by label, so bookmarking a folder twice cannot produce two rows; `find` answers with a position by the same comparison `add` dedupes by, so the title-bar toggle and a row's menu cannot disagree about whether a folder is bookmarked; `rename` replaces a name and treats a blank one as no name, which is how a row gets its folder's own name back, and says when there was nothing to rename; `move_item` reorders and ignores a destination that is out of range or already where the row is; a list with an unparseable file behind it is an error rather than a silent reset to empty. |
 | `uflinux-files-provider` | the crate does not depend on GTK, checked against its own manifest; the bus name is taken through the C entry point whose handlers are nullable, not the gio-rs wrapper that aborts at logout; the polling deadline is longer than the timer that checks it; a missing login session is refused before the bus is asked for. |
+| `uflinux-files` (desktop icons, `--features desktop-icons`) | the grid a screen becomes: a monitor divided by the cell an icon needs, never zero cells and never past the protocol's caps — columns by the column cap and rows by the row cap, which differ by eight times; the cell grows with the picture the model asks for, clamped into the band the provider decodes in; an icon lands in the grid its cell names and nowhere else, and a drop outside a grid is not a move; every request names the bus method that answers it, so a renamed variant cannot silently aim at the wrong one; a renderer already there means no desktop is drawn; the grace period is the one the documents promise; the desktop is its own application id, so it cannot be the file manager's single instance; an icon is a picture, a name and a button, and one with no icon of its own still shows something. |
 
 ## Archives
 
@@ -167,14 +174,23 @@ tests/provider-bus.sh target/debug/uflinux-files-provider
 With no session bus around — which is the case in a build chroot or a container — it
 starts a private one for itself, so it needs `dbus-run-session` and `gdbus` either way.
 It exits non-zero on the first answer that is not what the protocol says, so it chains
-onto the test run rather than being read by a person.
+onto the test run rather than being read by a person. It is run by hand and by the
+packaging image today, not by `cargo test`: nothing in the workspace shells out to it.
+
+The other half of the feature — the renderer that draws when nobody else does — is
+covered by the UI harness below rather than here, because what has to be seen is a
+surface appearing on a compositor. `tests/provider-bus.sh` says nothing about it, and
+`Status.renderer` is asserted from the provider's side only: the check that a first call
+reports `false` and a later one `true` is the check that the flag means "has anything
+been asked", which is the whole of what the fallback can act on.
 
 ## UI
 
 `tests/files-ui-smoke.sh` brings up its own headless `labwc` (headless backend, pixman
 renderer — no GPU, no X) and its own session bus, and runs the real binary under it. The
 binary is the first argument; if a `uflinux-searchd` sits beside it, or is named in
-`UFLINUX_SEARCHD_BIN`, the indexer is exercised too. Anything missing — `labwc`, `grim`,
+`UFLINUX_SEARCHD_BIN`, the indexer is exercised too, and if a `uflinux-files-provider`
+sits beside it the desktop is exercised too. Anything missing — `labwc`, `grim`,
 `gdbus`, the AT-SPI typelib — makes it print a `SKIP` line and exit 0, so a build host
 with no compositor is not read as a broken program.
 
@@ -234,9 +250,21 @@ window in the same instance, opened on a folder the first is not looking at, add
 of its own without losing the one the first window wrote and removes it again without the
 first window's copy putting it back; a window answers `close` over the bus and disappears;
 a second invocation opens a `Computer` window in the running instance; `--new-window` opens
-a window rather than focusing an open one; and the indexer answers `Status` on the bus.
+a window rather than focusing an open one; the desktop is drawn by whoever is there; and
+the indexer answers `Status` on the bus.
 The prompt is driven through the accessibility tree, by the `probe`'s `press` command,
 which activates a node by name — the same controller path a mouse click takes.
+
+The desktop check accepts two answers, and that is deliberate rather than weak. The
+fallback renderer sits behind a feature that defaults to off, so the same script has to be
+correct against a build that links `gtk4-layer-shell` and one that does not. It starts a
+provider, leaves it alone — the provider answers `renderer` from the single question it can
+ask itself, so probing it first would tell the fallback a shell is drawing and it would
+correctly stand down — and then runs `--desktop-icons`. Either an undecorated background
+frame appears in the tree holding one button and one label per icon the provider listed, or
+the process exits `2` having named the feature it was built without. What is asserted in
+both branches is that no ordinary window opened: a flag that silently fell back to opening
+a file manager would look like a success to every check above this one.
 
 The cross-window pair is the reason the second window is opened on the archive's folder
 rather than on the folder already on screen: it holds a row, `bundle.tar`, that no other
@@ -367,7 +395,7 @@ how it was always checked, and now as a sidebar row too, since a check that some
 left is only worth what the check was worth that it arrived — and then re-read after
 Forget, where its row, its card and the count in its status bar are all asserted to have
 followed the file. The bar matters as much as the widgets beside it: it counts cards, so
-a flow rebuilt down to two with `3 items` still printed over it is the same mistake as a
+a flow rebuilt down to three with `4 items` still printed over it is the same mistake as a
 row left standing over a share that is gone. Four checks, all of them about a window that
 never received a keypress.
 

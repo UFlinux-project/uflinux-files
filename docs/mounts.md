@@ -250,7 +250,7 @@ somebody else detached is not moved either; it keeps its folder and loses its
 cache.
 
 The card flow and the status bar are repainted together. The count in the bar
-counts cards, so repainting cards alone would leave `3 items` printed over two.
+counts cards, so repainting cards alone would leave `4 items` printed over three.
 
 ## Cleaning up: `--sweep-mounts`
 

@@ -116,6 +116,30 @@ box.ufm-open-with button {
 box.ufm-preview {
     min-width: 320px;
 }
+/* The desktop we paint ourselves. The surface has to be transparent or the
+   wallpaper sits behind an opaque grey rectangle, which is a worse desktop than the
+   blank one this replaces — and GTK gives a window an opaque background from the
+   theme, so it has to be taken away at the root of the tree rather than on the
+   cells. The class is on the window and the container is matched as its child, so
+   one rule covers both nodes without a second class to keep in step. */
+window.ufm-desktop,
+window.ufm-desktop > fixed {
+    background-color: transparent;
+}
+/* Over a wallpaper the theme's hover colour may be invisible or may be a solid
+   block; either way it was chosen for a window, not for a desktop. The name needs
+   to stay legible whatever is behind it, and a shadow is cheaper than a plate
+   behind every label — cheaper in memory, which is the point of this feature, and
+   cheaper to draw, which is the point of the machine it runs on. */
+window.ufm-desktop button.ufm-cell {
+    background-color: transparent;
+}
+window.ufm-desktop button.ufm-cell:hover {
+    background-color: alpha(currentColor, 0.12);
+}
+window.ufm-desktop label.ufm-name {
+    text-shadow: 0 1px 2px alpha(black, 0.8);
+}
 ";
 
 /// Install the stylesheet for the current display.
@@ -169,6 +193,12 @@ mod tests {
             "ufm-mono",
             "ufm-open-with",
             "ufm-preview",
+            // Set only by the feature-gated desktop module. It is in this list
+            // whatever the feature set, because the rule above is compiled either
+            // way and a rule that no build ever uses is exactly what this test is
+            // for — the check here is that the class is named by the crate, which
+            // it is, and not that every build of it has a widget to show.
+            "ufm-desktop",
             "ufm-grid",
             "ufm-list",
             "ufm-row",
