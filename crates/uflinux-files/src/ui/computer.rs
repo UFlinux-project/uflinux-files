@@ -350,6 +350,12 @@ fn build(card: &Card, hooks: &Rc<Hooks>) -> gtk::FlowBoxChild {
     child.set_child(Some(&body));
     child.set_tooltip_text(Some(&card.detail));
     child.set_sensitive(card.can_open);
+    // Same reason as the sidebar rows: the flow child is the thing a screen
+    // reader lands on and activates, and a card whose name lives only on the
+    // label inside it is an anonymous list item. The label property is the
+    // explicit name, so it wins over whatever a walk of the subtree would
+    // have collected.
+    child.update_property(&[gtk::accessible::Property::Label(&card.label)]);
     let slot = RefCell::new(card.can_open.then_some(card.id.clone()));
     unsafe { child.set_data::<RefCell<Option<CardId>>>(SLOT, slot) };
     child

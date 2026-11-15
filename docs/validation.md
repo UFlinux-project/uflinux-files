@@ -204,11 +204,25 @@ all. So the checks count occurrences where a phrase is shared (two `free of` lin
 the sidebar and a card, one means only the sidebar) and match on a tab-delimited node
 name where it is not. The window is also checked for the absence of the phrase that the
 bug printed: `not a valid location`, both in the tree and in the process's own output.
-Driving this window rather than pressing the sidebar's `Computer` row is a limitation of
-the probe worth recording: a sidebar row's accessible name sits on the `label` inside it,
-so `press Computer` activates the label, which is a no-op, and the row never fires
-`row-activated`. A row that should carry its place's name as its own accessible name is
-the real fix, and until then the second invocation is the route that reaches the view.
+The view is reached by a second invocation rather than by pressing the sidebar's
+`Computer` row, and that is a limit of GTK's accessibility model rather than of the
+probe: the AT-SPI bridge exposes a `list item` — a `ListBoxRow` or a `FlowBoxChild` —
+with an action list of zero entries, so there is nothing for `press` to activate and a
+row is reachable only by keyboard. What the tree does say about the rows is checked
+directly. Both a sidebar row and a card now set `accessible::Property::Label` on
+themselves, and the checks assert the resulting shape: a `list item` whose name is
+exactly `Home` and whose states include `focusable`, and a `table cell` whose name is
+exactly `Home` rather than a name built some other way. Setting that property matters
+because of what GTK does without it, which the same dump makes visible: a container with
+no explicit name is named by concatenating every label in its subtree, so an unnamed card
+announced itself as `Home /tmp/h 0.86545 125 GiB free of 929 GiB` — a drive's name, its
+mount point, a usage fraction and a capacity fused into one string that changes as the
+numbers change. With the property set, the name is the drive and the capacity is a
+`label` node below it. The third check guards that from the other side: the phrase
+`free of` must appear as a `label` node and must *not* appear inside a `table cell`'s
+name, so neither deleting the capacity line nor reverting to a concatenated name passes.
+The first two checks were confirmed to fail against a build with the two
+`update_property` calls stashed out, so they test the property rather than the fixture.
 
 The properties checks are the reason the probe's `press` takes an optional frame name. A
 folder window's titlebar carries a button labelled `Close`, and a depth-first walk from

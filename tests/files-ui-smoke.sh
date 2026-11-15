@@ -1119,6 +1119,47 @@ else
     ok "opening Computer logs no reader error"
 fi
 
+# --- the sidebar row and the card carry their own name ------------------------------
+# Both are list items, and until the name was set on the item itself an AT client
+# saw an anonymous row with a label somewhere inside it: nothing to announce, and
+# nothing to tell one row from the next. The way to see the difference is to ask
+# for the item by role and name together, which is what a screen reader reads.
+#
+# The Computer window is the one to ask, because it holds both halves: the sidebar
+# and the cards. Read from its own subtree, so a row in the other window's sidebar
+# cannot stand in for the one being checked.
+PFRAME=$(python3 "$A11Y" dump-frame Computer 2>/dev/null || true)
+if printf '%s\n' "$PFRAME" | grep -qF "$(printf 'list item\tHome\t')"; then
+    case $(printf '%s\n' "$PFRAME" | grep -F "$(printf 'list item\tHome\t')" | head -1 | cut -f3) in
+    *focusable*) ok "a sidebar row is a named item that can take focus" ;;
+    *) fail "a sidebar row is a named item that can take focus (states: $(printf '%s\n' "$PFRAME" | grep -F "$(printf 'list item\tHome\t')" | head -1 | cut -f3))" ;;
+    esac
+else
+    fail "a sidebar row is a named item that can take focus (no list item named 'Home')"
+fi
+# A card is named after the thing it stands for. Without an explicit name GTK
+# collects the text of the whole subtree, which announced the drive as
+# "Home /tmp/h 0.86545 125 GiB free of 929 GiB" — the capacity read out twice,
+# the fraction read out as a number, and no way to tell two drives apart before
+# the sentence ended. An exact-name match is what says the label won.
+if printf '%s\n' "$PFRAME" | grep -qF "$(printf 'table cell\tHome\t')"; then
+    ok "a card is named for its drive rather than for every label inside it"
+else
+    fail "a card is named for its drive rather than for every label inside it"
+fi
+# The capacity has not been hidden, only moved: it has to be a node of its own
+# that a reader reaches after the name, and not part of the card's name. Both
+# halves are needed, since dropping the capacity line would satisfy the first
+# half by having nothing to find. The sidebar's usage bar renders the same
+# phrase, so what is ruled out here is the phrase inside a card's name rather
+# than the phrase anywhere in the window.
+if printf '%s\n' "$PFRAME" | grep -qE "$(printf '^label\t')[^\t]*free of" \
+    && ! printf '%s\n' "$PFRAME" | grep -qE "$(printf '^table cell\t')[^\t]*free of"; then
+    ok "the capacity is a line of its own rather than part of a card's name"
+else
+    fail "the capacity is a line of its own rather than part of a card's name"
+fi
+
 # --- --new-window really is a separate process --------------------------------------
 # Before: however many frames the primary has. After: one more, from a process that gave
 # up being the single instance so it would not just focus the window already open.

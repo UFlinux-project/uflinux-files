@@ -255,6 +255,17 @@ mount dialog uses, and reports through `Event::Unmounted`, which is also what
 repaints the cards: the view and the mount table are kept in step by the same
 event that keeps the sidebar in step.
 
+A card sets its own accessible name, and so does a sidebar row, for a reason that is
+only visible from outside the process. GTK names a container that has no explicit name
+by concatenating every label in its subtree, which for a card means the drive, its
+mount point, a usage fraction and a capacity fused into one announcement that changes
+as the numbers change. `accessible::Property::Label` on the `FlowBoxChild` — and on
+the `ListBoxRow` in `ui/panel.rs`, which has the same shape and the same problem —
+replaces that with the one string a reader needs, and leaves the rest as separate
+nodes below it. Neither widget can be activated through AT-SPI either way: the bridge
+gives a `list item` an empty action list, so rows are activated by keyboard and the
+name is there to be read rather than to be pressed.
+
 `recent://` is the other collection that is not a directory, and it is deliberately
 the boring case: `recently-used.xbel` is parsed into a list of paths, each one is
 `stat`ed through the reader the window already has, and the result is handed to the

@@ -355,6 +355,13 @@ impl Panel {
         row.add_css_class("ufm-place");
         row.set_child(Some(&box_));
         row.set_activatable(true);
+        // The row is what a screen reader reaches and activates, so the
+        // place's name has to live on the row itself. A name carried only by
+        // the label inside leaves the list item anonymous: assistive tech
+        // announces "list item" with nothing to say, and an AT client
+        // activating the row activates the label, which does nothing.
+        let name = place.label();
+        row.update_property(&[gtk::accessible::Property::Label(&name)]);
         row
     }
 
