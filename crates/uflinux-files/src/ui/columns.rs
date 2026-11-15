@@ -331,6 +331,19 @@ impl Columns {
         }
     }
 
+    /// Re-apply the star list to every pane's rows and draw them again. The
+    /// columns keep their own cached listings, so a star changed elsewhere has to
+    /// reach the badges here — a badge in a parent column is the only way to see
+    /// which folders further up the path hold a starred row.
+    pub fn restamp(&self, starred: &ufm_core::Starred) {
+        for pane in self.inner.panes.borrow().iter() {
+            for row in pane.store.iter::<Row>().filter_map(Result::ok) {
+                row.restamp(starred);
+            }
+        }
+        self.rebind();
+    }
+
     /// Put one delivered listing in the pane that asked for it. Events for
     /// folders that are not on screen are ignored rather than queued: a pane
     /// the user has scrolled past will ask again if it becomes relevant.

@@ -17,12 +17,14 @@ pub mod error;
 pub mod location;
 pub mod paths;
 pub mod sort;
+pub mod starred;
 
 pub use config::{DesktopSlot, Preferences};
 pub use entry::{Entry, EntryFlags, EntryKind};
 pub use error::{Error, Result};
 pub use location::Location;
 pub use sort::{SortField, SortKey};
+pub use starred::{Star, Starred};
 
 /// Tests that change the process environment have to hold this, because
 /// `set_var` is unsafe in edition 2024 precisely because another thread may be

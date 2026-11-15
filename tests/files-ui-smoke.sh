@@ -78,7 +78,12 @@ mkdir -p "$HOME" "$XDG_DATA_HOME" "$ROOT/tree/alpha/one" "$ROOT/tree/alpha/two" 
 # a folder of two entries, so the count the status line has to say is unchanged.
 printf kept >"$ROOT/tree/one/keep.txt"
 printf new >"$ROOT/tree/alpha/one/arrived.txt"
-export HOME XDG_DATA_HOME
+# The star list goes under `$XDG_CONFIG_HOME`, and naming it here rather than
+# leaving it to default from `HOME` is what makes the file's path below a fact of
+# the fixture rather than a guess about the default. It points inside the home
+# this script already threw away, so starring leaves nothing behind.
+XDG_CONFIG_HOME=$HOME/.config
+export HOME XDG_DATA_HOME XDG_CONFIG_HOME
 # The path the window opens on. Two entries, so the status line has a number to say.
 TARGET=$ROOT/tree/alpha
 
@@ -177,6 +182,21 @@ has_frame() {
         sleep 0.2
     done
     fail "$2 (no window titled '$1')"
+}
+
+# A window whose title is NAME is gone. The other half of `has_frame`, needed
+# when a check below counts windows and an earlier one has to stop counting.
+wait_no_frame() {
+    i=0
+    while [ "$i" -lt 50 ]; do
+        refresh
+        if ! printf '%s\n' "$DUMP" | grep -qF "$(printf 'frame\t%s\t' "$1")"; then
+            return 0
+        fi
+        i=$((i + 1))
+        sleep 0.2
+    done
+    return 1
 }
 
 # The states field of the first node named NAME, or empty.
@@ -739,7 +759,7 @@ fi
 # because the window is standing on an ordinary folder. The two together are the point of
 # the assertion: the rows track what the window can actually do right now, which is also
 # what keeps the header menu honest.
-want=$(printf '%s\n' - Shift+Control+N F2 Delete Shift+Delete Control+C Control+X Control+V Alt+Enter | sort)
+want=$(printf '%s\n' - Shift+Control+N Control+T F2 Delete Shift+Delete Control+C Control+X Control+V Alt+Enter | sort)
 got=$(python3 "$A11Y" menu 2>/dev/null | sort)
 if [ "$got" = "$want" ]; then
     ok "the menu holds exactly the rows for one folder, each carrying its chord"
@@ -1063,6 +1083,87 @@ if python3 "$A11Y" type note >/dev/null 2>&1; then
     fi
 else
     fail "the search field takes the text typed into it"
+fi
+
+# --- the star -----------------------------------------------------------------
+# The star list is a file, the badge is drawn from it, and the collection is
+# assembled from it, so what is worth asserting end to end is that the file
+# appears, that a window pointed at `starred://` shows the row it names, and that
+# the same command takes the star back off. What the menu flips its label to —
+# "Unstar" — is the popup's own decision and is covered by that module's tests; a
+# menu row exposes its chord to an AT client rather than its text, so the tree
+# here cannot tell the two rows apart even though a user can.
+#
+# The row starred is the plain file the Open With checks created, which is also
+# the only row the search filter left on screen.
+python3 "$A11Y" select note.txt >/dev/null 2>&1 || :
+act star "[]" "[]"
+STAR_FILE=$XDG_CONFIG_HOME/uflinux/filemanager/starred.json
+i=0
+while [ "$i" -lt 50 ] && [ ! -f "$STAR_FILE" ]; do
+    i=$((i + 1))
+    sleep 0.2
+done
+if [ -f "$STAR_FILE" ] && grep -qF "$TARGET/note.txt" "$STAR_FILE"; then
+    ok "starring a row writes it to the star list"
+else
+    fail "starring a row writes it to the star list (no '$TARGET/note.txt' in $STAR_FILE)"
+fi
+# The collection, in a process of its own rather than in this one. A window in the
+# primary instance would hold the copy of the list that instance loaded, which is
+# true and worth knowing but is not what the collection is being asked here:
+# whether a list read from disk becomes rows.
+STAR_LOG=$ROOT/starred.log
+"$BIN" --new-window starred:// >"$STAR_LOG" 2>&1 &
+STAR=$!
+has_frame "Starred" "starred:// opens the collection"
+SFRAME=$(python3 "$A11Y" dump-frame Starred 2>/dev/null || true)
+if printf '%s\n' "$SFRAME" | grep -qF "$(printf '\tnote.txt\t')"; then
+    ok "the collection shows the starred row"
+else
+    fail "the collection shows the starred row (no row named 'note.txt')"
+fi
+# The count, which the collection has to say itself: it is assembled from the
+# store rather than read from a folder, so nothing else in the window knows how
+# many rows there are.
+if printf '%s\n' "$SFRAME" | grep -qF "$(printf '\t1 item\t')"; then
+    ok "the collection says how many rows it holds"
+else
+    fail "the collection says how many rows it holds"
+fi
+# The collection window closes before what follows rather than staying open. It
+# is a process of its own, and a process started with `--new-window` never owns
+# the bus name, so its actions are not reachable over D-Bus at all — and the row
+# picker finds a node by name across every window, which with two of them
+# holding `note.txt` is a coin toss.
+kill "$STAR" 2>/dev/null || :
+if ! wait_no_frame "Starred"; then
+    fail "the collection window would not close"
+fi
+# The same command again, on the same row, now that the collection is out of the
+# way. Starring is a toggle rather than two commands, so a second press has to
+# leave the list without the row in it — and the file has to be rewritten, not
+# merely left alone.
+python3 "$A11Y" select note.txt >/dev/null 2>&1 || :
+act star "[]" "[]"
+if [ -f "$STAR_FILE" ] && grep -qF "$TARGET/note.txt" "$STAR_FILE"; then
+    fail "the same command takes the star back off (the row is still listed)"
+else
+    ok "the same command takes the star back off"
+fi
+# An empty collection says so rather than showing a blank pane, which is the
+# difference between "nothing starred yet" and a window that looks broken. Asked
+# of a fresh process, so that nothing is left over from the list read above.
+"$BIN" --new-window starred:// >"$ROOT/starred2.log" 2>&1 &
+STAR2=$!
+if wait_named "Nothing starred yet"; then
+    ok "an empty collection says so"
+else
+    fail "an empty collection says so (no banner)"
+fi
+kill "$STAR2" 2>/dev/null || :
+if ! wait_no_frame "Starred"; then
+    fail "an empty collection says so (its window would not close)"
 fi
 
 # --- a second location opens a window in the running instance -----------------------

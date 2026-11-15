@@ -358,6 +358,12 @@ impl Location {
 
     /// Whether `self` is `ancestor` or lives inside it. Compares normalized
     /// forms, so this is safe for a "may this window navigate here" check.
+    ///
+    /// An archive location counts as inside its own container, stated either way:
+    /// as the archive root (`archive:///t/a.zip!/`), and as the plain file the
+    /// container is on disk (`file:///t/a.zip`). The second case is what makes
+    /// "is this inside the thing being deleted" answer correctly for a starred
+    /// member of an archive — the container is the only storage the member has.
     #[must_use]
     pub fn is_within(&self, ancestor: &Self) -> bool {
         match (self, ancestor) {
@@ -376,6 +382,7 @@ impl Location {
                             .strip_prefix(ai.as_str())
                             .is_some_and(|rest| rest.starts_with('/')))
             }
+            (Self::Archive { archive, .. }, Self::File { path }) => archive == path,
             (Self::Search(mine), Self::Search(theirs)) => mine == theirs,
             (Self::Virtual(mine), Self::Virtual(theirs)) => mine == theirs,
             _ => false,

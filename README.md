@@ -24,6 +24,12 @@ the model over D-Bus and never opens a window.
   and whether the share is still there, with a Disconnect button on the ones that
   can be. It is a fourth presentation rather than a fourth reader — there is no
   directory behind it to read.
+- **Stars**: `<Ctrl>T` puts a star on the selected rows and takes it off the ones
+  that already have one. The list is a file, not an extended attribute — nothing
+  on disk says a row was starred — so the badge on an icon is drawn from it and
+  `starred://` is assembled from it, most recent first. A star whose folder is
+  deleted goes with it; one whose share is simply unmounted is listed as
+  unavailable rather than dropped.
 - **Archives as folders**: zip, tar and its codecs, and 7z open like a directory
   and unpack with `<Ctrl>E` into a folder named after them. Read-only browsing
   plus extract; no write-back.

@@ -211,6 +211,20 @@ fn is_within_covers_both_kinds() {
 }
 
 #[test]
+fn an_archive_member_is_within_its_own_container() {
+    // The container stated as a plain file, which is how a delete names it: the
+    // member has no storage apart from the container, so deleting the container
+    // has to count as deleting the member.
+    let container = Location::file("/t/a.zip");
+    assert!(parse("archive:///t/a.zip!/x/y").is_within(&container));
+    assert!(parse("archive:///t/a.zip!/").is_within(&container));
+    assert!(!parse("archive:///t/a.zip.old!/x").is_within(&container));
+    // The other direction does not hold: a folder on disk is not inside a
+    // container that happens to share its name.
+    assert!(!container.is_within(&parse("archive:///t/a.zip!/")));
+}
+
+#[test]
 fn file_name_is_the_leaf() {
     assert_eq!(Location::file("/a/b").file_name(), Some("b"));
     assert_eq!(Location::file("/").file_name(), None);

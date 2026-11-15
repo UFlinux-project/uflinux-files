@@ -22,7 +22,7 @@ use gtk::prelude::*;
 use gtk::{gio, pango};
 
 use ufm_core::config::ViewMode;
-use ufm_core::entry::Entry;
+use ufm_core::entry::{Entry, EntryFlags};
 use ufm_core::sort::{SortField, SortKey, sort_entries};
 
 use super::popup::{self, ContextHandler, Listeners};
@@ -357,6 +357,19 @@ impl View {
         self.store.splice(0, self.store.n_items(), &rows);
     }
 
+    /// Re-apply the star list to the rows already on screen and draw them again.
+    ///
+    /// A star is not a fact the filesystem holds, so re-reading the folder cannot
+    /// settle it and the rows have to be updated where they stand. The listings
+    /// the window keeps are stamped by the caller, which owns them; this covers
+    /// the model, whose rows are the ones actually drawn.
+    pub fn restamp(&self, starred: &ufm_core::Starred) {
+        for row in self.store.iter::<Row>().filter_map(Result::ok) {
+            row.restamp(starred);
+        }
+        self.rebind();
+    }
+
     #[must_use]
     pub fn selected(&self) -> Vec<Entry> {
         self.selected_rows().iter().map(Row::entry).collect()
@@ -578,10 +591,15 @@ pub(super) fn grid_factory(
         let image = gtk::Image::new();
         image.set_pixel_size(size.get());
         image.set_halign(gtk::Align::Center);
+        let icon = star_overlay(&image, size.get());
         let label = name_label();
         label.set_justify(gtk::Justification::Center);
         label.set_xalign(0.5);
-        cell.append(&image);
+        // The overlay rather than the image is what sits in the cell, so the
+        // centring has to stay on the image: an overlay sizes itself to its
+        // child and passes the child's alignment on.
+        icon.set_halign(gtk::Align::Center);
+        cell.append(&icon);
         cell.append(&label);
         item.set_child(Some(&cell));
         popup::attach(&cell, item, true, &on_press);
@@ -593,17 +611,70 @@ pub(super) fn grid_factory(
         let Some(row) = item.item().and_then(|object| object.downcast::<Row>().ok()) else {
             return;
         };
-        let (image, label) = parts(item.child().as_ref());
-        if let Some(image) = image {
+        let found = parts(item.child().as_ref());
+        if let Some(image) = found.icon {
             image.set_pixel_size(icon_size.get());
             image.set_icon_name(Some(&row.icon_name()));
             thumbs.request(&image, &row, icon_size.get());
         }
-        if let Some(label) = label {
+        if let Some(label) = found.label {
             label.set_text(&row.name());
         }
+        paint_badge(found.star.as_ref(), &row, icon_size.get());
     });
     factory
+}
+
+/// The icon of a row, with a star laid over its corner.
+///
+/// An overlay rather than a box because the star belongs to the icon and not
+/// beside it: a row's height is set by the icon, and a sibling in a box would
+/// make a starred cell taller than its neighbours in the same grid.
+fn star_overlay(image: &gtk::Image, size: i32) -> gtk::Overlay {
+    let icon = gtk::Overlay::new();
+    icon.set_child(Some(image));
+    icon.add_overlay(&star_badge(size));
+    icon
+}
+
+/// The star drawn over the corner of a row's icon, hidden until the row turns
+/// out to be starred.
+///
+/// Decorative, so it is kept out of the accessibility tree: the row's name is
+/// what a screen reader should say, and a second node in front of every name
+/// would be noise. The `ufm-starred` class is what tells [`parts`] which image
+/// is the badge and which is the icon.
+fn star_badge(icon_size: i32) -> gtk::Image {
+    let badge = gtk::Image::from_icon_name("starred-symbolic");
+    badge.add_css_class("ufm-starred");
+    badge.set_halign(gtk::Align::End);
+    badge.set_valign(gtk::Align::Start);
+    badge.set_pixel_size(badge_size(icon_size));
+    badge.set_visible(false);
+    badge.set_accessible_role(gtk::AccessibleRole::Presentation);
+    badge.update_state(&[gtk::accessible::State::Hidden(true)]);
+    badge
+}
+
+/// How big the star is next to an icon of a given size. A third of the icon,
+/// with a floor: at the list mode's 16 px the badge would otherwise be a few
+/// pixels of noise, and a star nobody can read is worse than no star at all.
+fn badge_size(icon_size: i32) -> i32 {
+    icon_size.saturating_div(3).clamp(12, 20)
+}
+
+/// Show the badge on a starred row and hide it again on every other row, so a
+/// recycled cell cannot keep a star that belongs to a row it no longer shows.
+fn paint_badge(badge: Option<&gtk::Image>, row: &Row, icon_size: i32) {
+    let Some(badge) = badge else { return };
+    let starred = row.with(|entry| entry.flags.contains(EntryFlags::STARRED));
+    badge.set_pixel_size(badge_size(icon_size));
+    badge.set_visible(starred);
+    // The state travels with the visibility. A widget that is drawn and calls
+    // itself hidden is a worse answer than one that says nothing, and the state
+    // set at construction would otherwise be a claim about a row from before
+    // this cell was recycled onto the one it now shows.
+    badge.update_state(&[gtk::accessible::State::Hidden(!starred)]);
 }
 
 /// List mode: one column of the table.
@@ -636,7 +707,7 @@ fn list_factory(
             row.add_css_class("ufm-row");
             let image = gtk::Image::new();
             image.set_pixel_size(size.get());
-            row.append(&image);
+            row.append(&star_overlay(&image, size.get()));
             row.append(&label);
             row.upcast()
         } else {
@@ -658,15 +729,16 @@ fn list_factory(
             Column::Kind => row.kind_label(),
             Column::Modified => row.modified_label(),
         };
-        let (image, label) = parts(item.child().as_ref());
-        if let Some(image) = image {
+        let found = parts(item.child().as_ref());
+        if let Some(image) = found.icon {
             image.set_pixel_size(icon_size.get());
             image.set_icon_name(Some(&row.icon_name()));
             thumbs.request(&image, &row, icon_size.get());
         }
-        if let Some(label) = label {
+        if let Some(label) = found.label {
             label.set_text(&text);
         }
+        paint_badge(found.star.as_ref(), &row, icon_size.get());
     });
     factory
 }
@@ -682,18 +754,41 @@ fn name_label() -> gtk::Label {
     label
 }
 
-/// Find the icon and the name inside the widget a setup handler built, by
-/// looking at its children. Cheaper than per-row object data, and it keeps the
-/// factories free of `unsafe`, which the object-data API needs.
-fn parts(child: Option<&gtk::Widget>) -> (Option<gtk::Image>, Option<gtk::Label>) {
-    let mut image = None;
-    let mut label = None;
+/// The widgets a bind handler needs inside the widget a setup handler built.
+///
+/// Three of them rather than two because a cell now holds two images, and
+/// picking the wrong one would draw a star over a folder icon or a folder icon
+/// over a star.
+struct Parts {
+    icon: Option<gtk::Image>,
+    label: Option<gtk::Label>,
+    star: Option<gtk::Image>,
+}
+
+/// Find the icon, the name and the star inside the widget a setup handler built,
+/// by looking at its children. Cheaper than per-row object data, and it keeps
+/// the factories free of `unsafe`, which the object-data API needs.
+///
+/// The badge is told apart from the icon by its css class rather than by order:
+/// an overlay's children are the icon and then the badge, but a handler that
+/// relies on that breaks the moment either of the two is wrapped in something
+/// else.
+fn parts(child: Option<&gtk::Widget>) -> Parts {
+    let mut found = Parts {
+        icon: None,
+        label: None,
+        star: None,
+    };
     let mut candidates: Vec<gtk::Widget> = child.into_iter().cloned().collect();
     while let Some(widget) = candidates.pop() {
         if let Some(picture) = widget.downcast_ref::<gtk::Image>() {
-            image = Some(picture.clone());
+            if widget.has_css_class("ufm-starred") {
+                found.star = Some(picture.clone());
+            } else {
+                found.icon = Some(picture.clone());
+            }
         } else if let Some(text) = widget.downcast_ref::<gtk::Label>() {
-            label = Some(text.clone());
+            found.label = Some(text.clone());
         } else {
             // The children model says its items are plain `GObject`s, so they
             // have to be downcast one by one rather than iterated as widgets.
@@ -706,7 +801,7 @@ fn parts(child: Option<&gtk::Widget>) -> (Option<gtk::Image>, Option<gtk::Label>
             );
         }
     }
-    (image, label)
+    found
 }
 
 #[cfg(test)]
@@ -868,17 +963,41 @@ mod tests {
             let label = name_label();
             cell.append(&image);
             cell.append(&label);
-            let (found_image, found_label) = parts(Some(&cell.upcast::<gtk::Widget>()));
-            assert!(found_image.is_some_and(|i| i == image));
-            assert!(found_label.is_some_and(|l| l == label));
+            let found = parts(Some(&cell.upcast::<gtk::Widget>()));
+            assert!(found.icon.is_some_and(|i| i == image));
+            assert!(found.label.is_some_and(|l| l == label));
+            assert!(found.star.is_none());
+        });
+    }
+
+    #[test]
+    fn parts_keeps_the_star_from_being_taken_for_the_icon() {
+        tk::ui(|| {
+            // The shape the factories actually build: an overlay holding the icon
+            // and the badge, inside the cell beside the name.
+            let cell = gtk::Box::new(gtk::Orientation::Vertical, 0);
+            let image = gtk::Image::new();
+            let badge = star_badge(64);
+            let icon = gtk::Overlay::new();
+            icon.set_child(Some(&image));
+            icon.add_overlay(&badge);
+            let label = name_label();
+            cell.append(&icon);
+            cell.append(&label);
+            let found = parts(Some(&cell.upcast::<gtk::Widget>()));
+            assert!(found.icon.is_some_and(|i| i == image));
+            assert!(found.star.is_some_and(|s| s == badge));
+            assert!(found.label.is_some_and(|l| l == label));
         });
     }
 
     #[test]
     fn parts_tolerates_a_row_with_no_child() {
         tk::ui(|| {
-            assert!(parts(None).0.is_none());
-            assert!(parts(None).1.is_none());
+            let found = parts(None);
+            assert!(found.icon.is_none());
+            assert!(found.label.is_none());
+            assert!(found.star.is_none());
         });
     }
 

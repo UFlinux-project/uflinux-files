@@ -22,7 +22,7 @@ use std::path::{Path, PathBuf};
 use std::rc::{Rc, Weak};
 use std::sync::Arc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use gio::prelude::*;
 use glib::Propagation;
@@ -30,8 +30,9 @@ use glib::variant::ToVariant;
 use gtk::prelude::*;
 
 use ufm_core::Location;
+use ufm_core::Starred;
 use ufm_core::config::{Preferences, ViewMode};
-use ufm_core::entry::Entry;
+use ufm_core::entry::{Entry, EntryFlags};
 use ufm_core::location::VirtualDir;
 use ufm_core::paths;
 use ufm_core::sort::SortKey;
@@ -123,6 +124,9 @@ pub fn open(app: &gtk::Application, urls: &[String]) {
 
     let shared = Rc::new(Shared {
         prefs: RefCell::new(prefs),
+        // Read once here rather than per listing: the list is small, changes
+        // only through this window, and every change writes the file back.
+        starred: RefCell::new(Starred::load(&Starred::path()).unwrap_or_default()),
         state: RefCell::new(State::new(&start)),
         readers,
         missed: Cell::new(false),
@@ -373,6 +377,11 @@ struct Ctx {
 /// State shared by every handler in one window.
 struct Shared {
     prefs: RefCell<Preferences>,
+    /// The user's stars, kept in memory for the life of the window and saved
+    /// on every change. Listings are stamped with it on their way in, which is
+    /// what lets a badge appear in a folder, a search page and the collection
+    /// itself from one copy of the truth.
+    starred: RefCell<Starred>,
     state: RefCell<State>,
     readers: Arc<Readers>,
     /// Whether the kernel reported a change to the folder on screen while a
@@ -688,14 +697,56 @@ fn show_virtual(ctx: &Ctx, dir: VirtualDir, view: &View) {
             ctx.modes.set_visible_child_name("view");
             view.set_entries(entries);
         }
-        // Nothing writes a star yet, so the collection is empty by definition
-        // rather than by chance — which is worth saying, because an empty view on
-        // its own reads as a folder that failed to fill.
-        VirtualDir::Starred => {
-            ctx.modes.set_visible_child_name("view");
-            show_banner(ctx, "Nothing starred yet");
+        VirtualDir::Starred => show_starred(ctx, view),
+    }
+}
+
+/// The starred collection, assembled from the store rather than read from a
+/// folder. Each star is asked for its current metadata, which is what makes a
+/// share that is not mounted right now, or a folder deleted outside the
+/// window, simply absent from a collection that otherwise looks fine.
+///
+/// The rows are kept rather than dropped when they cannot be read, and the
+/// count of them goes in the bar: a collection that quietly shrinks is worse
+/// than one that says how much of it it could not show.
+fn show_starred(ctx: &Ctx, view: &View) {
+    let readers = Arc::clone(&ctx.shared.readers);
+    let starred = ctx.shared.starred.borrow();
+    let mut entries = Vec::with_capacity(starred.len());
+    let mut missing = 0_usize;
+    for star in starred.stars() {
+        match readers.metadata(&star.location) {
+            Ok(entry) => entries.push(entry),
+            Err(_) => missing += 1,
         }
     }
+    drop(starred);
+    if entries.is_empty() && missing == 0 {
+        ctx.modes.set_visible_child_name("view");
+        show_banner(ctx, "Nothing starred yet");
+        return;
+    }
+    // The rows come from the filesystem, which knows nothing about stars, so
+    // they are stamped like any other listing. Every row here ends up with a
+    // badge, which is repetitive and honest: the flag is what the menu reads to
+    // decide between "Star" and "Unstar", and a collection that left it out
+    // would offer a row called "Star" that takes a star away.
+    ctx.shared.starred.borrow().stamp(&mut entries);
+    // The count is what a collection owes its reader.
+    let total = u64::try_from(entries.len()).unwrap_or(u64::MAX);
+    let status = if missing > 0 {
+        let gone = u64::try_from(missing).unwrap_or(u64::MAX);
+        format!("{} · {gone} not available", format_items(total))
+    } else {
+        format_items(total)
+    };
+    ctx.shared.state.borrow_mut().shown.clone_from(&entries);
+    ctx.modes.set_visible_child_name("view");
+    // The empty-collection banner has to go, or the collection would arrive with
+    // a strip saying there was nothing in it.
+    ctx.banner.set_visible(false);
+    view.set_entries(entries);
+    view.set_status(Some(&status));
 }
 
 /// The cards for the My Computer view, read from the window's own mount table and
@@ -855,7 +906,14 @@ impl ufm_vfs::ListingSink for Sink {
 }
 
 /// Put one delivered event on screen.
-fn apply(ctx: &Ctx, event: Event) {
+fn apply(ctx: &Ctx, mut event: Event) {
+    // Stamping happens here rather than in each reader so that every listing
+    // carries the same flags: folder reads, archive members and the virtual
+    // views all arrive through this one point. The columns are updated below
+    // from the same event, so a parent column's badges come from here too.
+    if let Event::Batch { entries, .. } | Event::Finished { entries, .. } = &mut event {
+        ctx.shared.starred.borrow().stamp(entries);
+    }
     // First for the columns, which match events against their own panes rather
     // than against the window's current folder: a parent column's listing is not
     // for the folder in the title bar, and the check below would drop it.
@@ -1055,6 +1113,23 @@ fn operated(ctx: &Ctx, outcome: ops::Outcome) {
     if let Some(record) = outcome.undo {
         ctx.jobs.record(record);
     }
+    // A star on a name that no longer exists is not a star on some future file
+    // that happens to take the name, so the rows an operation destroyed are
+    // dropped here. Trashed rows are not: Undo can bring them back, and with
+    // them the star.
+    if !outcome.removed.is_empty() {
+        let forgotten = {
+            let mut starred = ctx.shared.starred.borrow_mut();
+            let forgotten = starred.forget(&outcome.removed);
+            if forgotten > 0 {
+                let _ = starred.save(&Starred::path());
+            }
+            forgotten
+        };
+        if forgotten > 0 {
+            refresh_badges(ctx);
+        }
+    }
     let current = ctx.shared.state.borrow().current.clone();
     let here = current.as_ref();
     // The folder in the title bar changed, so its rows and its count are both
@@ -1174,8 +1249,13 @@ fn found(ctx: &Ctx, page: Found) {
     let Some(view) = ctx.view.upgrade() else {
         return;
     };
-    let filtered = filter(&page.entries, &ctx.shared.state.borrow().query);
-    ctx.shared.state.borrow_mut().results = Some(page.entries);
+    // Index results arrive from the search runner rather than through the queue,
+    // so they miss the stamping in `apply` and need it here. Without it a star
+    // would show in a folder and disappear in a search for the same file.
+    let mut entries = page.entries;
+    ctx.shared.starred.borrow().stamp(&mut entries);
+    let filtered = filter(&entries, &ctx.shared.state.borrow().query);
+    ctx.shared.state.borrow_mut().results = Some(entries);
     ctx.columns.forget();
     ctx.modes.set_visible_child_name("view");
     view.set_entries(filtered);
@@ -1564,6 +1644,11 @@ fn menu() -> gio::Menu {
     // row", and a second name for one command is a chord wasted.
     files.append(Some("Open With\u{2026}"), Some("win.open-with"));
     files.append(Some("New Folder"), Some("win.new-folder"));
+    // One row for both directions of the toggle, which is what a menu built once
+    // can offer: the label cannot follow the selection, because the model is
+    // built before there is one. The context menu has the rows on hand and says
+    // "Star" or "Unstar" properly — see [`popup::Command`].
+    files.append(Some("Star"), Some("win.star"));
     files.append(Some("Rename"), Some("win.rename"));
     files.append(Some("Move to Trash"), Some("win.trash"));
     files.append(Some("Delete Permanently"), Some("win.delete"));
@@ -2066,6 +2151,8 @@ fn op_actions(ctx: &Ctx) -> Vec<Rc<gio::SimpleAction>> {
     // See [`undo_action`].
     let undo = undo_action(ctx);
 
+    let star = star_action(ctx);
+
     let facts = one_row_action("properties", ctx, |window, handle, entry| {
         props::show(&window, &handle, entry);
     });
@@ -2077,6 +2164,7 @@ fn op_actions(ctx: &Ctx) -> Vec<Rc<gio::SimpleAction>> {
     vec![
         Rc::new(new_folder),
         rename,
+        star,
         discard_action("trash", false, ctx),
         discard_action("delete", true, ctx),
         pickup_action("copy", ops::Transfer::Copy, ctx),
@@ -2088,6 +2176,95 @@ fn op_actions(ctx: &Ctx) -> Vec<Rc<gio::SimpleAction>> {
         chooser,
         facts,
     ]
+}
+
+/// `star`: add or remove a star on every row the operation would act on.
+///
+/// One action for both directions, and the rows decide which way each of them
+/// goes: a selection of three holding two stars and one plain row stars the
+/// plain one and leaves the others alone, which is the only reading that never
+/// destroys a star the user put somewhere else. The label the menu shows comes
+/// from [`popup::Scope::starred`], which says whether every row is starred.
+///
+/// Nothing is read from disk here. The store is in memory, the listings are
+/// re-stamped rather than re-read, and the only cost is writing one small file.
+fn star_action(ctx: &Ctx) -> Rc<gio::SimpleAction> {
+    let star = gio::SimpleAction::new("star", None);
+    star.connect_activate({
+        let ctx = ctx.clone();
+        move |_action, _parameter| {
+            let picked = targets(&ctx);
+            if picked.is_empty() {
+                return;
+            }
+            let now = SystemTime::now();
+            let changed = {
+                let mut starred = ctx.shared.starred.borrow_mut();
+                picked
+                    .iter()
+                    // `toggle` reports the state a row is in afterwards rather
+                    // than whether it moved, so counting its answer would count
+                    // the stars put on and miss every star taken off — which
+                    // would leave an un-star unpersisted and its badge lit.
+                    .filter(|entry| {
+                        let before = starred.contains(&entry.location);
+                        starred.toggle(entry.location.clone(), now) != before
+                    })
+                    .count()
+            };
+            if changed == 0 {
+                return;
+            }
+            let _ = ctx.shared.starred.borrow().save(&Starred::path());
+            refresh_badges(&ctx);
+        }
+    });
+    Rc::new(star)
+}
+
+/// Whether every row a menu covers already carries a star. An empty selection
+/// counts as not starred: over the background there is no row to unstar, and the
+/// menu leaves the command out there anyway.
+fn all_starred(picked: &[Entry]) -> bool {
+    !picked.is_empty()
+        && picked
+            .iter()
+            .all(|entry| entry.flags.contains(EntryFlags::STARRED))
+}
+
+/// Tell everything on screen that the star list changed, so a badge follows the
+/// change without a directory being read a second time.
+///
+/// Three places hold a row: the listings the window keeps, the model behind the
+/// grid and list views, and the cached listings inside each column pane. All
+/// three are re-stamped from the store. A star is not something the filesystem
+/// stores, so a re-read would not settle it — the flags have to be rewritten
+/// where they already are.
+fn refresh_badges(ctx: &Ctx) {
+    let starred = ctx.shared.starred.borrow().clone();
+    {
+        let mut state = ctx.shared.state.borrow_mut();
+        starred.stamp(&mut state.shown);
+        if let Some(results) = state.results.as_mut() {
+            starred.stamp(results);
+        }
+    }
+    if let Some(view) = ctx.view.upgrade() {
+        view.restamp(&starred);
+    }
+    ctx.columns.restamp(&starred);
+    // The collection itself can be the thing on screen, and a star removed from
+    // a row there takes the row away rather than re-labelling it.
+    let on_collection = ctx
+        .shared
+        .state
+        .borrow()
+        .current
+        .as_ref()
+        .is_some_and(|here| here.virtual_dir() == Some(VirtualDir::Starred));
+    if on_collection && let Some(view) = ctx.view.upgrade() {
+        show_starred(ctx, &view);
+    }
 }
 
 /// An action whose handler acts on exactly one selected row, and stays quiet
@@ -2197,6 +2374,18 @@ fn sync_ops(ctx: &Ctx) {
     sync_open_with(ctx);
     sync_properties(ctx);
     sync_preview(ctx);
+    sync_star(ctx);
+}
+
+/// Enable or disable the star. Any row can be starred, and any number of them
+/// together, so the condition is the simplest of the row commands: there has to
+/// be a row. Starring the folder in the title bar is what the sidebar row and
+/// <kbd>Ctrl</kbd>T are for instead.
+fn sync_star(ctx: &Ctx) {
+    let Some(window) = ctx.window.upgrade() else {
+        return;
+    };
+    enable(&window, "star", !targets(ctx).is_empty());
 }
 
 /// Enable or disable the preview. One row is the whole condition: any row at all
@@ -2381,6 +2570,7 @@ fn menu_rows(ctx: &Ctx, in_current: bool) -> Vec<popup::Command> {
         extracting: extract_target(ctx).is_some(),
         openable: open_with_target(ctx).is_some(),
         pastable: can_paste(ctx),
+        starred: all_starred(&picked),
     };
     popup::rows_for(&picked, scope)
 }
@@ -2404,6 +2594,7 @@ fn show_context_menu(ctx: &Ctx, widget: &gtk::Widget, target: popup::Target, x: 
         extracting: extract_target(ctx).is_some(),
         openable: open_with_target(ctx).is_some(),
         pastable: can_paste(ctx),
+        starred: all_starred(&picked),
     };
     ctx.popup.show(
         &window,
@@ -2421,6 +2612,9 @@ fn install_accels(app: &gtk::Application) {
     app.set_accels_for_action("win.refresh", &["F5"]);
     app.set_accels_for_action("win.hidden", &["<Ctrl>H"]);
     app.set_accels_for_action("win.search", &["<Ctrl>F"]);
+    // The star. `<Ctrl>T` rather than a letter with a tradition elsewhere: `T` is
+    // the initial of the only word the command has, and the chord is free.
+    app.set_accels_for_action("win.star", &["<Ctrl>T"]);
     // `<Ctrl>F` is the filter, which is the one a user reaching for search in a
     // folder wants. The index is the wider thing, so it gets the wider chord.
     app.set_accels_for_action("win.find", &["<Ctrl><Shift>F"]);

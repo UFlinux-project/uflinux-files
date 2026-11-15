@@ -185,6 +185,8 @@ pub enum Command {
     Open,
     OpenWith,
     NewFolder,
+    Star,
+    Unstar,
     Rename,
     Trash,
     Delete,
@@ -197,10 +199,12 @@ pub enum Command {
 
 impl Command {
     /// Every row, in the order the sections below lay them out.
-    const ALL: [Self; 11] = [
+    const ALL: [Self; 13] = [
         Self::Open,
         Self::OpenWith,
         Self::NewFolder,
+        Self::Star,
+        Self::Unstar,
         Self::Rename,
         Self::Trash,
         Self::Delete,
@@ -217,6 +221,8 @@ impl Command {
             Self::Open => "Open",
             Self::OpenWith => "Open With\u{2026}",
             Self::NewFolder => "New Folder",
+            Self::Star => "Star",
+            Self::Unstar => "Unstar",
             Self::Rename => "Rename",
             Self::Trash => "Move to Trash",
             Self::Delete => "Delete Permanently",
@@ -235,6 +241,7 @@ impl Command {
             Self::Open => "win.open",
             Self::OpenWith => "win.open-with",
             Self::NewFolder => "win.new-folder",
+            Self::Star | Self::Unstar => "win.star",
             Self::Rename => "win.rename",
             Self::Trash => "win.trash",
             Self::Delete => "win.delete",
@@ -250,7 +257,9 @@ impl Command {
         match self {
             Self::Open | Self::OpenWith => Section::Open,
             Self::NewFolder | Self::Paste => Section::Add,
-            Self::Rename | Self::Trash | Self::Delete => Section::Change,
+            Self::Star | Self::Unstar | Self::Rename | Self::Trash | Self::Delete => {
+                Section::Change
+            }
             Self::Copy | Self::Cut => Section::Take,
             Self::Extract | Self::Properties => Section::About,
         }
@@ -322,6 +331,24 @@ pub struct Scope {
     /// The clipboard has something to put into this folder. The same test the
     /// Paste action uses.
     pub pastable: bool,
+    /// Every row the menu covers is already starred, so the row should say
+    /// "Unstar" rather than "Star". One row rather than two is the point: a menu
+    /// offering both would ask the user to guess which one takes effect. Asked of
+    /// the window for the same reason as [`Scope::openable`] — the rows carry the
+    /// flag, and only the window has them.
+    pub starred: bool,
+}
+
+/// The star row for a menu over rows that are starred when `starred` says so.
+/// Always exactly one row: the command is one toggle, and the label is what says
+/// which way it goes.
+#[must_use]
+fn star_row(starred: bool) -> Command {
+    if starred {
+        Command::Unstar
+    } else {
+        Command::Star
+    }
 }
 
 /// The rows of the menu for a given selection.
@@ -370,6 +397,10 @@ fn one_row(entry: &Entry, scope: Scope) -> Vec<Command> {
             rows.push(Command::Paste);
         }
     }
+    // Before the destructive rows rather than after them: starring a row is the
+    // lightest thing this group offers, and the row that undoes it is the same
+    // row with a different label.
+    rows.push(star_row(scope.starred));
     rows.extend([
         Command::Rename,
         Command::Trash,
@@ -392,6 +423,10 @@ fn many_rows(scope: Scope) -> Vec<Command> {
             rows.push(Command::Paste);
         }
     }
+    // Several rows star together and unstar together. `Scope::starred` is only
+    // true when every one of them is starred, so the row cannot promise to undo
+    // something it did not do to all of them.
+    rows.push(star_row(scope.starred));
     rows.extend([Command::Trash, Command::Delete, Command::Copy, Command::Cut]);
     if scope.extracting {
         rows.push(Command::Extract);
@@ -594,6 +629,7 @@ mod tests {
         extracting: false,
         openable: false,
         pastable: false,
+        starred: false,
     };
 
     /// A press in one of the older Miller columns.
@@ -602,6 +638,7 @@ mod tests {
         extracting: false,
         openable: false,
         pastable: false,
+        starred: false,
     };
 
     /// Fire a gesture's `pressed` by hand. The harness has no pointer, so a
@@ -652,6 +689,7 @@ mod tests {
             vec![
                 Command::Open,
                 Command::NewFolder,
+                Command::Star,
                 Command::Rename,
                 Command::Trash,
                 Command::Delete,
@@ -659,6 +697,36 @@ mod tests {
                 Command::Cut,
                 Command::Properties,
             ]
+        );
+    }
+
+    #[test]
+    fn a_starred_row_is_offered_the_row_that_takes_the_star_back() {
+        // One row either way, so the menu never holds both. The label is the only
+        // difference, which is also why the row cannot be a single "Toggle star"
+        // — a menu row that does not say what it will do is a coin toss.
+        let starred = Scope {
+            starred: true,
+            ..HERE
+        };
+        let rows = rows_for(&[folder("one")], starred);
+        assert!(rows.contains(&Command::Unstar));
+        assert!(!rows.contains(&Command::Star));
+        assert_eq!(
+            rows.iter().filter(|row| **row == Command::Unstar).count(),
+            1,
+            "the star should be offered once"
+        );
+        // Several rows that are all starred unstar together, and a mix does not
+        // get an Unstar that would leave some of them alone.
+        let many = rows_for(&[folder("one"), file("note.txt")], starred);
+        assert!(many.contains(&Command::Unstar));
+        assert!(!rows_for(&[folder("one"), file("note.txt")], HERE).contains(&Command::Unstar));
+        assert!(
+            !rows_for(&[], HERE)
+                .iter()
+                .any(|row| matches!(row, Command::Star | Command::Unstar)),
+            "over the background there is no row to star"
         );
     }
 
@@ -810,6 +878,7 @@ mod tests {
                 extracting: true,
                 openable: false,
                 pastable: true,
+                starred: false,
             },
         ));
         assert_eq!(
@@ -818,6 +887,7 @@ mod tests {
                 vec!["Open".to_string()],
                 vec!["New Folder".to_string(), "Paste".to_string()],
                 vec![
+                    "Star".to_string(),
                     "Rename".to_string(),
                     "Move to Trash".to_string(),
                     "Delete Permanently".to_string()
@@ -837,7 +907,8 @@ mod tests {
                     in_current: true,
                     extracting: false,
                     openable: false,
-                    pastable: true
+                    pastable: true,
+                    starred: false
                 }
             ))),
             vec![vec!["New Folder".to_string(), "Paste".to_string()]]

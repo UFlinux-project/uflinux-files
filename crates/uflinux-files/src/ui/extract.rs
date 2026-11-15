@@ -111,12 +111,14 @@ pub fn extract(handle: &Handle, jobs: &Jobs, location: Location) {
                     ok: true,
                     message: format!("Extracting {label} stopped."),
                     changed: changed.into_iter().collect(),
+                    removed: Vec::new(),
                     undo: None,
                 },
                 Err(error) => Outcome {
                     ok: false,
                     message: complaint(&container, &error),
                     changed: Vec::new(),
+                    removed: Vec::new(),
                     undo: None,
                 },
             }
@@ -185,6 +187,7 @@ fn arrived(report: ufm_archive::Report, changed: Option<Location>) -> Outcome {
         ok: report.skipped.is_empty(),
         message: report.summary(),
         changed: changed.clone().into_iter().collect(),
+        removed: Vec::new(),
         // Everything the archive wrote sits inside the one folder it made, so
         // undoing the extraction is removing that folder — no per-member record.
         undo: changed.map(Record::created),
@@ -201,6 +204,7 @@ fn refused(message: &str) -> Outcome {
         ok: false,
         message: message.to_string(),
         changed: Vec::new(),
+        removed: Vec::new(),
         undo: None,
     }
 }

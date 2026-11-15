@@ -43,6 +43,14 @@ label.ufm-meta {
     opacity: 0.75;
     font-size: 9pt;
 }
+/* The star over a row's icon. Accent-coloured rather than left to the symbolic
+   recolouring, which would paint it the same grey as the folder icon it sits on
+   and make it read as part of that icon. The shadow keeps it legible over a
+   photograph, which is what a thumbnail is. */
+image.ufm-starred {
+    color: @accent_color;
+    -gtk-icon-shadow: 0 0 2px alpha(black, 0.6);
+}
 label.ufm-status {
     opacity: 0.7;
     font-size: 9pt;
@@ -145,6 +153,7 @@ mod tests {
             "ufm-header-active",
             "ufm-name",
             "ufm-meta",
+            "ufm-starred",
             "ufm-status",
             "ufm-sidebar",
             "ufm-sidebar-group",

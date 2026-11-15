@@ -10,7 +10,9 @@
 //!
 //! Rows are immutable once shown. A change anywhere is a change to the listing,
 //! which replaces rows rather than mutating them, so no per-row change signal
-//! exists and a factory never has to unsubscribe from one.
+//! exists and a factory never has to unsubscribe from one. The single exception
+//! is [`Row::restamp`], which updates the one flag the filesystem does not know
+//! about and is always followed by a rebind rather than by a signal.
 
 use glib::subclass::prelude::*;
 use std::cell::RefCell;
@@ -62,6 +64,21 @@ impl Row {
     #[must_use]
     pub fn entry(&self) -> Entry {
         self.with(Entry::clone)
+    }
+
+    /// Re-apply the star flag from `starred`, so a row can follow a change to the
+    /// list without being thrown away and rebuilt.
+    ///
+    /// Rows are otherwise immutable — see the module documentation — and this is
+    /// the one deliberate exception, because a star is not a fact about the file:
+    /// the filesystem never had it, so re-reading the folder would not settle it
+    /// either. The change is invisible on its own; the caller pairs this with a
+    /// rebind, which asks the factories to draw the rows again.
+    pub fn restamp(&self, starred: &ufm_core::Starred) {
+        let mut borrowed = self.imp().entry.borrow_mut();
+        if let Some(entry) = borrowed.as_mut() {
+            starred.stamp(std::slice::from_mut(entry));
+        }
     }
 
     #[must_use]
@@ -211,5 +228,22 @@ mod tests {
         let mut link = entry("gone", EntryKind::File);
         link.flags = EntryFlags::SYMLINK | EntryFlags::BROKEN;
         assert_eq!(Row::new(link).icon_name(), "image-missing");
+    }
+
+    #[test]
+    fn restamping_follows_the_list_in_both_directions() {
+        let row = Row::new(entry("here.txt", EntryKind::File));
+        let mut list = ufm_core::Starred::default();
+        assert!(!row.with(|e| e.flags.contains(EntryFlags::STARRED)));
+        list.star(
+            row.with(|e| e.location.clone()),
+            std::time::SystemTime::now(),
+        );
+        row.restamp(&list);
+        assert!(row.with(|e| e.flags.contains(EntryFlags::STARRED)));
+        row.restamp(&ufm_core::Starred::default());
+        assert!(!row.with(|e| e.flags.contains(EntryFlags::STARRED)));
+        // Restamping leaves the rest of the entry alone.
+        assert_eq!(row.name(), "here.txt");
     }
 }

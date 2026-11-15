@@ -270,8 +270,66 @@ name is there to be read rather than to be pressed.
 the boring case: `recently-used.xbel` is parsed into a list of paths, each one is
 `stat`ed through the reader the window already has, and the result is handed to the
 ordinary listing. Recent files *are* files, so only the source of the list is
-unusual. `starred://` has no writer yet and says so with a banner rather than
-showing an empty view, which reads as a folder that failed to fill.
+unusual. `starred://` has the same shape and its own section below.
+
+## Stars
+
+A star is not a file attribute. Nothing on disk says that a row was starred, so
+the fact lives in `starred.json` and the flag on an `Entry` is a rendering of it,
+set on the way into the widget tree. `ufm_core::starred` owns the file — load,
+save, `star`/`unstar`/`toggle`, and the two sweeps that keep the list honest when
+rows are deleted (`forget`) or a folder is removed underneath them (`prune`) — and
+knows nothing about GTK. The window holds one `Starred`, loaded once at startup,
+so a listing is stamped against memory rather than against a file read per folder.
+
+Stamping is the reason the flag is a bit and not a lookup in the row: a factory
+that asked the store per row would run a linear scan per row per repaint, and
+`Starred::stamp` does the same work once for the whole listing. It *sets* the flag
+rather than only setting it, so a re-stamp against a list that no longer carries a
+star takes the badge off — the only way an un-star can be undone on screen without
+re-reading the folder, which would not settle anything anyway because the
+filesystem never knew.
+
+That is also why `Row`, `View` and `Columns` each have a `restamp`. Rows are
+otherwise immutable, and the cheaper-looking option — handing the view a fresh
+`Vec<Entry>` — throws away the selection, which a user who just pressed `Ctrl+T`
+or `Delete` would feel immediately. `restamp` rewrites the `Entry` each row already
+holds and then re-runs the existing bind, so the widgets stay where they are and
+the badge follows the store. The three copies of a listing (the window's state, the
+model behind the grid, and each column pane's cache) all have to be told, or the
+badge disagrees with itself between one repaint and the next.
+
+One action serves both directions, and each row decides its own way: a selection of
+three holding two stars stars the plain row and leaves the others alone, which is
+the only reading that never destroys a star the user put somewhere else. The menu
+label is the opposite decision and is made per menu, from whether *every* selected
+row is starred, so `Unstar` never half-undoes a selection. Note that `toggle`
+reports the state afterwards rather than whether anything moved — counting its
+answer would count the stars put on and miss every star taken off, which shows up
+as an un-star that does not survive a restart.
+
+The collection is assembled from the store rather than read from a folder, so it
+says its own item count, and a star whose location no longer resolves is counted
+into the status line (`1 item · 1 not available`) rather than dropped silently — a
+share that is simply not mounted right now is not a lost star, and a row that says
+it is unavailable says something truer than no row at all. An empty collection
+shows a banner instead of an empty view, which is the difference between "nothing
+starred yet" and a window that looks broken. Deleting rows takes their stars with
+them: an operation reports the locations it destroyed, and the store forgets them,
+so the collection never accumulates rows that can only ever be dead.
+
+The badge itself is an `Image` over the row's icon in an `Overlay`, because
+gtk4-rs 0.10 has no binding for `GtkBadge` — the widget exists in GTK, the
+generated binding does not. It is built invisible in both factories and shown by
+painting, so a row that is not starred carries one hidden widget rather than a
+layout that changes when a star is added. Being decoration, it is a
+`Presentation` with `State::Hidden` tracking its visibility: without that an AT
+client is handed an icon whose name is `starred-symbolic` in the middle of every
+starred row, which is a container's worth of noise to say one fact the row's own
+name would carry better. Both factories route it by CSS class rather than by
+position, so the code that reads a row back apart to repaint it cannot mistake the
+badge for the icon — the two are the same widget type, and one of them is the thing
+the row is named for.
 
 ## File operations
 
@@ -309,6 +367,12 @@ otherwise "Moved 1 item" would be hidden a fraction of a second after it
 appeared, and the user who moved a row would get no answer at all. Navigation
 clears the held message; a read failure replaces it, being the newer fact about
 the folder.
+
+An outcome also carries the locations it destroyed, and only for a discard: a
+row moved out of reach can be undone, so its star stays, and a row sent to the
+trash is still the same row when it comes back. What is gone for good has to be
+named, because state the filesystem does not hold cannot be re-derived from it —
+the star list forgets exactly those locations, and nothing else.
 
 A taken name is a question rather than a decision. The plan records one
 collision per row whose name the destination already has, holding both sides of
@@ -704,6 +768,7 @@ dialog, a banner or a row in a list.
 | `~/.config/uflinux/filemanager/credentials.json` | saved credentials, `0600` |
 | `~/.config/uflinux/filemanager/mounts/*.conf` | per-mount credential files, `0600` |
 | `~/.config/uflinux/filemanager/desktop.json` | desktop icon layout, provider only |
+| `~/.config/uflinux/filemanager/starred.json` | starred locations, most recent first |
 | `~/.config/uflinux/filemanager/index.json` | indexer configuration |
 | `~/.cache/uflinux-files/index/` | the two Tantivy indexes |
 | `~/.cache/thumbnails/` | thumbnails, freedesktop layout |

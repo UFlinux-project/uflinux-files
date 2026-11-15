@@ -321,6 +321,16 @@ pub struct Outcome {
     /// A failure that changed nothing reports nothing here, which is what stops
     /// a refused operation from costing a directory read.
     pub changed: Vec<Location>,
+    /// Rows that were destroyed rather than moved, in the order they left. The
+    /// field above answers which listings are stale, which is not the same
+    /// question as which rows no longer exist: a folder that lost a row and a
+    /// folder that gained one both need re-reading, and only one of them had a
+    /// row destroyed. The star list asks the second question, and nothing in the
+    /// drawing path asks it, which is why it costs a vector per operation rather
+    /// than being worked out from the re-read. Rows that went to the trash are
+    /// left out — they can come back, and a star list that forgot a place the
+    /// user can still restore loses something they meant to keep.
+    pub removed: Vec<Location>,
     /// What the operation did, in the terms an inverse needs — `Some` for the
     /// operations that can be put back, and only for those. The window hands this
     /// to the job table, which is what makes the Undo button sensitive.
@@ -338,6 +348,7 @@ impl Outcome {
             ok: true,
             message: message.into(),
             changed: Vec::new(),
+            removed: Vec::new(),
             undo: None,
         }
     }
@@ -347,6 +358,7 @@ impl Outcome {
             ok: false,
             message: message.into(),
             changed: Vec::new(),
+            removed: Vec::new(),
             undo: None,
         }
     }
@@ -904,6 +916,7 @@ pub fn discard(handle: &Handle, jobs: &Jobs, entries: &[Entry], permanent: bool)
             let mut deleted = 0_usize;
             let mut failures: Vec<String> = Vec::new();
             let mut changed: Vec<Location> = Vec::new();
+            let mut gone: Vec<Location> = Vec::new();
             let mut homes: Vec<Location> = Vec::new();
             let mut stopped = false;
             for (index, entry) in picked.iter().enumerate() {
@@ -927,7 +940,14 @@ pub fn discard(handle: &Handle, jobs: &Jobs, entries: &[Entry], permanent: bool)
                         trashed += 1;
                         homes.push(entry.location.clone());
                     }
-                    Ok(Gone::Deleted) => deleted += 1,
+                    Ok(Gone::Deleted) => {
+                        deleted += 1;
+                        // The rows that went to the trash are left out of this
+                        // list on purpose: a trashed row comes back under undo,
+                        // and a star list that forgets a row the user can still
+                        // restore loses a place they meant to keep.
+                        gone.push(entry.location.clone());
+                    }
                     Err(message) => {
                         failures.push(format!("{}: {message}", entry.name));
                         continue;
@@ -962,6 +982,7 @@ pub fn discard(handle: &Handle, jobs: &Jobs, entries: &[Entry], permanent: bool)
             outcome.ok = failures.is_empty();
             outcome.message = report(&parts, &failures);
             outcome.changed = changed;
+            outcome.removed = gone;
             outcome.undo = (!homes.is_empty()).then(|| Record {
                 effect: Effect::Trashed(where_trashed(&homes)),
                 replaced: Vec::new(),
