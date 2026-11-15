@@ -100,6 +100,17 @@ reach a log by accident. Saved credentials live in
 `<config>/credentials.json` at `0600`. The freedesktop Secret Service is a
 possible later backend, not a dependency.
 
+One rule governs that file: an entry survives exactly when the mount table holds
+a record for its share. No eject path breaks that rule, deliberately — Disconnect
+means the mount is not wanted now and Forget means the row is not wanted, and
+neither is a promise about the next time the share is typed in, when the password
+is what the dialog needs. What has to not survive is an entry no record explains
+any more, and that is a question about the whole table rather than about one
+share, so it is asked in one place: the sweep, described below. A password with
+nothing to attach to is a secret nobody can name, and this file holds plaintext,
+so the cost of keeping one is the same as the cost of a `.conf` file that
+outlived its mount.
+
 ## Privilege, and why not udisks2
 
 UFLinux has no udisks2. The alternative precedent in the distro is the
@@ -205,7 +216,9 @@ being clicked.
 Forget drops the record without detaching, and refuses a share the kernel still
 reports `Mounted` — the record is the only handle on a live mount, and losing it
 strands a mount point no window can eject. A `Stale` share is dropped without a
-detach and left to the next sweep.
+detach and left to the next sweep. A saved password outlives this by design: the
+row is gone, so the entry is now one nothing explains, and the sweep is what
+notices rather than the click.
 
 ## Every window follows the table
 
@@ -252,12 +265,25 @@ discrepancy it records an action and the evidence for it:
 - a directory under the mount root with no entry in the table → remove it if empty
 - a `.conf` file with no matching mount → remove it, since it may be a password
 - a mount idle past `--idle-after` → detach it
+- an entry in `credentials.json` whose share is no longer in the table → drop it
 
 `apply_files` performs the file removals itself; the detaches are plans the
 caller runs, so a sweep containing no detaches never touches polkit at all. The
 notes list collects what could not be classified and is reported, never fatal: a
 sweep that stops halfway leaves the rest to rot, and a leftover password file is
 exactly the thing that should not rot.
+
+The last bullet is the only place that rule is carried out, and that is the
+reason it exists. No eject path touches `credentials.json`: Disconnect means the
+mount is not wanted now and Forget means the row is not wanted, and neither is a
+promise about the next time the share is typed in. What has to not survive is an
+entry no record explains, which is a question about the whole table rather than
+about one share — so it is asked once, at the end, after the detaches and after
+the table has been written, and the two files on disk agree with each other when
+the run finishes. A share this run detached has no record by then and loses its
+password in the same pass; a share that is merely idle and not asked about keeps
+the password it reconnects with. A store that refuses the prune is a note, not a
+failure, in the company of every other thing a sweep could not do.
 
 A sweep keeps two lists, because "what is left to do" and "what this run did" are
 not the same question. `items()` is the pending detaches; `removed()` is what has

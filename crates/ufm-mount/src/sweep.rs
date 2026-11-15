@@ -30,9 +30,11 @@ use ufm_core::error::{Error, Result};
 use ufm_core::paths;
 
 use crate::backend::{Backend, MountTarget, Paths as SearchPaths};
+use crate::credentials::CredentialStore;
 use crate::monitor::{MountState, Observer};
 use crate::plan::Plan;
 use crate::table::{MountTable, now};
+use crate::uri::Share;
 
 /// The extension of a per-mount credential file.
 const CRED_SUFFIX: &str = ".conf";
@@ -337,6 +339,39 @@ impl Sweep {
         &self.notes
     }
 
+    /// Add one thing this run could not do, for a caller that found a leftover it
+    /// cannot classify itself. [`Sweep::prune_saved_passwords`] is one such caller,
+    /// and a password it could not drop is exactly the kind of thing this list
+    /// exists to say: reported, never fatal, because a sweep that stops at the
+    /// first problem leaves the rest of them behind.
+    pub fn record_note(&mut self, note: impl Into<String>) {
+        self.notes.push(note.into());
+    }
+
+    /// Drop the saved passwords whose shares are no longer listed, reporting a
+    /// failure to do so as a note rather than failing the sweep.
+    ///
+    /// This is the net, not the broom. A share the user lets go loses its password
+    /// the moment its record does, in the process that removed the record; what
+    /// lands here is what nothing owns any more — an entry whose record was
+    /// deleted by hand, or one written by a build that has since changed how a
+    /// share is named. In a healthy session this finds nothing to do, which is the
+    /// shape a safety net should have.
+    ///
+    /// It belongs to the sweep because that is the run whose whole job is noticing
+    /// that reality moved, and because the notes list is where a leftover this run
+    /// could not reclaim has to be said out loud: `credentials.json` holds
+    /// plaintext passwords, so an entry that outlives its share has the same cost
+    /// as a `.conf` file that does.
+    pub fn prune_saved_passwords(&mut self, store: &dyn CredentialStore, table: &MountTable) {
+        let keep: Vec<Share> = table.iter().map(|record| record.share.clone()).collect();
+        if let Err(e) = store.prune(&keep) {
+            self.record_note(format!(
+                "cannot drop saved passwords that are no longer listed: {e}"
+            ));
+        }
+    }
+
     /// What this run already took care of, in the order it happened: empty until
     /// [`Sweep::apply_files`] runs or the caller reports a detach with
     /// [`Sweep::record_done`]. A detach item here still carries the plan that ran;
@@ -447,6 +482,7 @@ mod tests {
     use std::fs;
     use std::path::Path;
 
+    use crate::credentials::{FileStore, Secret};
     use crate::uri::Share;
 
     fn share(input: &str) -> Share {
@@ -817,5 +853,96 @@ mod tests {
         let root = credential_root();
         assert!(root.starts_with(paths::config_dir()), "{}", root.display());
         assert!(!root.starts_with(paths::mount_root()));
+    }
+
+    /// A store whose every call fails, to check what a sweep does with a leftover
+    /// it can reclaim neither by deleting nor by reporting.
+    struct Broken;
+
+    impl CredentialStore for Broken {
+        fn get(&self, _share: &Share) -> Option<Secret> {
+            None
+        }
+
+        fn put(
+            &self,
+            _share: &Share,
+            _user: Option<&str>,
+            _password: Option<Secret>,
+        ) -> Result<()> {
+            Err(Error::Config("read-only".into()))
+        }
+
+        fn forget(&self, _share: &Share) -> Result<()> {
+            Err(Error::Config("read-only".into()))
+        }
+
+        fn prune(&self, _keep: &[Share]) -> Result<()> {
+            Err(Error::Config("read-only".into()))
+        }
+    }
+
+    #[test]
+    fn a_saved_password_for_a_share_that_is_no_longer_listed_is_dropped() {
+        let fix = Fixture::new();
+        let store = FileStore::at(fix.dir.path().join("credentials.json"));
+        let gone = share("smb://srv/gone");
+        store
+            .put(&gone, None, Some(Secret::from("hunter2")))
+            .expect("store");
+        let table = fix.table();
+        let (stubs, search) = fix.helpers();
+        let mut sweep = Sweep::scan(&table, &fix.observer(), &search, &fix.options());
+        sweep.prune_saved_passwords(&store, &table);
+        assert!(
+            store.get(&gone).is_none(),
+            "the password outlived its share"
+        );
+        assert!(sweep.notes().is_empty(), "{}", sweep.summary());
+        drop(stubs);
+    }
+
+    #[test]
+    fn a_saved_password_for_a_share_still_in_the_table_survives_a_prune() {
+        let fix = Fixture::new();
+        let store = FileStore::at(fix.dir.path().join("credentials.json"));
+        let listed = share("smb://srv/kept");
+        store
+            .put(&listed, None, Some(Secret::from("hunter2")))
+            .expect("store");
+        let mut table = fix.table();
+        table.add(&listed);
+        let (stubs, search) = fix.helpers();
+        let mut sweep = Sweep::scan(&table, &fix.observer(), &search, &fix.options());
+        sweep.prune_saved_passwords(&store, &table);
+        assert!(
+            store.get(&listed).is_some(),
+            "a share the table still describes keeps its password"
+        );
+        assert!(sweep.notes().is_empty(), "{}", sweep.summary());
+        drop(stubs);
+    }
+
+    #[test]
+    fn a_password_that_cannot_be_dropped_is_a_note_and_not_a_failure() {
+        let fix = Fixture::new();
+        let table = fix.table();
+        let (stubs, search) = fix.helpers();
+        let mut sweep = Sweep::scan(&table, &fix.observer(), &search, &fix.options());
+        sweep.prune_saved_passwords(&Broken, &table);
+        assert!(
+            sweep
+                .notes()
+                .iter()
+                .any(|n| n.contains("saved passwords") && n.contains("read-only")),
+            "{}",
+            sweep.summary()
+        );
+        assert!(
+            sweep.summary().contains("note:"),
+            "the summary has to print what the scan could not do: {}",
+            sweep.summary()
+        );
+        drop(stubs);
     }
 }

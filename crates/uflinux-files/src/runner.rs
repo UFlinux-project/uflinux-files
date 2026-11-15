@@ -143,6 +143,13 @@ impl Login {
 
     /// Whether the table had nothing marked, which is the common case and worth
     /// saying out loud rather than printing nothing.
+    ///
+    /// Test-only, because [`Self::summary`] already says it: the human path prints
+    /// "nothing marked connect at login", and the JSON path reports an empty
+    /// `attempts` list, which a session tool can test as easily as a flag. Both
+    /// answers come from the same list, so there is nothing for a caller to keep
+    /// in sync — and a method nobody calls is a method that can drift.
+    #[cfg(test)]
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.attempts.is_empty()
@@ -570,6 +577,13 @@ impl Runner {
         // that stopped being a mount has no credential file worth keeping.
         sweep.apply_files()?;
         let _ = self.table.save();
+        // The saved passwords go last, against the table this run just wrote, so
+        // the two files on disk agree with each other afterwards: a password
+        // survives exactly when a record exists to explain it. Nothing is re-read
+        // first, because the sweep's own answers were already judged against this
+        // same table — pruning against a fresher copy would mean a run whose
+        // detaches and whose password cleanup disagreed about which shares exist.
+        sweep.prune_saved_passwords(&self.store, &self.table);
         Ok(sweep)
     }
 
@@ -592,9 +606,17 @@ impl Runner {
         SweepOptions::new(&self.layout.credential_dir)
     }
 
-    /// Add or update the record for a share without mounting, so a share can be
-    /// listed before it is connected — which is what "connect at login" means
-    /// before the first successful mount.
+    /// Put a share in the table without mounting it, so a test can build the state
+    /// a share marked connect-at-login has before its first mount.
+    ///
+    /// Test-only, and that is the honest answer rather than a shortcut: every
+    /// production path into the table goes through [`Self::mount`], which adds the
+    /// record itself before anything runs — see the note on that method about a
+    /// crash mid-mount. The connect dialog mounts whatever it is handed, and the
+    /// login row acts on a record a previous mount already left behind. Nothing on
+    /// screen offers a share that is listed without having been connected and
+    /// written by something else, so nothing calls this.
+    #[cfg(test)]
     #[must_use]
     pub fn list(&mut self, share: &Share) -> &mut MountRecord {
         self.table.add(share)
@@ -706,6 +728,15 @@ impl Runner {
     }
 
     /// Drop a record and its symlink, which is where both eject paths end.
+    ///
+    /// The saved password is deliberately left alone here. Both eject paths end up
+    /// in this function, and neither is a statement that the user never wants that
+    /// server again — Disconnect means the mount is not wanted now, and Forget
+    /// means the row is not wanted — while the password is what the connect dialog
+    /// needs the next time the share is typed in. What has to not survive is an
+    /// entry no record explains any more, and that is the sweep's question, asked
+    /// of the whole table at once rather than of one share at a time: see
+    /// [`ufm_mount::sweep::Sweep::prune_saved_passwords`]. One rule, one place.
     fn retire(&mut self, id: &str) {
         if let Some(record) = self.table.remove(id) {
             self.unpublish(&record);
@@ -1375,6 +1406,90 @@ mod tests {
             report.message.contains("password is needed"),
             "{}",
             report.message
+        );
+    }
+
+    #[test]
+    fn a_sweep_drops_a_saved_password_whose_share_is_no_longer_listed() {
+        let fixture = Fixture::new();
+        let share = share("smb://user@srv/share");
+        let mut runner = fixture.runner();
+        runner
+            .remember(&share, Some(Secret::from("hunter2")))
+            .expect("store");
+        // The share is not in the table, which is the state a hand-edited
+        // `mounts.json` or a deleted record leaves behind.
+        let options = runner.leftover_options();
+        let sweep = runner.sweep(&options).expect("sweep");
+        assert!(
+            !runner.has_password(&share),
+            "the password outlived its share"
+        );
+        assert!(sweep.notes().is_empty(), "{}", sweep.summary());
+        let raw = fs::read_to_string(fixture.path("conf").join("credentials.json")).expect("file");
+        assert!(!raw.contains("hunter2"), "{raw}");
+    }
+
+    #[test]
+    fn a_sweep_leaves_a_live_share_its_password() {
+        let fixture = Fixture::new();
+        let share = share("smb://user@srv/share");
+        let target = point(&fixture, &share);
+        fixture.kernel_helper(&target, "cifs");
+        let mut runner = fixture.runner();
+        let report = runner.mount(&share, Some(&Secret::from("hunter2")));
+        assert!(report.ok, "{}", report.message);
+        // Mounting caches what the user typed, so the password is on disk by
+        // design here; the sweep has no business second-guessing a share the
+        // table still describes.
+        assert!(runner.has_password(&share));
+        let sweep = runner
+            .sweep(&runner.leftover_options())
+            .expect("leftover sweep");
+        assert!(sweep.is_empty(), "{}", sweep.summary());
+        assert!(
+            runner.has_password(&share),
+            "a share that is connected keeps the password it reconnects with"
+        );
+        // Asked about idleness too, since that sweep detaches and retires the
+        // share; without `--idle-after` on a share this fresh, nothing changes.
+        let idle = runner
+            .sweep(&runner.idle_options(3600))
+            .expect("idle sweep");
+        assert!(idle.is_empty(), "{}", idle.summary());
+        assert!(runner.has_password(&share));
+    }
+
+    #[test]
+    fn letting_go_of_a_share_leaves_its_password_for_the_sweep_to_reclaim() {
+        let fixture = Fixture::new();
+        let share = share("smb://user@srv/share");
+        let target = point(&fixture, &share);
+        fixture.kernel_helper(&target, "cifs");
+        let mut runner = fixture.runner();
+        let id = runner
+            .mount(&share, Some(&Secret::from("hunter2")))
+            .id
+            .clone()
+            .expect("an id");
+        let report = runner.unmount(&id);
+        assert!(report.ok, "{}", report.message);
+        // Ejecting is not "never again": the password outlives the mount, and the
+        // one place that decides a saved password has no owner is the sweep.
+        assert!(
+            runner.has_password(&share),
+            "an unmount is not a reason to forget a password"
+        );
+        // The share is unmounted and unlisted now, so the next sweep — the one the
+        // window runs on its timer, or `--sweep-mounts` at session start — is the
+        // thing that notices.
+        let sweep = runner
+            .sweep(&runner.leftover_options())
+            .expect("leftover sweep");
+        assert!(sweep.notes().is_empty(), "{}", sweep.summary());
+        assert!(
+            !runner.has_password(&share),
+            "a password with no record to explain it does not survive a sweep"
         );
     }
 

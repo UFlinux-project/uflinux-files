@@ -13,16 +13,13 @@
 
 mod cli;
 
-// The connect dialog calls `mount` and `forget`; a card's or a sidebar row's
-// Disconnect calls `unmount`, Reconnect calls `reconnect`, Forget calls
-// `forget_share`, the login row calls `set_autostart`, `--sweep-mounts` calls
-// `sweep` and `--connect-at-login` calls `connect_at_login`. `list` is the one
-// method still waiting for a caller: it exists so a share can be recorded before
-// it is ever mounted, and a share marked from the sidebar reached that state
-// through `mount` or through a record the table already had. Until something
-// offers a share without mounting it, this keeps the one honest name rather than
-// deleting a capability the mount table already models.
-#[allow(dead_code)]
+// Every method here has a caller: the connect dialog calls `mount` and `forget`, a
+// card's or a sidebar row's Disconnect calls `unmount`, Reconnect calls
+// `reconnect`, Forget calls `forget_share`, the login row calls `set_autostart`,
+// `--sweep-mounts` calls `sweep` and `--connect-at-login` calls `connect_at_login`.
+// The module used to carry an `allow(dead_code)` that hid two helpers nothing
+// outside a test calls — `Runner::list` and `Login::is_empty` — and both now say so
+// with `#[cfg(test)]` instead. See the note on each.
 mod runner;
 mod ui;
 

@@ -462,6 +462,19 @@ JSON
     mkdir -p "$WORK/mnt/orphan-empty" "$WORK/mnt/orphan-full"
     printf 'x\n' >"$WORK/mnt/orphan-full/kept.txt"
 
+    # A saved password whose share is no longer in the table is a leftover of the
+    # same kind, and costs the same: `credentials.json` holds plaintext, so an entry
+    # that outlives its record is a secret with nothing to attach to. Of the two
+    # entries below, one belongs to a share the table does list and has to survive
+    # the run; the other belongs to a share nothing knows about at all.
+    cat >"$WORK/conf/credentials.json" <<'JSON'
+{"version":1,"shares":{
+ "sftp://localhost/srv/live":{"user":null,"password":"hunter2"},
+ "sftp://localhost/srv/deleted":{"user":null,"password":"hunter2"}
+}}
+JSON
+    chmod 600 "$WORK/conf/credentials.json"
+
     report=$("$BIN" --sweep-mounts --json)
     printf '%s\n' "$report" >"$WORK/sweep.json"
     grep -q '"action":"detach"' "$WORK/sweep.json" ||
@@ -482,6 +495,17 @@ JSON
     grep -q "$LIVE_ID" "$WORK/sweep.json" &&
         fail "a live mount was offered for detaching without being asked to" "$(cat "$WORK/sweep.json")"
     ok "a live mount is left alone when only leftovers were asked for"
+
+    # The password file is cleaned by the same rule as the password directory: an
+    # entry survives exactly when a record exists to explain it. `srv/live` has one
+    # and is mounted; `srv/deleted` has nothing and is a secret nobody can name.
+    grep -q 'srv/deleted' "$WORK/conf/credentials.json" &&
+        fail "a saved password whose share is not listed outlived the sweep" \
+        "$(cat "$WORK/conf/credentials.json")"
+    grep -q 'srv/live' "$WORK/conf/credentials.json" ||
+        fail "a saved password for a share that is still connected was dropped" \
+        "$(cat "$WORK/conf/credentials.json")"
+    ok "a sweep drops a saved password with no record and keeps one with a record"
 
     # Everything the report claimed to have done has to have happened, and nothing
     # else: a sweep that lies about a detach leaves a share the user cannot eject.
@@ -514,6 +538,11 @@ JSON
         fail "the report says a detach happened but the mount is still there" "$report"
     [ ! -e "$WORK/mnt/$LIVE_ID" ] ||
         fail "an idle share was detached but its mount point was left behind"
+    # And the password goes with it. The record was the only thing explaining that
+    # entry, and the sweep that removed the record is the run that notices.
+    grep -q 'srv/live' "$WORK/conf/credentials.json" &&
+        fail "a saved password outlived the record that explained it" \
+        "$(cat "$WORK/conf/credentials.json")"
     ok "an idle share is detached without privilege and its mount point with it"
 
     # The user's own files, left where they were.
