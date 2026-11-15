@@ -22,10 +22,12 @@
 //! for directories, so a date checked after a helper ran says nothing about this
 //! crate.
 //!
-//! `$PATH` is process-wide and these tests rewrite it, so the ones that do and the
-//! ones that merely need a codec installed share one lock. Without it a compressed
-//! fixture could be opened while a sibling test had narrowed the environment and
-//! fail for a reason that has nothing to do with the code under test.
+//! `$PATH` is process-wide and these tests rewrite it, so the ones that do, the
+//! ones that merely need a codec installed, and the ones that unpack a whole
+//! container share one lock. The last group matters for a reason beyond codecs: a
+//! narrowed `$PATH` can hold a sibling's *fake* helper, and a whole-container
+//! unpack is the one thing that goes looking for a helper. Without the lock that
+//! sibling runs the fake, and a counter meant to hold one line holds two.
 
 use std::collections::BTreeSet;
 use std::io::Write as _;
@@ -427,6 +429,7 @@ fn gzip_file(source: &Path, target: &Path) {
 
 #[test]
 fn a_whole_zip_arrives_in_the_destination() {
+    let _lock = tools_locked();
     let dir = tempfile::TempDir::new().expect("temp dir");
     let container = dir.path().join("tree.zip");
     as_zip(&container, &tree());
@@ -439,6 +442,7 @@ fn a_whole_zip_arrives_in_the_destination() {
 
 #[test]
 fn a_whole_plain_tar_arrives_in_the_destination() {
+    let _lock = tools_locked();
     let dir = tempfile::TempDir::new().expect("temp dir");
     let container = dir.path().join("tree.tar");
     as_tar(&container, &tree());
@@ -625,6 +629,7 @@ fn one_file_inside_a_container_unpacks_under_its_own_name() {
 
 #[test]
 fn a_link_member_arrives_as_a_link_and_a_device_is_left_out() {
+    let _lock = tools_locked();
     let dir = tempfile::TempDir::new().expect("temp dir");
     let container = dir.path().join("tree.tar");
     let mut members = tree();
@@ -654,6 +659,7 @@ fn a_link_member_arrives_as_a_link_and_a_device_is_left_out() {
 
 #[test]
 fn a_parent_the_container_never_lists_arrives_as_a_folder() {
+    let _lock = tools_locked();
     let dir = tempfile::TempDir::new().expect("temp dir");
     let container = dir.path().join("deep.zip");
     as_zip(
@@ -681,6 +687,7 @@ fn a_parent_the_container_never_lists_arrives_as_a_folder() {
 
 #[test]
 fn the_report_counts_what_arrived_and_says_where() {
+    let _lock = tools_locked();
     let dir = tempfile::TempDir::new().expect("temp dir");
     let container = dir.path().join("tree.tar");
     let members = tree();
