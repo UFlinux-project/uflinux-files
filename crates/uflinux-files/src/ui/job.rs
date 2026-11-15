@@ -34,6 +34,15 @@ use crate::ui::ops::Outcome;
 /// user has navigated away since the chunk it produced was queued.
 #[derive(Debug)]
 pub enum Event {
+    Devices {
+        cards: Vec<super::computer::Card>,
+    },
+    DeviceAction {
+        message: String,
+        success: bool,
+        target: PathBuf,
+        mounted: bool,
+    },
     /// A chunk of a listing that is still being read, in read order.
     Batch {
         location: Location,
@@ -46,13 +55,18 @@ pub enum Event {
         hints: Option<FsHints>,
     },
     /// The read failed. The message is for the banner, so it is already worded.
-    Failed { location: Location, message: String },
+    Failed {
+        location: Location,
+        message: String,
+    },
     /// A network share was connected, or failed to. The one variant that is not
     /// about a listing: mounting runs off-thread because the backend helper
     /// blocks, so its result has to reach the main loop the same way a listing
     /// does. The [`Report`] carries the share id, which is what lets the window
     /// re-read the mount table and move into the new mount point.
-    Mounted { report: Report },
+    Mounted {
+        report: Report,
+    },
     /// A share was disconnected, or could not be. The same shape as
     /// [`Event::Mounted`] and for the same reason — the helper blocks, so the
     /// answer has to reach the main loop through the pipe — but handled
@@ -60,33 +74,46 @@ pub enum Event {
     /// in an empty mount point, so the window repaints and says what happened
     /// instead. `My Computer` is where the answer is read, which is also where
     /// the button that asked for it is.
-    Unmounted { report: Report },
+    Unmounted {
+        report: Report,
+    },
     /// A file operation finished. The other variant that is not about a listing,
     /// and shaped on the same principle: a worker that changed something reports
     /// what it did and which folders it left behind, and the window decides
     /// whether that is worth a re-read. The message is shown whatever the
     /// outcome, because an operation that silently did nothing is
     /// indistinguishable from one that is still running.
-    Operation { outcome: Outcome },
+    Operation {
+        outcome: Outcome,
+    },
     /// A picture is ready, or was not to be had. The third variant that is not
     /// about a folder. `token` names the widget that asked — see [`super::thumb`]
     /// — so the answer can be dropped when that widget has since been rebound,
     /// which is the ordinary outcome of scrolling rather than a failure. Only
     /// encoded bytes travel, because a `Pixbuf` is not `Send`.
-    Thumb { token: u64, png: Option<Vec<u8>> },
+    Thumb {
+        token: u64,
+        png: Option<Vec<u8>>,
+    },
     /// A folder has been walked and its total is known. The fourth variant that
     /// is not about a listing, and the only one whose destination is a dialog:
     /// the properties window asked for the number (see [`super::props`]) and the
     /// window is only the postman. `path` is the folder that was walked, which is
     /// what lets an answer for a dialog the user has since closed be dropped.
-    Sized { path: PathBuf, tally: Tally },
+    Sized {
+        path: PathBuf,
+        tally: Tally,
+    },
     /// One member of an archive has been written out, so the chooser waiting for
     /// it can open. The fifth variant that is not about a folder, and the reason
     /// it carries an id rather than a path is that a `gio::AppInfo` is neither
     /// `Send` nor `Sync`: the list of programs that could take the file cannot
     /// travel to the worker and back, so the worker brings the bytes and the
     /// dialog reads the list itself (see [`super::openwith`]).
-    Materialised { id: usize, path: PathBuf },
+    Materialised {
+        id: usize,
+        path: PathBuf,
+    },
     /// The head of a text file, read for the preview popover. The sixth variant
     /// that is not about a folder, and shaped the way [`Event::Sized`] is: the
     /// popover asked, the window is only the postman, and `token` names the
@@ -94,7 +121,10 @@ pub enum Event {
     /// dropped rather than painted (see [`super::preview`]). The bytes arrive
     /// already decoded and already cut down, because a worker that read a whole
     /// 2 MiB document into a popover would cost more than the popover is worth.
-    Preview { token: u64, text: Option<String> },
+    Preview {
+        token: u64,
+        text: Option<String>,
+    },
     /// Where a file operation has got. The seventh variant that is not about a
     /// folder, and the only one that arrives more than once per job: a worker
     /// that is copying reports every so often (see [`super::jobs::Reporter`],
@@ -102,7 +132,9 @@ pub enum Event {
     /// each one into the strip it already showed. `report.id` names the job, so
     /// a report that arrives after its job finished is dropped rather than
     /// reopening a strip nobody is waiting for.
-    Progress { report: super::jobs::Progress },
+    Progress {
+        report: super::jobs::Progress,
+    },
     /// A file operation is over, and here is what it did. The same shape as
     /// [`Event::Operation`] — the outcome is worded for the banner and names the
     /// folders it left behind — with a job id attached so the strip can be

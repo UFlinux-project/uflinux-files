@@ -8,8 +8,9 @@ It browses directories, archives and mounted network shares through one path
 model, indexes filenames and application entries with Tantivy, and provides the
 desktop icon model that `uflinux-desktop` draws.
 
+    uflinux-files                        # open the Computer overview
     uflinux-files ~/Documents            # open a window at a folder
-    uflinux-files computer://            # the My Computer panel
+    uflinux-files computer://            # open the Computer overview explicitly
     uflinux-files --sweep-mounts         # clean up after an unclean shutdown
     uflinux-files --connect-at-login     # mount the shares marked connect at login
 
@@ -21,11 +22,12 @@ the model over D-Bus and never opens a window.
 - **Three views** of the same folder: icon grid, list with columns, and macOS
   Miller columns. View mode, sort order and column widths are remembered per
   folder, so a folder opened in columns stays in columns.
-- **A My Computer view** for the things that are not folders: `computer://` renders
-  a card per drive and per mounted share, each saying how full its filesystem is
-  and whether the share is still there, with a Disconnect button on the ones that
-  can be. It is a fourth presentation rather than a fourth reader — there is no
-  directory behind it to read.
+- **A Computer start screen** with shortcuts to Home, Recent, Starred and existing
+  XDG folders, plus cards for the system filesystem and local volumes. The Network
+  page lists configured network shares and offers a connection dialog. Device discovery runs off the UI thread. Common unencrypted local
+  volumes can be mounted through the polkit helper and safely unmounted when
+  mounted by Files. Volumes mounted elsewhere open normally; encrypted volumes
+  are shown as locked.
 - **More than one window**: a second invocation opens a window in the instance
   already running rather than a second copy of the program, and `<Ctrl>W` closes
   the one you are looking at. Each window keeps its own folder, view mode and
@@ -112,11 +114,10 @@ the model over D-Bus and never opens a window.
   with an empty dialog. It works on a member of an archive too: the one member is
   written out to a cache that forgets what is a week old, and the program is handed
   that.
-- **A preview on `Space`**: one row, one popover, no detour. The facts come from the
-  listing, so it is instant; a picture is one request to the same thumbnail pipeline
-  the rows use, decoded at the largest size the cache's `large` band holds; and a text
-  file shows its opening bytes, read on a worker that stops at 64 KiB so a 2 MiB
-  document costs no more than a 2 KiB one. The same key closes it.
+- **A right preview pane** that follows the selected row and is toggled with `Space`
+  or the header button. It reuses the bounded image and text preview paths; audio
+  and video playback starts only after pressing Play. Its visibility and width are
+  remembered, and multi-selection shows a count instead of loading every file.
 - **Progress you can watch and stop**: a copy, move, delete or extract puts a strip
   above the listing naming the item it is on and how far along it is — bytes when every
   source reported a size, rows when one did not — and reports at most ten times a

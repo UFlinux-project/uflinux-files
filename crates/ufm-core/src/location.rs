@@ -36,6 +36,7 @@ pub const SEPARATOR: char = '!';
 pub enum VirtualDir {
     /// The "My Computer" overview: drives, mounts, devices, network.
     Computer,
+    Network,
     /// Recently used files.
     Recent,
     /// User-starred locations.
@@ -47,6 +48,7 @@ impl VirtualDir {
     pub const fn scheme(self) -> &'static str {
         match self {
             Self::Computer => "computer",
+            Self::Network => "network",
             Self::Recent => "recent",
             Self::Starred => "starred",
         }
@@ -56,6 +58,7 @@ impl VirtualDir {
     pub const fn label(self) -> &'static str {
         match self {
             Self::Computer => "Computer",
+            Self::Network => "Network",
             Self::Recent => "Recent",
             Self::Starred => "Starred",
         }
@@ -114,6 +117,7 @@ impl Location {
             }
             "archive" => Self::parse_archive(rest, input),
             "computer" => Ok(Self::Virtual(VirtualDir::Computer)),
+            "network" => Ok(Self::Virtual(VirtualDir::Network)),
             "recent" => Ok(Self::Virtual(VirtualDir::Recent)),
             "starred" => Ok(Self::Virtual(VirtualDir::Starred)),
             "search" => {

@@ -130,6 +130,14 @@ pub fn desktop_dir() -> PathBuf {
     home().join("Desktop")
 }
 
+/// Resolve an XDG user directory, with a conventional home-relative fallback.
+#[must_use]
+pub fn user_dir(key: &str, fallback: &str) -> PathBuf {
+    read_user_dirs()
+        .remove(key)
+        .unwrap_or_else(|| home().join(fallback))
+}
+
 #[must_use]
 pub fn home() -> PathBuf {
     std::env::var_os("HOME").map_or_else(|| PathBuf::from("/"), PathBuf::from)

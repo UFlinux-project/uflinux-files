@@ -27,6 +27,7 @@ mod columns;
 mod computer;
 mod conflict;
 mod connect;
+mod devices;
 // The desktop we paint ourselves when no shell claims the renderer interface. Not
 // compiled by default: the feature pulls in gtk4-layer-shell, and a build without
 // it still parses `--desktop-icons` and refuses it by name. Reachable from `main`

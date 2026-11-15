@@ -44,6 +44,7 @@ pub enum Place {
     Recent,
     /// The computer panel: mounts, usage, and what is stale.
     Computer,
+    Network,
     Trash,
     /// A folder the user pinned that is not one of the bookmarks below — kept
     /// for a caller that has a path and no record behind it.
@@ -86,6 +87,7 @@ impl Place {
             Self::Starred => "Starred".to_string(),
             Self::Recent => "Recent".to_string(),
             Self::Computer => "Computer".to_string(),
+            Self::Network => "Network".to_string(),
             Self::Trash => "Trash".to_string(),
             Self::Folder(path) => path.file_name().map_or_else(
                 || path.display().to_string(),
@@ -109,6 +111,7 @@ impl Place {
             Self::Starred => "starred",
             Self::Recent => "document-open-recent",
             Self::Computer => "computer",
+            Self::Network => "network-workgroup-symbolic",
             Self::Trash => "user-trash",
             // The themed folder for a pinned folder and for a bookmark, whatever a
             // bookmark points at. The record has an `icon` field for a name a user
@@ -125,8 +128,7 @@ impl Place {
     #[must_use]
     pub const fn group(&self) -> PanelGroup {
         match self {
-            Self::Home
-            | Self::Desktop
+            Self::Desktop
             | Self::Documents
             | Self::Downloads
             | Self::Music
@@ -134,7 +136,12 @@ impl Place {
             | Self::Videos
             | Self::Folder(_)
             | Self::Bookmark(_) => PanelGroup::Folders,
-            Self::Starred | Self::Recent | Self::Trash | Self::Computer => PanelGroup::System,
+            Self::Home
+            | Self::Starred
+            | Self::Recent
+            | Self::Trash
+            | Self::Computer
+            | Self::Network => PanelGroup::System,
             Self::Mount { .. } => PanelGroup::Network,
         }
     }
@@ -144,25 +151,29 @@ impl Place {
     /// is what a user with no `~/Templates` expects.
     #[must_use]
     pub fn standard() -> Vec<Self> {
-        let home = paths::home();
-        let exists = |name: &str, place: Self| home.join(name).is_dir().then_some(place);
-        let mut places = vec![Self::Home];
+        let exists = |key: &str, name: &str, place: Self| {
+            paths::user_dir(key, name).is_dir().then_some(place)
+        };
+        let mut places = vec![
+            Self::Computer,
+            Self::Home,
+            Self::Recent,
+            Self::Starred,
+            Self::Network,
+            Self::Trash,
+        ];
         places.extend(
             [
-                exists("Desktop", Self::Desktop),
-                exists("Documents", Self::Documents),
-                exists("Downloads", Self::Downloads),
-                exists("Music", Self::Music),
-                exists("Pictures", Self::Pictures),
-                exists("Videos", Self::Videos),
+                paths::desktop_dir().is_dir().then_some(Self::Desktop),
+                exists("XDG_DOCUMENTS_DIR", "Documents", Self::Documents),
+                exists("XDG_DOWNLOAD_DIR", "Downloads", Self::Downloads),
+                exists("XDG_MUSIC_DIR", "Music", Self::Music),
+                exists("XDG_PICTURES_DIR", "Pictures", Self::Pictures),
+                exists("XDG_VIDEOS_DIR", "Videos", Self::Videos),
             ]
             .into_iter()
             .flatten(),
         );
-        places.push(Self::Computer);
-        places.push(Self::Recent);
-        places.push(Self::Starred);
-        places.push(Self::Trash);
         places
     }
 
@@ -177,11 +188,7 @@ impl Place {
     #[must_use]
     pub fn with_bookmarks(bookmarks: &[Bookmark]) -> Vec<Self> {
         let mut places = Self::standard();
-        let at = places
-            .iter()
-            .position(|place| place.group() != PanelGroup::Folders)
-            .unwrap_or(places.len());
-        places.splice(at..at, bookmarks.iter().cloned().map(Self::Bookmark));
+        places.extend(bookmarks.iter().cloned().map(Self::Bookmark));
         places
     }
 
@@ -191,7 +198,13 @@ impl Place {
         match self {
             Self::Home => Location::file(paths::home()),
             Self::Desktop => Location::file(paths::desktop_dir()),
+            Self::Documents => Location::file(paths::user_dir("XDG_DOCUMENTS_DIR", "Documents")),
+            Self::Downloads => Location::file(paths::user_dir("XDG_DOWNLOAD_DIR", "Downloads")),
+            Self::Music => Location::file(paths::user_dir("XDG_MUSIC_DIR", "Music")),
+            Self::Pictures => Location::file(paths::user_dir("XDG_PICTURES_DIR", "Pictures")),
+            Self::Videos => Location::file(paths::user_dir("XDG_VIDEOS_DIR", "Videos")),
             Self::Computer => Location::computer(),
+            Self::Network => Location::parse("network://").expect("network is a location"),
             // The `//` is not decoration: `Location::parse` only accepts a bare
             // absolute path or a `scheme://rest` URI, so a bare `recent:` is an
             // error rather than the Recent folder.
@@ -201,7 +214,6 @@ impl Place {
             Self::Folder(path) => Location::file(path.clone()),
             Self::Bookmark(bookmark) => bookmark.location.clone(),
             Self::Mount { id, .. } => Location::file(paths::mount_root().join(id)),
-            other => Location::file(paths::home().join(other.label())),
         }
     }
 }
@@ -448,6 +460,10 @@ impl Panel {
     /// Rebuild the list. The order is the caller's, so bookmarks stay where the
     /// user put them; a heading is inserted wherever the group changes.
     pub fn set_places(&self, places: Vec<Place>) {
+        let places: Vec<_> = places
+            .into_iter()
+            .filter(|p| !matches!(p, Place::Mount { .. }))
+            .collect();
         self.list.unselect_all();
         for child in child_widgets(&self.list) {
             self.list.remove(&child);
@@ -455,8 +471,13 @@ impl Panel {
         let mut last: Option<PanelGroup> = None;
         for place in &places {
             let group = place.group();
-            if last != Some(group) {
-                self.list.append(&heading(group));
+            if last.is_some() && last != Some(group) {
+                let separator = gtk::Separator::new(gtk::Orientation::Horizontal);
+                let row = gtk::ListBoxRow::new();
+                row.set_selectable(false);
+                row.set_activatable(false);
+                row.set_child(Some(&separator));
+                self.list.append(&row);
             }
             last = Some(group);
             self.list.append(&self.row(place));
@@ -755,10 +776,7 @@ mod tests {
             .iter()
             .position(|place| *place == Place::Computer)
             .expect("Computer should still be a row");
-        assert!(
-            at < computer,
-            "a bookmark belongs with the folders, not under the system rows"
-        );
+        assert!(at > computer, "bookmarks follow the primary places");
         // The reason for the splice rather than an append: one heading per group.
         // Walking the groups and counting the runs is what `set_places` does when
         // it decides where to draw a heading, so a second run of folders here

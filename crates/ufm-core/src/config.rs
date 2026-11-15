@@ -136,6 +136,10 @@ pub struct Preferences {
     /// The switch lives here rather than only in the view so that a second window
     /// and the desktop provider can be told the same thing.
     pub thumbnails: bool,
+    /// Whether the selection inspector is requested in wide windows.
+    pub preview_visible: bool,
+    pub preview_width_px: u32,
+    pub sidebar_width_px: u32,
     pub panel_mode: PanelMode,
     pub panel_groups: HashMap<PanelGroup, PanelMode>,
     /// Panel groups the user switched off entirely.
@@ -184,6 +188,9 @@ impl Default for Preferences {
             show_hidden: false,
             show_toolbar: true,
             thumbnails: true,
+            preview_visible: true,
+            preview_width_px: 320,
+            sidebar_width_px: 220,
             panel_mode: PanelMode::Visible,
             panel_groups,
             panel_hidden: Vec::new(),
@@ -215,6 +222,8 @@ impl Preferences {
         // UI. Clamp rather than reset so the rest of the file survives.
         prefs.icon_scale = prefs.icon_scale.clamp(16, 512);
         prefs.list_density = prefs.list_density.clamp(16, 64);
+        prefs.preview_width_px = prefs.preview_width_px.clamp(260, 640);
+        prefs.sidebar_width_px = prefs.sidebar_width_px.clamp(160, 400);
         Ok(prefs)
     }
 

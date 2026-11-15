@@ -18,6 +18,33 @@ pub const CSS: &str = r"
     padding: 6px;
     border-radius: 6px;
 }
+.ufm-inspector {
+    border-left: 1px solid alpha(currentColor, 0.12);
+    background-color: alpha(currentColor, 0.025);
+}
+button.ufm-shortcut {
+    min-width: 88px;
+    min-height: 92px;
+    padding: 10px;
+    border-radius: 10px;
+}
+button.ufm-shortcut:hover {
+    background-color: alpha(currentColor, 0.08);
+}
+button.ufm-shortcut image {
+    color: @accent_color;
+}
+box.ufm-drive {
+    min-width: 250px;
+    min-height: 76px;
+    padding: 12px;
+    border-radius: 10px;
+    background-color: alpha(currentColor, 0.035);
+    border: 1px solid alpha(currentColor, 0.09);
+}
+box.ufm-drive image {
+    color: @accent_color;
+}
 .ufm-cell:hover {
     background-color: alpha(currentColor, 0.07);
 }
@@ -64,7 +91,9 @@ row.ufm-sidebar-group {
     padding-top: 10px;
 }
 row.ufm-place {
-    padding: 3px 6px;
+    padding: 8px 10px;
+    margin: 2px 6px;
+    border-radius: 8px;
 }
 box.ufm-computer {
     padding: 8px;
@@ -173,6 +202,9 @@ mod tests {
         // without a rule is a style that silently does nothing.
         let classes = [
             "ufm-cell",
+            "ufm-inspector",
+            "ufm-shortcut",
+            "ufm-drive",
             "ufm-header",
             "ufm-header-active",
             "ufm-name",

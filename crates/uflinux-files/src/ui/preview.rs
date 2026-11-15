@@ -1,6 +1,10 @@
 //! What this row actually is, without leaving the folder.
 //!
-//! The spacebar preview: a popover over the selected row that says what the row
+//! The window uses an embedded inspector. The older popover implementation below
+//! remains as a compatibility reference for its focused widget tests; no window
+//! installs it. Both presentations use the same bounded content builders.
+//!
+//! The original spacebar preview: a popover over the selected row that says what the row
 //! holds — its type, its size, when it changed, and when possible the thing
 //! itself: the picture for an image, the opening lines for a text file. The
 //! point is the answer without a detour. Opening a document means waiting for an
@@ -41,9 +45,9 @@ use super::job::{Event, Handle};
 use super::row::Row;
 use super::thumb::Pipeline;
 
-/// The edge a preview picture is decoded at: the largest the thumbnail crate
-/// allows, which lands it in the cache's `large` band and away from the icons.
-const EDGE: u32 = ufm_thumb::MAX_SIZE;
+/// Large enough for the inspector while keeping a decoded image bounded on a
+/// small window. This remains in the thumbnail cache's large band.
+const EDGE: u32 = 320;
 
 /// How much of a text file is read. A preview is not a pager; the opening
 /// kilobytes say whether this is the file the user was looking for, and reading
@@ -436,6 +440,113 @@ fn pointing_to(window: &gtk::ApplicationWindow) -> Option<gtk::gdk::Rectangle> {
         1,
         1,
     ))
+}
+
+/// Selection inspector embedded beside the listing. The older popover above is
+/// retained for its existing widget tests, but windows use this pane.
+pub struct Inspector {
+    root: gtk::Box,
+    content: gtk::Box,
+    video: RefCell<Option<gtk::Video>>,
+}
+
+impl Inspector {
+    pub fn new() -> Self {
+        let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        root.add_css_class("ufm-inspector");
+        root.set_widget_name("ufm-inspector");
+        root.set_size_request(260, -1);
+        let title = gtk::Label::new(Some("Preview"));
+        title.add_css_class("heading");
+        title.set_xalign(0.0);
+        title.set_margin_top(14);
+        title.set_margin_start(14);
+        title.set_margin_bottom(8);
+        root.append(&title);
+        let scroll = gtk::ScrolledWindow::new();
+        scroll.set_vexpand(true);
+        let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        content.set_margin_start(14);
+        content.set_margin_end(14);
+        scroll.set_child(Some(&content));
+        root.append(&scroll);
+        let inspector = Self {
+            root,
+            content,
+            video: RefCell::new(None),
+        };
+        inspector.placeholder("Select a file to preview");
+        inspector
+    }
+
+    pub fn widget(&self) -> &gtk::Box {
+        &self.root
+    }
+
+    pub fn clear(&self, window: &gtk::ApplicationWindow) {
+        forget(window);
+        if let Some(video) = self.video.borrow_mut().take() {
+            if let Some(stream) = video.media_stream() {
+                stream.pause();
+            }
+            video.set_filename(None::<&Path>);
+        }
+        while let Some(child) = self.content.first_child() {
+            self.content.remove(&child);
+        }
+    }
+
+    fn placeholder(&self, message: &str) {
+        let label = gtk::Label::new(Some(message));
+        label.add_css_class("dim-label");
+        label.set_wrap(true);
+        label.set_margin_top(24);
+        self.content.append(&label);
+    }
+
+    pub fn show_entries(
+        &self,
+        window: &gtk::ApplicationWindow,
+        handle: &Handle,
+        thumbs: &Pipeline,
+        entries: &[Entry],
+    ) {
+        self.clear(window);
+        let [entry] = entries else {
+            if entries.is_empty() {
+                self.placeholder("Select a file to preview");
+            } else {
+                self.placeholder(&format!("{} items selected", entries.len()));
+            }
+            return;
+        };
+        self.content.append(&body(window, handle, thumbs, entry));
+        let is_media = entry
+            .mime
+            .as_deref()
+            .is_some_and(|m| m.starts_with("video/") || m.starts_with("audio/"));
+        if is_media && let Some(path) = entry.location.as_path() {
+            let play = gtk::Button::with_label("Play preview");
+            play.set_margin_top(12);
+            let video = gtk::Video::new();
+            video.set_autoplay(false);
+            video.set_size_request(240, 160);
+            video.set_visible(false);
+            let source = path.to_path_buf();
+            let player = video.clone();
+            play.connect_clicked(move |button| {
+                player.set_filename(Some(&source));
+                player.set_visible(true);
+                if let Some(stream) = player.media_stream() {
+                    stream.play();
+                }
+                button.set_visible(false);
+            });
+            self.content.append(&play);
+            self.content.append(&video);
+            *self.video.borrow_mut() = Some(video);
+        }
+    }
 }
 #[cfg(test)]
 mod tests {

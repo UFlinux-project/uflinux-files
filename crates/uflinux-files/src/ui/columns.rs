@@ -365,7 +365,9 @@ impl Columns {
             // job's ending, both of which belong to the strip rather than to a
             // pane — and a pane that re-read itself on every report would spend
             // a copy re-reading the folder it is copying into.
-            Event::Batch { .. }
+            Event::Devices { .. }
+            | Event::DeviceAction { .. }
+            | Event::Batch { .. }
             | Event::Mounted { .. }
             | Event::Unmounted { .. }
             | Event::Operation { .. }

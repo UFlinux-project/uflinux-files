@@ -503,10 +503,10 @@ fi
 # the prompt is answered from here. The job's pid is kept rather than waiting for
 # every background job, because `labwc` and the application are background jobs too
 # and outlive this section.
-if ! python3 "$A11Y" select one >/dev/null 2>&1; then
-    fail "a row can be selected through the accessibility tree"
-else
+if SELECT_RESULT=$(python3 "$A11Y" select one 2>&1); then
     ok "a row can be selected through the accessibility tree"
+else
+    fail "a row can be selected through the accessibility tree ($SELECT_RESULT)"
 fi
 act copy "[]" "[]"
 act up "[]" "[]"
@@ -707,8 +707,8 @@ fi
 # their key labels — `Location`, `Permissions` — because those words appear
 # nowhere else in the interface, unlike the kind label, which the list view also
 # prints per row whenever that mode is showing.
-if ! python3 "$A11Y" select one >/dev/null 2>&1; then
-    fail "a row can be selected for the properties check"
+if SELECT_RESULT=$(python3 "$A11Y" select one 2>&1); [ "$?" -ne 0 ]; then
+    fail "a row can be selected for the properties check ($SELECT_RESULT)"
 elif describe properties | grep -qF '(true'; then
     ok "Properties is sensitive with one row selected"
 else
@@ -990,10 +990,8 @@ else
     fi
 fi
 
-# --- the spacebar preview ----------------------------------------------------
-# The popover is built from what the listing already carries, so the assertions
-# are that it appears at all, that it says something the rest of the interface
-# does not, and that the same key that opened it closes it. The text pane is what
+# --- the right preview pane --------------------------------------------------
+# The inspector is built from what the listing already carries. The text pane is what
 # makes this checkable: its content is the file's own bytes, which appear
 # nowhere else on screen, so finding the string proves the worker read the file
 # and the answer found the label that asked for it.
@@ -1038,8 +1036,7 @@ else
     else
         fail "Preview is sensitive with one plain file selected ($(describe preview))"
     fi
-    act preview "[]" "[]"
-    # The file's bytes, which no row, column heading or status label says.
+    # The pane is visible by default and follows selection.
     has_named "preview-head-line" "the preview shows the opening text of the file"
     # The facts the listing already had, read off the fixture rather than
     # hard-coded. Nothing else in the interface prints a mode string: the
@@ -1051,8 +1048,7 @@ else
     else
         fail "the preview reports the mode bits the file actually has (no $pmode)"
     fi
-    # The same key closes it, which is the whole difference between a preview and
-    # a dialog the user has to go looking for the dismiss of.
+    # Space closes the pane, then opens it again with the same selected file.
     act preview "[]" "[]"
     i=0
     while [ "$i" -lt 50 ] && printf '%s\n' "$DUMP" |
@@ -1064,8 +1060,10 @@ else
     if printf '%s\n' "$DUMP" | grep -qF "$(printf '\tpreview-head-line\t')"; then
         fail "the same key closes the preview again"
     else
-        ok "the same key closes the preview again"
+        ok "Space closes the preview pane"
     fi
+    act preview "[]" "[]"
+    has_named "preview-head-line" "Space reopens the preview pane"
 fi
 
 # A picture preview asks the thumbnail pipeline for the largest size it allows,
@@ -1078,7 +1076,6 @@ if [ "$probe" != ok ]; then
     echo "skip preview picture: this machine cannot decode an image"
 else
     python3 "$A11Y" select photo.png >/dev/null 2>&1 || :
-    act preview "[]" "[]"
     i=0
     big=
     while [ "$i" -lt 100 ] && [ -z "$big" ]; do
@@ -1499,13 +1496,11 @@ if printf '%s\n' "$CFRAME" | grep -qF "$(printf '\tSystem\t')"; then
 else
     fail "the My Computer view shows the system drive (no card named 'System')"
 fi
-# "Home" appears twice in this window: once as the sidebar's place, once as the
-# card. Counting rather than merely matching is what makes the check about the
-# card, because the sidebar row alone would satisfy a plain match.
+# "Home" appears in both the sidebar and the preferred-folder shortcuts.
 if [ "$(printf '%s\n' "$CFRAME" | grep -cF "$(printf '\tHome\t')")" -ge 2 ]; then
     ok "the My Computer view shows the home folder"
 else
-    fail "the My Computer view shows the home folder (only the sidebar says Home)"
+    fail "the My Computer view shows the home folder shortcut"
 fi
 # The one thing a folder listing could never say, and the reason the view exists:
 # a card reports how full its filesystem is. The sidebar's Home row carries a
@@ -1548,10 +1543,9 @@ else
     ok "Computer shows cards rather than a reader error"
 fi
 # The count in the bar counts cards. Left to the listing path it would have said
-# "Empty folder" about a window showing two drives. Four since the fixture started
-# with one share listed and a desktop folder: Home, Desktop, the system drive, and
-# that share.
-if printf '%s\n' "$CFRAME" | grep -qF "$(printf '\t4 items\t')"; then
+# "Empty folder" about a window showing two drives. Three cards are present:
+# Desktop, the system drive, and the configured share. Home is a shortcut.
+if printf '%s\n' "$CFRAME" | grep -qF "$(printf '\t3 items\t')"; then
     ok "the status line counts the cards rather than entries read from disk"
 else
     fail "the status line counts the cards rather than entries read from disk"
@@ -1775,11 +1769,9 @@ if printf '%s\n' "$CFRAME" | grep -qF "$(printf 'table cell\tvideos2024\t')"; th
 else
     ok "forgetting a share takes its card out of the window that did not ask"
 fi
-# The count in that window's bar counts what it is showing now. Three cards left:
-# Home, the desktop folder and the system drive. A bar still saying four over three
-# cards is the same mistake as a row left over a share that is gone, one widget
-# further down.
-if printf '%s\n' "$CFRAME" | grep -qF "$(printf '\t3 items\t')"; then
+# The count in that window's bar counts what it is showing now. Two cards left:
+# the desktop folder and the system drive. Home is in the shortcuts above.
+if printf '%s\n' "$CFRAME" | grep -qF "$(printf '\t2 items\t')"; then
     ok "the other window's status line counts the cards it has left"
 else
     fail "the other window's status line counts the cards it has left"

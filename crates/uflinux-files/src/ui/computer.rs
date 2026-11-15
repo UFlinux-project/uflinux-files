@@ -22,6 +22,7 @@ use std::rc::Rc;
 
 use gtk::prelude::*;
 
+use ufm_core::Location;
 use ufm_core::entry::human_size;
 use ufm_core::paths;
 use ufm_mount::{MountRecord, MountState, Protocol, Share};
@@ -34,6 +35,10 @@ pub enum CardId {
     Local(PathBuf),
     /// A share in the mount table, by record id.
     Mount(String),
+    Device {
+        path: PathBuf,
+        mountpoint: Option<PathBuf>,
+    },
 }
 
 /// One card of the My Computer view.
@@ -179,6 +184,9 @@ fn capacity(hints: &FsHints) -> Option<String> {
 struct Hooks {
     on_open: RefCell<Option<Open>>,
     on_unmount: RefCell<Option<Unmount>>,
+    on_shortcut: RefCell<Option<Box<dyn Fn(Location)>>>,
+    on_device: RefCell<Option<Box<dyn Fn(PathBuf, Option<PathBuf>)>>>,
+    on_connect: RefCell<Option<Box<dyn Fn()>>>,
 }
 
 type Open = Box<dyn Fn(CardId)>;
@@ -206,9 +214,16 @@ impl Hooks {
 /// tracking which card moved.
 pub struct ComputerView {
     scroll: gtk::ScrolledWindow,
+    network_only: bool,
     flow: gtk::FlowBox,
+    local_flow: gtk::FlowBox,
+    removable_flow: gtk::FlowBox,
+    local_heading: gtk::Label,
+    removable_heading: gtk::Label,
     count: Cell<usize>,
     hooks: Rc<Hooks>,
+    base: RefCell<Vec<Card>>,
+    devices: RefCell<Vec<Card>>,
 }
 
 /// The widget name every card carries, so a test can find a card without
@@ -221,6 +236,14 @@ const SLOT: &str = "ufm-card-id";
 impl ComputerView {
     #[must_use]
     pub fn new() -> Self {
+        Self::build_view(false)
+    }
+
+    pub fn network() -> Self {
+        Self::build_view(true)
+    }
+
+    fn build_view(network_only: bool) -> Self {
         let flow = gtk::FlowBox::new();
         flow.set_homogeneous(true);
         flow.set_max_children_per_line(6);
@@ -236,6 +259,9 @@ impl ComputerView {
         let hooks = Rc::new(Hooks {
             on_open: RefCell::new(None),
             on_unmount: RefCell::new(None),
+            on_shortcut: RefCell::new(None),
+            on_device: RefCell::new(None),
+            on_connect: RefCell::new(None),
         });
         // Connected once, for the life of the view, rather than on every repaint:
         // the handler reads the id out of the child it was handed, so it works for
@@ -250,16 +276,168 @@ impl ComputerView {
                 }
             }
         });
+        let local_flow = gtk::FlowBox::new();
+        let removable_flow = gtk::FlowBox::new();
+        for group in [&local_flow, &removable_flow] {
+            group.set_selection_mode(gtk::SelectionMode::None);
+            group.set_max_children_per_line(4);
+            group.set_row_spacing(12);
+            group.set_column_spacing(12);
+            group.connect_child_activated({
+                let hooks = Rc::clone(&hooks);
+                move |_, child| {
+                    if let Some(id) = card_id(child) {
+                        hooks.open(id);
+                    }
+                }
+            });
+        }
 
+        let page = gtk::Box::new(gtk::Orientation::Vertical, 18);
+        page.set_margin_top(24);
+        page.set_margin_start(24);
+        page.set_margin_end(24);
+        page.set_margin_bottom(24);
+        let heading = gtk::Label::new(Some("Preferred Folders"));
+        heading.add_css_class("heading");
+        heading.set_xalign(0.0);
+        page.append(&heading);
+        let shortcuts = gtk::FlowBox::new();
+        shortcuts.set_selection_mode(gtk::SelectionMode::None);
+        shortcuts.set_max_children_per_line(9);
+        shortcuts.set_column_spacing(8);
+        shortcuts.set_row_spacing(8);
+        for (name, icon, location) in [
+            (
+                "Home",
+                "user-home-symbolic",
+                Some(Location::file(paths::home())),
+            ),
+            (
+                "Recent",
+                "document-open-recent-symbolic",
+                Location::parse("recent://").ok(),
+            ),
+            (
+                "Starred",
+                "starred-symbolic",
+                Location::parse("starred://").ok(),
+            ),
+            (
+                "Documents",
+                "folder-documents-symbolic",
+                Some(Location::file(paths::user_dir(
+                    "XDG_DOCUMENTS_DIR",
+                    "Documents",
+                ))),
+            ),
+            (
+                "Downloads",
+                "folder-download-symbolic",
+                Some(Location::file(paths::user_dir(
+                    "XDG_DOWNLOAD_DIR",
+                    "Downloads",
+                ))),
+            ),
+            (
+                "Music",
+                "folder-music-symbolic",
+                Some(Location::file(paths::user_dir("XDG_MUSIC_DIR", "Music"))),
+            ),
+            (
+                "Videos",
+                "folder-videos-symbolic",
+                Some(Location::file(paths::user_dir("XDG_VIDEOS_DIR", "Videos"))),
+            ),
+            (
+                "Pictures",
+                "folder-pictures-symbolic",
+                Some(Location::file(paths::user_dir(
+                    "XDG_PICTURES_DIR",
+                    "Pictures",
+                ))),
+            ),
+        ] {
+            let Some(location) = location else {
+                continue;
+            };
+            if let Some(path) = location.as_path()
+                && !path.is_dir()
+            {
+                continue;
+            }
+            let button = gtk::Button::new();
+            button.add_css_class("ufm-shortcut");
+            let box_ = gtk::Box::new(gtk::Orientation::Vertical, 6);
+            let image = gtk::Image::from_icon_name(icon);
+            image.set_pixel_size(48);
+            box_.append(&image);
+            box_.append(&gtk::Label::new(Some(name)));
+            button.set_child(Some(&box_));
+            let hooks = Rc::clone(&hooks);
+            button.connect_clicked(move |_| {
+                if let Some(callback) = hooks.on_shortcut.borrow().as_ref() {
+                    callback(location.clone());
+                }
+            });
+            shortcuts.append(&button);
+        }
+        let network = gtk::Button::new();
+        network.add_css_class("ufm-shortcut");
+        let network_body = gtk::Box::new(gtk::Orientation::Vertical, 6);
+        let network_icon = gtk::Image::from_icon_name("network-workgroup-symbolic");
+        network_icon.set_pixel_size(48);
+        network_body.append(&network_icon);
+        network_body.append(&gtk::Label::new(Some("Network")));
+        network.set_child(Some(&network_body));
+        network.connect_clicked({
+            let hooks = Rc::clone(&hooks);
+            move |_| {
+                if let Some(callback) = hooks.on_shortcut.borrow().as_ref() {
+                    callback(Location::parse("network://").expect("network location"));
+                }
+            }
+        });
+        shortcuts.append(&network);
+        page.append(&shortcuts);
+        heading.set_visible(!network_only);
+        shortcuts.set_visible(!network_only);
+        let connect = gtk::Button::with_label("Connect to Server…");
+        connect.set_action_name(Some("win.connect"));
+        connect.set_halign(gtk::Align::Start);
+        connect.set_visible(network_only);
+        page.append(&connect);
+        let heading = gtk::Label::new(Some(if network_only { "Network" } else { "Storage" }));
+        heading.add_css_class("heading");
+        heading.set_xalign(0.0);
+        page.append(&heading);
+        page.append(&flow);
+        let local_heading = gtk::Label::new(Some("On This Computer"));
+        local_heading.add_css_class("heading");
+        local_heading.set_xalign(0.0);
+        page.append(&local_heading);
+        page.append(&local_flow);
+        let removable_heading = gtk::Label::new(Some("Removable"));
+        removable_heading.add_css_class("heading");
+        removable_heading.set_xalign(0.0);
+        page.append(&removable_heading);
+        page.append(&removable_flow);
         let scroll = gtk::ScrolledWindow::new();
-        scroll.set_child(Some(&flow));
+        scroll.set_child(Some(&page));
         scroll.set_hexpand(true);
         scroll.set_vexpand(true);
         Self {
             scroll,
+            network_only,
             flow,
+            local_flow,
+            removable_flow,
+            local_heading,
+            removable_heading,
             count: Cell::new(0),
             hooks,
+            base: RefCell::new(Vec::new()),
+            devices: RefCell::new(Vec::new()),
         }
     }
 
@@ -281,11 +459,53 @@ impl ComputerView {
     /// changed. The flow's own activation handler was connected in [`Self::new`]
     /// and stays, because it reads each card's id from the card itself.
     pub fn set_cards(&self, cards: &[Card]) {
+        if self.base.borrow().as_slice() == cards {
+            return;
+        }
+        *self.base.borrow_mut() = cards.to_vec();
+        self.render();
+    }
+
+    pub fn set_devices(&self, cards: Vec<Card>) {
+        if *self.devices.borrow() == cards {
+            return;
+        }
+        *self.devices.borrow_mut() = cards;
+        self.render();
+    }
+
+    fn render(&self) {
         self.flow.remove_all();
-        for card in cards {
+        self.local_flow.remove_all();
+        self.removable_flow.remove_all();
+        let base = self.base.borrow();
+        let devices = self.devices.borrow();
+        let shown = base.iter().filter(|card| {
+            if self.network_only {
+                matches!(card.id, CardId::Mount(_))
+            } else {
+                !matches!(card.id, CardId::Mount(_))
+                    && !matches!(&card.id, CardId::Local(path) if path == &paths::home())
+            }
+        });
+        let base_count = shown.clone().count();
+        for card in shown {
             self.flow.append(&build(card, &self.hooks));
         }
-        self.count.set(cards.len());
+        let mut locals = 0;
+        let mut removable = 0;
+        for card in devices.iter().filter(|_| !self.network_only) {
+            if card.icon == "drive-removable-media-symbolic" {
+                self.removable_flow.append(&build(card, &self.hooks));
+                removable += 1;
+            } else {
+                self.local_flow.append(&build(card, &self.hooks));
+                locals += 1;
+            }
+        }
+        self.local_heading.set_visible(locals > 0);
+        self.removable_heading.set_visible(removable > 0);
+        self.count.set(base_count + locals + removable);
     }
 
     /// What happens when a card is activated. The window navigates.
@@ -296,6 +516,18 @@ impl ComputerView {
     /// What happens when a card's Disconnect is pressed. The window unmounts.
     pub fn on_unmount(&self, f: impl Fn(String) + 'static) {
         *self.hooks.on_unmount.borrow_mut() = Some(Box::new(f));
+    }
+
+    pub fn on_shortcut(&self, f: impl Fn(Location) + 'static) {
+        *self.hooks.on_shortcut.borrow_mut() = Some(Box::new(f));
+    }
+
+    pub fn on_device(&self, f: impl Fn(PathBuf, Option<PathBuf>) + 'static) {
+        *self.hooks.on_device.borrow_mut() = Some(Box::new(f));
+    }
+
+    pub fn on_connect(&self, f: impl Fn() + 'static) {
+        *self.hooks.on_connect.borrow_mut() = Some(Box::new(f));
     }
 }
 
@@ -318,7 +550,10 @@ fn card_id(child: &gtk::FlowBoxChild) -> Option<CardId> {
 fn build(card: &Card, hooks: &Rc<Hooks>) -> gtk::FlowBoxChild {
     let body = gtk::Box::new(gtk::Orientation::Horizontal, 10);
     body.add_css_class("ufm-computer");
-    body.append(&gtk::Image::from_icon_name(&card.icon));
+    body.add_css_class("ufm-drive");
+    let icon = gtk::Image::from_icon_name(&card.icon);
+    icon.set_pixel_size(36);
+    body.append(&icon);
 
     let lines = gtk::Box::new(gtk::Orientation::Vertical, 2);
     lines.set_hexpand(true);
@@ -336,7 +571,9 @@ fn build(card: &Card, hooks: &Rc<Hooks>) -> gtk::FlowBoxChild {
     }
     body.append(&lines);
 
-    if let CardId::Mount(id) = &card.id {
+    if let CardId::Mount(id) = &card.id
+        && matches!(card.state, Some("Connected" | "Disconnected"))
+    {
         let hooks = Rc::clone(hooks);
         let id = id.clone();
         let button = gtk::Button::with_label("Disconnect");
@@ -344,12 +581,49 @@ fn build(card: &Card, hooks: &Rc<Hooks>) -> gtk::FlowBoxChild {
         button.connect_clicked(move |_| hooks.unmount(&id));
         body.append(&button);
     }
+    if let CardId::Mount(id) = &card.id
+        && card.state == Some("Not connected")
+    {
+        let actions = gtk::MenuButton::new();
+        actions.set_icon_name("open-menu-symbolic");
+        let menu = gio::Menu::new();
+        menu.append(Some("Reconnect"), Some(&format!("win.reconnect('{}')", id)));
+        menu.append(Some("Forget"), Some(&format!("win.forget-share('{}')", id)));
+        actions.set_menu_model(Some(&menu));
+        body.append(&actions);
+    }
+    if let CardId::Device { path, mountpoint } = &card.id
+        && !matches!(card.state, Some("Locked" | "Unsupported"))
+        && mountpoint
+            .as_ref()
+            .is_none_or(|p| p.starts_with(paths::mount_root().join("devices")))
+    {
+        let button = gtk::Button::with_label(if mountpoint.is_some() {
+            "Eject"
+        } else {
+            "Mount"
+        });
+        let hooks = Rc::clone(hooks);
+        let path = path.clone();
+        let mountpoint = mountpoint.clone();
+        button.connect_clicked(move |_| {
+            if let Some(callback) = hooks.on_device.borrow().as_ref() {
+                callback(path.clone(), mountpoint.clone());
+            }
+        });
+        body.append(&button);
+    }
 
     let child = gtk::FlowBoxChild::new();
     child.set_widget_name(CARD);
     child.set_child(Some(&body));
     child.set_tooltip_text(Some(&card.detail));
-    child.set_sensitive(card.can_open);
+    child.set_sensitive(
+        card.can_open
+            || matches!(card.id, CardId::Mount(_))
+            || (matches!(card.id, CardId::Device { .. })
+                && !matches!(card.state, Some("Locked" | "Unsupported"))),
+    );
     // Same reason as the sidebar rows: the flow child is the thing a screen
     // reader lands on and activates, and a card whose name lives only on the
     // label inside it is an anonymous list item. The label property is the

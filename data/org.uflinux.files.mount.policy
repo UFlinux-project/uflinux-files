@@ -23,10 +23,10 @@
 <policyconfig>
 
   <action id="org.uflinux.files.mount">
-    <description>Mount or unmount a network share</description>
+    <description>Mount or unmount a network share or local volume</description>
     <description xml:lang="fr">Monter ou démonter un partage réseau</description>
     <description xml:lang="km">តំឡើង ឬដោះតំឡើងការចែករំលែកបណ្ដាញ</description>
-    <message>UFLinux Files needs administrator authorization to mount a network share.</message>
+    <message>UFLinux Files needs administrator authorization to mount a share or local volume.</message>
     <message xml:lang="fr">Files a besoin d'une autorisation d'administrateur pour monter un partage réseau.</message>
     <message xml:lang="km">កម្មវិធី Files ត្រូវការការអនុម័តពីអ្នកគ្រប់គ្រង ដើម្បីតំឡើងការចែករំលែកបណ្ដាញ។</message>
     <icon_name>org.uflinux.Files</icon_name>

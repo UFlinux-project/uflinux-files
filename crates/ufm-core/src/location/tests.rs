@@ -109,6 +109,8 @@ fn archive_needs_a_separator() {
 #[test]
 fn virtual_locations() {
     assert_eq!(parse("computer://"), Location::computer());
+    assert_eq!(parse("network://"), Location::Virtual(VirtualDir::Network));
+    assert_eq!(parse("network://").to_string(), "network://");
     assert_eq!(parse("recent://"), Location::Virtual(VirtualDir::Recent));
     assert_eq!(parse("starred://"), Location::Virtual(VirtualDir::Starred));
     assert_eq!("computer://", Location::computer().to_string());

@@ -6,7 +6,7 @@ pkgdesc="UFLinux file manager: GTK4 browsing, archives, mounts and search"
 url="${UFLINUX_PROJECT_URL:-https://github.com}"
 arch="x86 x86_64 aarch64 armv7 ppc64le s390x riscv64"
 license="GPL-3.0-only"
-depends="uflinux-files-searchd=$pkgver-r$pkgrel desktop-file-utils hicolor-icon-theme"
+depends="uflinux-files-searchd=$pkgver-r$pkgrel desktop-file-utils hicolor-icon-theme lsblk"
 # Not `udisks2`: UFLinux has no udisks2, so SMB and NFS go through our own
 # polkit action and /usr/libexec/uflinux-files-mount. The session agent that
 # answers the pkexec prompt is the one uflinux-desktop already registers.
@@ -121,7 +121,7 @@ mount_helper() {
 	# cifs-utils/nfs-utils are the mount helpers the two kernel filesystems
 	# actually call; sshfs-fuse and davfs2 are the unprivileged paths and belong
 	# to the main package's recommends instead.
-	depends="polkit-elogind cifs-utils nfs-utils"
+	depends="polkit-elogind cifs-utils nfs-utils blkid mount umount"
 	amove usr/libexec/uflinux-files-mount usr/share/polkit-1 usr/share/uflinux-files
 }
 # Filled in by scripts/files-source.py --update; empty here so the recipe still

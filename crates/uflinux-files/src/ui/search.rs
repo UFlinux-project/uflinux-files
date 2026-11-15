@@ -249,6 +249,11 @@ impl Search {
         self.inner.entry.grab_focus();
     }
 
+    pub fn show_here(&self) {
+        self.inner.target.set_selected(Target::Here.index());
+        self.show();
+    }
+
     /// Ask now, without waiting out the debounce. Used by <kbd>Enter</kbd> and by
     /// a refresh of results after the index or the folder changed.
     pub fn search_now(&self) {

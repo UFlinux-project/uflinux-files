@@ -39,6 +39,7 @@
 #![allow(clippy::doc_markdown)]
 
 use std::io::Write;
+use std::os::unix::fs::FileTypeExt;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command as OsCommand, ExitCode, Stdio};
@@ -134,10 +135,128 @@ const USAGE: &str = "usage: uflinux-files-mount mount|unmount --type cifs|nfs --
 /// Parse, check, and run. The split exists so the tests can cover every
 /// rejection without a root-owned mount namespace.
 fn dispatch(argv: &[String]) -> Result<u8, String> {
+    if argv
+        .first()
+        .is_some_and(|s| matches!(s.as_str(), "device-mount" | "device-unmount"))
+    {
+        return device_dispatch(argv);
+    }
     let request = parse(argv)?;
     let owner = owner()?;
     let request = check(&request, owner)?;
     Ok(run(&request))
+}
+
+/// Local volumes have a separate, fixed argument shape and mount root. They do
+/// not accept caller-supplied filesystem types or mount options.
+fn device_dispatch(argv: &[String]) -> Result<u8, String> {
+    if argv.len() != 5 || argv[1] != "--device" || argv[3] != "--target" {
+        return Err(
+            "device request expects device-mount|device-unmount --device /dev/NAME --target DIR"
+                .into(),
+        );
+    }
+    let owner = owner()?;
+    let mount = argv[0] == "device-mount";
+    let source = PathBuf::from(&argv[2]);
+    let device =
+        std::fs::canonicalize(&source).map_err(|e| format!("{}: {e}", source.display()))?;
+    if !device.starts_with("/dev/")
+        || !std::fs::metadata(&device)
+            .map_err(|e| e.to_string())?
+            .file_type()
+            .is_block_device()
+    {
+        return Err("the source is not a block device under /dev".into());
+    }
+    let target = PathBuf::from(&argv[4]);
+    let allowed = PathBuf::from(format!("/run/user/{owner}/ufm/devices"));
+    if target.parent() != Some(allowed.as_path()) || target.file_name().is_none() {
+        return Err("the target is outside this user's device mount directory".into());
+    }
+    let canonical = std::fs::canonicalize(&target).map_err(|e| e.to_string())?;
+    if canonical != target {
+        return Err("the mount target contains a symlink".into());
+    }
+    let request = Request {
+        verb: if mount { Verb::Mount } else { Verb::Unmount },
+        fstype: "ext4",
+        source: device.display().to_string(),
+        target: target.clone(),
+        options: Vec::new(),
+    };
+    if mount {
+        check_target(&request, owner)?;
+    } else {
+        let meta = std::fs::metadata(&allowed).map_err(|e| e.to_string())?;
+        if meta.uid() != owner || meta.permissions().mode() & 0o077 != 0 {
+            return Err("the device mount directory is not private to the caller".into());
+        }
+    }
+    let observer = ufm_mount::monitor::Observer::new();
+    let existing = observer.find(&target);
+    if mount {
+        if existing.is_some() {
+            return Err("the target is already mounted".into());
+        }
+        if observer
+            .points()
+            .iter()
+            .any(|point| point.source == device.display().to_string())
+        {
+            return Err("the device is already mounted elsewhere".into());
+        }
+        let blkid = program("blkid").ok_or("blkid is not installed")?;
+        let output = OsCommand::new(blkid)
+            .args(["-o", "value", "-s", "TYPE"])
+            .arg(&device)
+            .output()
+            .map_err(|e| e.to_string())?;
+        if !output.status.success() {
+            return Err("cannot determine the device filesystem".into());
+        }
+        let kind = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if !matches!(
+            kind.as_str(),
+            "ext2"
+                | "ext3"
+                | "ext4"
+                | "btrfs"
+                | "xfs"
+                | "f2fs"
+                | "vfat"
+                | "exfat"
+                | "ntfs"
+                | "ntfs3"
+        ) {
+            return Err(format!("{kind} is not a supported unencrypted filesystem"));
+        }
+        let mut options = "nosuid,nodev".to_string();
+        if matches!(kind.as_str(), "vfat" | "exfat" | "ntfs" | "ntfs3") {
+            let group = std::fs::metadata(&allowed)
+                .map_err(|e| e.to_string())?
+                .gid();
+            options.push_str(&format!(",uid={owner},gid={group},umask=077"));
+        }
+        let program = program("mount").ok_or("mount is not installed")?;
+        let mut command = OsCommand::new(program);
+        command
+            .args(["-t", &kind, "-o", &options])
+            .arg(&device)
+            .arg(&target);
+        Ok(execute(&mut command, "mount"))
+    } else {
+        let Some(point) = existing else {
+            return Ok(0);
+        };
+        if point.source != device.display().to_string() {
+            return Err("the target holds a different device".into());
+        }
+        let program = program("umount").ok_or("umount is not installed")?;
+        let mut command = OsCommand::new(program);
+        command.arg(&target);
+        Ok(execute(&mut command, "umount"))
+    }
 }
 
 /// The uid whose directories and files this request is allowed to touch.
@@ -1018,5 +1137,23 @@ mod tests {
         assert!(USAGE.contains("--target"));
         assert!(USAGE.contains("--options"));
         assert!(USAGE.starts_with("usage:"));
+    }
+
+    #[test]
+    fn device_requests_reject_wrong_shape_and_non_devices() {
+        let bad = vec!["device-mount".into(), "--device".into(), "/dev/null".into()];
+        assert!(device_dispatch(&bad).is_err());
+        let bad = vec![
+            "device-mount".into(),
+            "--device".into(),
+            "/tmp".into(),
+            "--target".into(),
+            format!("/run/user/{}/ufm/devices/fake", uid()),
+        ];
+        assert!(
+            device_dispatch(&bad)
+                .unwrap_err()
+                .contains("not a block device")
+        );
     }
 }

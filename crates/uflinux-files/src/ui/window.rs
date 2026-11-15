@@ -18,7 +18,9 @@
 
 use std::cell::Cell;
 use std::cell::RefCell;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::process::Command as OsCommand;
 use std::rc::{Rc, Weak};
 use std::sync::Arc;
 use std::thread;
@@ -43,6 +45,7 @@ use super::columns::Columns;
 use super::computer::{self, Card, CardId, ComputerView};
 use super::conflict;
 use super::connect;
+use super::devices;
 use super::extract;
 use super::job::{Event, Handle, Queue};
 use super::jobs::Jobs;
@@ -50,7 +53,7 @@ use super::openwith;
 use super::ops;
 use super::panel::{self, Panel, Place, Usage};
 use super::popup::{self, Popup};
-use super::preview::{self, Preview};
+use super::preview::{self, Inspector};
 use super::props;
 use super::recent;
 use super::row::{Row, format_items};
@@ -350,11 +353,9 @@ pub fn open(app: &gtk::Application, urls: &[String]) {
     // greyed out in exactly the places the header menu and the keyboard are greyed
     // out rather than having a second set of rules of its own.
     let popup = Popup::install(&window);
-    // The spacebar preview, built closed. Its own popover rather than a second
-    // job for the menu's popover: a menu and a preview have nothing in common
-    // beyond being popovers, and sharing one would mean a preview that closes
-    // the menu it did not open.
-    let preview = Preview::install(&window);
+    // The inspector lives beside the folder views and follows their selection.
+    let preview = Rc::new(Inspector::new());
+    preview.widget().set_visible(prefs.preview_visible);
 
     let panel = Rc::new(Panel::new());
     // One preview pipeline per window: the worker, the queue and the token table
@@ -378,11 +379,12 @@ pub fn open(app: &gtk::Application, urls: &[String]) {
     // The cards for `computer://`, built empty. The window is what fills them in,
     // because the mount table and the capacities live in the window's state.
     let computer = Rc::new(ComputerView::new());
+    let network = Rc::new(ComputerView::network());
 
     let shared = shared_state(prefs, readers, &start);
 
     // The presentations that are not the grid/list stack.
-    let modes = mode_stack(&view, &columns, &computer, mode);
+    let modes = mode_stack(&view, &columns, &computer, &network, mode);
 
     let ctx = Ctx {
         window: window.downgrade(),
@@ -390,8 +392,11 @@ pub fn open(app: &gtk::Application, urls: &[String]) {
         view: Rc::downgrade(&view),
         columns: Rc::clone(&columns),
         computer: Rc::clone(&computer),
+        network: Rc::clone(&network),
+        devices_loading: Rc::new(Cell::new(false)),
         modes,
         path,
+        crumbs: gtk::Box::new(gtk::Orientation::Horizontal, 0),
         banner,
         banner_label,
         search: Rc::new(RefCell::new(None)),
@@ -438,6 +443,18 @@ pub fn open(app: &gtk::Application, urls: &[String]) {
     wire_actions(app, &window, &ctx);
     wire_jobs(&ctx);
     wire_close(&window);
+    glib::timeout_add_local(Duration::from_secs(10), {
+        let ctx = ctx.clone();
+        move || {
+            if ctx.window.upgrade().is_none() {
+                return glib::ControlFlow::Break;
+            }
+            if ctx.modes.visible_child_name().as_deref() == Some("computer") {
+                show_cards(&ctx);
+            }
+            glib::ControlFlow::Continue
+        }
+    });
 
     app.add_window(&window);
     window.present();
@@ -472,12 +489,14 @@ fn mode_stack(
     view: &View,
     columns: &Columns,
     computer: &ComputerView,
+    network: &ComputerView,
     mode: ViewMode,
 ) -> gtk::Stack {
     let modes = gtk::Stack::new();
     modes.add_named(view.widget(), Some("view"));
     modes.add_named(columns.widget(), Some("columns"));
     modes.add_named(computer.widget(), Some("computer"));
+    modes.add_named(network.widget(), Some("network"));
     modes.set_hexpand(true);
     modes.set_vexpand(true);
     if mode == ViewMode::Columns {
@@ -559,13 +578,131 @@ fn build_content(ctx: &Ctx, panel: &Panel, view: &View) -> gtk::Box {
     // Under the header rather than in it: the bar carries a scope selector and a
     // status line, which is too wide for a header bar and too tall for a
     // toolbar. It is hidden until asked for, so it costs nothing otherwise.
-    content.append(ctx.find.widget());
+
+    let files = gtk::Paned::new(gtk::Orientation::Horizontal);
+    files.set_start_child(Some(&ctx.modes));
+    files.set_end_child(Some(ctx.preview.widget()));
+    files.set_shrink_end_child(false);
+    files.set_resize_end_child(false);
+    files.set_position(
+        1080 - ctx.shared.prefs.borrow().sidebar_width_px as i32
+            - ctx.shared.prefs.borrow().preview_width_px as i32,
+    );
+    files.connect_notify_local(Some("position"), {
+        let shared = Rc::clone(&ctx.shared);
+        let pending = Rc::new(RefCell::new(None::<glib::SourceId>));
+        move |paned, _| {
+            let width = paned.width() - paned.position();
+            if paned.width() > 0 && (260..=640).contains(&width) {
+                if let Some(id) = pending.borrow_mut().take() {
+                    id.remove();
+                }
+                let shared = Rc::clone(&shared);
+                let pending_next = Rc::clone(&pending);
+                *pending.borrow_mut() = Some(glib::timeout_add_local_once(
+                    Duration::from_millis(300),
+                    move || {
+                        pending_next.borrow_mut().take();
+                        edit_prefs(&shared, |prefs| prefs.preview_width_px = width as u32);
+                    },
+                ));
+            }
+        }
+    });
+    let files_overlay = gtk::Overlay::new();
+    files_overlay.set_child(Some(&files));
     let split = gtk::Paned::new(gtk::Orientation::Horizontal);
     split.set_start_child(Some(panel.widget()));
-    split.set_end_child(Some(&ctx.modes));
+    split.set_end_child(Some(&files_overlay));
     split.set_shrink_start_child(false);
-    split.set_position(220);
-    content.append(&split);
+    split.set_position(ctx.shared.prefs.borrow().sidebar_width_px as i32);
+    split.connect_notify_local(Some("position"), {
+        let shared = Rc::clone(&ctx.shared);
+        let pending = Rc::new(RefCell::new(None::<glib::SourceId>));
+        move |paned, _| {
+            let width = paned.position();
+            if paned.width() > 0 && (160..=400).contains(&width) {
+                if let Some(id) = pending.borrow_mut().take() {
+                    id.remove();
+                }
+                let shared = Rc::clone(&shared);
+                let pending_next = Rc::clone(&pending);
+                *pending.borrow_mut() = Some(glib::timeout_add_local_once(
+                    Duration::from_millis(300),
+                    move || {
+                        pending_next.borrow_mut().take();
+                        edit_prefs(&shared, |prefs| prefs.sidebar_width_px = width as u32);
+                    },
+                ));
+            }
+        }
+    });
+    let root = gtk::Overlay::new();
+    root.set_child(Some(&split));
+    root.set_hexpand(true);
+    root.set_vexpand(true);
+    root.connect_notify_local(Some("width"), {
+        let sidebar = panel.widget().clone();
+        let inspector = ctx.preview.widget().clone();
+        let shared = Rc::clone(&ctx.shared);
+        let files = files.clone();
+        let files_overlay = files_overlay.clone();
+        let split = split.clone();
+        let sidebar_overlaid = Cell::new(false);
+        let inspector_overlaid = Cell::new(false);
+        move |root, _| {
+            let width = root.width();
+            if width == 0 {
+                return;
+            }
+            if width < 960 && !inspector_overlaid.get() {
+                files.set_end_child(None::<&gtk::Widget>);
+                inspector.set_halign(gtk::Align::End);
+                inspector.set_valign(gtk::Align::Fill);
+                inspector.set_size_request(shared.prefs.borrow().preview_width_px as i32, -1);
+                files_overlay.add_overlay(&inspector);
+                inspector.set_visible(false);
+                inspector_overlaid.set(true);
+            } else if width >= 960 && inspector_overlaid.get() {
+                files_overlay.remove_overlay(&inspector);
+                inspector.set_halign(gtk::Align::Fill);
+                inspector.set_size_request(260, -1);
+                files.set_end_child(Some(&inspector));
+                inspector.set_visible(
+                    !shared
+                        .state
+                        .borrow()
+                        .current
+                        .as_ref()
+                        .is_some_and(|location| {
+                            matches!(
+                                location.virtual_dir(),
+                                Some(VirtualDir::Computer | VirtualDir::Network)
+                            )
+                        })
+                        && shared.prefs.borrow().preview_visible,
+                );
+                inspector_overlaid.set(false);
+            }
+            if width < 700 && !sidebar_overlaid.get() {
+                split.set_start_child(None::<&gtk::Widget>);
+                sidebar.set_halign(gtk::Align::Start);
+                sidebar.set_valign(gtk::Align::Fill);
+                sidebar.set_size_request(shared.prefs.borrow().sidebar_width_px as i32, -1);
+                root.add_overlay(&sidebar);
+                sidebar.set_visible(false);
+                sidebar_overlaid.set(true);
+            } else if width >= 700 && sidebar_overlaid.get() {
+                root.remove_overlay(&sidebar);
+                sidebar.set_halign(gtk::Align::Fill);
+                sidebar.set_size_request(-1, -1);
+                split.set_start_child(Some(&sidebar));
+                sidebar.set_visible(true);
+                sidebar_overlaid.set(false);
+            }
+        }
+    });
+    content.append(&root);
     content.append(&status_bar(view));
     content
 }
@@ -584,10 +721,13 @@ struct Ctx {
     /// The cards for `computer://`, for the same reason and by the same argument.
     /// Repainted by the handlers that hear about mounts, unmounts and free space.
     computer: Rc<ComputerView>,
+    network: Rc<ComputerView>,
+    devices_loading: Rc<Cell<bool>>,
     /// Grid/list against columns against the cards. The view keeps its own stack
     /// inside this one.
     modes: gtk::Stack,
     path: gtk::Label,
+    crumbs: gtk::Box,
     banner: gtk::Box,
     banner_label: gtk::Label,
     search: Rc<RefCell<Option<gtk::SearchEntry>>>,
@@ -604,8 +744,8 @@ struct Ctx {
     /// owned by widgets inside the window, and the menu is parented to that window,
     /// so nothing else in the tree would keep it alive.
     popup: Rc<Popup>,
-    /// The spacebar preview, for the same reason and by the same argument.
-    preview: Rc<Preview>,
+    /// The right-hand selection inspector.
+    preview: Rc<Inspector>,
     /// The operations this window has running, and the strip that says so.
     ///
     /// `Rc` because the handlers that start a job and the strip's own widgets
@@ -825,8 +965,8 @@ struct Window {
     /// because a popover with no other owner is freed as soon as the call that
     /// built it returns.
     _popup: Rc<Popup>,
-    /// Likewise the preview popover.
-    _preview: Rc<Preview>,
+    /// Likewise the preview pane.
+    _preview: Rc<Inspector>,
 }
 
 /// Where the first window should start.
@@ -834,7 +974,7 @@ fn initial(urls: &[String], prefs: &Preferences) -> Location {
     urls.iter()
         .find_map(|url| Location::parse(url).ok())
         .or_else(|| prefs.startup_location.clone())
-        .unwrap_or_else(|| Location::file(paths::home()))
+        .unwrap_or_else(Location::computer)
 }
 
 /// Show `location`, reading it on a worker thread.
@@ -879,11 +1019,23 @@ fn navigate(ctx: &Ctx, location: Location, record: bool) {
             state.runner.touch(&id);
         }
     }
+    ctx.preview.widget().set_visible(
+        !matches!(
+            location.virtual_dir(),
+            Some(VirtualDir::Computer | VirtualDir::Network)
+        ) && ctx.shared.prefs.borrow().preview_visible
+            && ctx
+                .preview
+                .widget()
+                .parent()
+                .is_some_and(|parent| parent.is::<gtk::Paned>()),
+    );
 
     if let Some(window) = ctx.window.upgrade() {
         window.set_title(Some(&location.display()));
     }
     ctx.path.set_label(&location.display());
+    update_crumbs(ctx, &location);
     ctx.banner.set_visible(false);
     // A menu left open over the folder being left would offer rows for rows that
     // are about to be replaced, and points at a widget that may not survive the
@@ -893,7 +1045,7 @@ fn navigate(ctx: &Ctx, location: Location, record: bool) {
     // text read in flight belongs to a file that may not be on screen a moment
     // later. Closing it is cheaper than tracking whether it still applies.
     if let Some(window) = ctx.window.upgrade() {
-        ctx.preview.hide(&window);
+        ctx.preview.clear(&window);
     }
     // Results describe a query, not this folder, so they leave when the folder
     // does. `reset` rather than `clear`: the listing coming on screen is the
@@ -941,6 +1093,17 @@ fn select_place(ctx: &Ctx, location: &Location) {
 /// Put the current cards on screen, and the count of them in the status bar.
 fn show_cards(ctx: &Ctx) {
     paint_cards(ctx, &card_data(&ctx.shared));
+    if !ctx.devices_loading.replace(true) {
+        if let Some(handle) = ctx.handle.borrow().clone() {
+            thread::spawn(move || {
+                handle.send(Event::Devices {
+                    cards: devices::discover(),
+                })
+            });
+        } else {
+            ctx.devices_loading.set(false);
+        }
+    }
 }
 
 /// Show a set of cards that has already been built, and the count of them.
@@ -956,7 +1119,15 @@ fn show_cards(ctx: &Ctx) {
 /// folder's count of entries with a count of filesystems.
 fn paint_cards(ctx: &Ctx, cards: &[Card]) {
     ctx.computer.set_cards(cards);
-    if ctx.modes.visible_child_name().as_deref() != Some("computer") {
+    ctx.network.set_cards(cards);
+    let mode = ctx.modes.visible_child_name();
+    if mode.as_deref() == Some("network") {
+        if let Some(view) = ctx.view.upgrade() {
+            view.set_status(Some(&format_items(ctx.network.card_count() as u64)));
+        }
+        return;
+    }
+    if mode.as_deref() != Some("computer") {
         return;
     }
     // The cards are not rows, so the count in the bar would say "Empty folder"
@@ -979,6 +1150,10 @@ fn show_virtual(ctx: &Ctx, dir: VirtualDir, view: &View) {
         VirtualDir::Computer => {
             ctx.modes.set_visible_child_name("computer");
             show_cards(ctx);
+        }
+        VirtualDir::Network => {
+            ctx.modes.set_visible_child_name("network");
+            paint_cards(ctx, &card_data(&ctx.shared));
         }
         VirtualDir::Recent => {
             let readers = Arc::clone(&ctx.shared.readers);
@@ -1314,6 +1489,38 @@ fn apply(ctx: &Ctx, mut event: Event) {
         // dismissed while its file was being read is the ordinary case, which is
         // why the answer is looked up rather than assumed wanted.
         Event::Preview { token, ref text } => preview::arrived(token, text.as_deref()),
+        Event::Devices { cards } => {
+            ctx.devices_loading.set(false);
+            ctx.computer.set_devices(cards);
+            if ctx.modes.visible_child_name().as_deref() == Some("computer") {
+                if let Some(view) = ctx.view.upgrade() {
+                    view.set_status(Some(&format_items(ctx.computer.card_count() as u64)));
+                }
+            }
+        }
+        Event::DeviceAction {
+            message,
+            success,
+            target,
+            mounted,
+        } => {
+            show_banner(ctx, &message);
+            if success {
+                if !mounted
+                    && ctx
+                        .shared
+                        .state
+                        .borrow()
+                        .current
+                        .as_ref()
+                        .is_some_and(|loc| loc.as_path().is_some_and(|p| p.starts_with(&target)))
+                {
+                    navigate(ctx, Location::computer(), true);
+                } else if ctx.modes.visible_child_name().as_deref() == Some("computer") {
+                    show_cards(ctx);
+                }
+            }
+        }
     }
 }
 
@@ -1580,6 +1787,9 @@ fn restored(ctx: &Ctx) {
 /// cards would leave the window showing a folder that is not the one in the title
 /// bar. Columns are asked for only where there is a chain of folders to build.
 fn presentation(location: &Location, mode: ViewMode) -> &'static str {
+    if location.virtual_dir() == Some(VirtualDir::Network) {
+        return "network";
+    }
     if location.virtual_dir() == Some(VirtualDir::Computer) {
         return "computer";
     }
@@ -1852,26 +2062,28 @@ fn header(ctx: &Ctx, menu: &gio::Menu) -> gtk::HeaderBar {
     for (name, icon, tip) in [
         ("back", "go-previous-symbolic", "Back"),
         ("forward", "go-next-symbolic", "Forward"),
-        ("up", "go-up-symbolic", "Up one folder"),
     ] {
         let button = gtk::Button::from_icon_name(icon);
         button.set_action_name(Some(&format!("win.{name}")));
         button.set_tooltip_text(Some(tip));
         bar.pack_start(&button);
     }
-    let refresh = gtk::Button::from_icon_name("view-refresh-symbolic");
-    refresh.set_action_name(Some("win.refresh"));
-    refresh.set_tooltip_text(Some("Reload this folder"));
-    bar.pack_start(&refresh);
 
-    // Connect belongs on the bar rather than only in the menu: a share that is
-    // hard to reach is a share nobody connects to, and the menu is three clicks
-    // deep for something a network folder needs once per session.
-    let connect = gtk::Button::from_icon_name("network-server-symbolic");
-    connect.set_action_name(Some("win.connect"));
-    connect.set_tooltip_text(Some("Connect to a server"));
-    bar.pack_start(&connect);
-
+    let sidebar = gtk::Button::from_icon_name("sidebar-show-left-symbolic");
+    sidebar.set_tooltip_text(Some("Toggle places sidebar"));
+    sidebar.connect_clicked({
+        let ctx = ctx.clone();
+        move |_| {
+            if let Some(panel) = ctx.panel.upgrade() {
+                let places = panel.widget();
+                places.set_visible(!places.is_visible());
+                if places.is_visible() && places.parent().is_some_and(|p| p.is::<gtk::Overlay>()) {
+                    ctx.preview.widget().set_visible(false);
+                }
+            }
+        }
+    });
+    bar.pack_end(&sidebar);
     let search = folder_filter(ctx);
     *ctx.search.borrow_mut() = Some(search.clone());
     let modes = gtk::MenuButton::builder()
@@ -1879,8 +2091,119 @@ fn header(ctx: &Ctx, menu: &gio::Menu) -> gtk::HeaderBar {
         .menu_model(menu)
         .build();
     bar.pack_end(&modes);
+    let views = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    views.add_css_class("linked");
+    for mode in [ViewMode::Grid, ViewMode::List, ViewMode::Columns] {
+        let button = gtk::Button::from_icon_name(mode.icon_name());
+        button.set_action_name(Some("win.mode"));
+        button.set_action_target_value(Some(&mode_name(mode).to_variant()));
+        button.set_tooltip_text(Some(mode.label()));
+        views.append(&button);
+    }
+    bar.pack_end(&views);
+    let inspector = gtk::Button::from_icon_name("sidebar-show-right-symbolic");
+    inspector.set_action_name(Some("win.preview"));
+    inspector.set_tooltip_text(Some("Toggle preview pane (Space)"));
+    bar.pack_end(&inspector);
     bar.pack_end(&search);
-    bar.set_title_widget(Some(&ctx.path));
+    let search_button = gtk::Button::from_icon_name("system-search-symbolic");
+    search_button.set_tooltip_text(Some("Search files"));
+    search_button.connect_clicked({
+        let ctx = ctx.clone();
+        move |_| ctx.find.show_here()
+    });
+    bar.pack_end(&search_button);
+    let title = gtk::Stack::new();
+    title.set_hexpand(true);
+    let address = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    address.add_css_class("linked");
+    address.set_hexpand(true);
+    let location_button = gtk::Button::new();
+    location_button.set_hexpand(true);
+    location_button.set_child(Some(&gtk::Image::from_icon_name("document-edit-symbolic")));
+    let crumb_scroll = gtk::ScrolledWindow::new();
+    crumb_scroll.set_policy(gtk::PolicyType::Automatic, gtk::PolicyType::Never);
+    crumb_scroll.set_hexpand(true);
+    crumb_scroll.set_min_content_width(100);
+    crumb_scroll.set_child(Some(&ctx.crumbs));
+    address.append(&crumb_scroll);
+    address.append(&location_button);
+    let entry = gtk::Entry::new();
+    entry.set_hexpand(true);
+    title.add_named(&address, Some("address"));
+    title.add_named(&entry, Some("entry"));
+    title.add_named(ctx.find.widget(), Some("search"));
+    let edit = gio::SimpleAction::new("location", None);
+    edit.connect_activate({
+        let ctx = ctx.clone();
+        let entry = entry.clone();
+        let title = title.clone();
+        move |_, _| {
+            ctx.find.clear();
+            if let Some(location) = ctx.shared.state.borrow().current.as_ref() {
+                let value = location
+                    .as_path()
+                    .map_or_else(|| location.to_string(), |p| p.display().to_string());
+                entry.set_text(&value);
+            }
+            title.set_visible_child_name("entry");
+            entry.grab_focus();
+            entry.select_region(0, -1);
+        }
+    });
+    if let Some(window) = ctx.window.upgrade() {
+        window.add_action(&edit);
+    }
+    location_button.set_action_name(Some("win.location"));
+    entry.connect_activate({
+        let ctx = ctx.clone();
+        let title = title.clone();
+        move |entry| {
+            let input = entry.text();
+            let input = if input == "~" {
+                paths::home().display().to_string()
+            } else if let Some(rest) = input.strip_prefix("~/") {
+                paths::home().join(rest).display().to_string()
+            } else {
+                input.to_string()
+            };
+            match Location::parse(&input) {
+                Ok(location) => {
+                    entry.remove_css_class("error");
+                    title.set_visible_child_name("address");
+                    navigate(&ctx, location, true);
+                }
+                Err(error) => {
+                    entry.add_css_class("error");
+                    entry.set_tooltip_text(Some(&error.to_string()));
+                }
+            }
+        }
+    });
+    let keys = gtk::EventControllerKey::new();
+    keys.connect_key_pressed({
+        let title = title.clone();
+        move |_, key, _, _| {
+            if key == gtk::gdk::Key::Escape {
+                title.set_visible_child_name("address");
+                glib::Propagation::Stop
+            } else {
+                glib::Propagation::Proceed
+            }
+        }
+    });
+    entry.add_controller(keys);
+    ctx.find.widget().connect_visible_notify({
+        let title = title.clone();
+        move |search| {
+            title.set_visible_child_name(if search.is_visible() {
+                "search"
+            } else {
+                "address"
+            })
+        }
+    });
+    bar.set_title_widget(Some(&title));
     bar
 }
 
@@ -1941,6 +2264,7 @@ fn menu() -> gio::Menu {
     let show = gio::Menu::new();
     show.append(Some("Show hidden files"), Some("win.hidden"));
     show.append(Some("Picture previews"), Some("win.thumbnails"));
+    show.append(Some("Preview pane"), Some("win.preview"));
     // The file operations, in the order a user reaches for them: make something,
     // name it, get rid of it, move it. `Delete Permanently` is spelled out rather
     // than shortened to `Delete`, because a menu that offers both has to say which
@@ -2046,11 +2370,17 @@ fn wire_handlers(panel: &Rc<Panel>, view: &Rc<View>, columns: &Rc<Columns>, ctx:
     // fires no navigation and changes no clipboard.
     view.on_selection({
         let ctx = ctx.clone();
-        move || sync_ops(&ctx)
+        move || {
+            sync_ops(&ctx);
+            sync_inspector(&ctx);
+        }
     });
     columns.on_selection({
         let ctx = ctx.clone();
-        move || sync_ops(&ctx)
+        move || {
+            sync_ops(&ctx);
+            sync_inspector(&ctx);
+        }
     });
     // One subscriber for both presentations, so that a right-click answers with the
     // same menu wherever it lands. The row was selected before the press was
@@ -2087,9 +2417,37 @@ fn wire_handlers(panel: &Rc<Panel>, view: &Rc<View>, columns: &Rc<Columns>, ctx:
     // The cards answer for themselves rather than through a row: a card names a
     // folder or a share, and the only two things worth doing with either are
     // walking into it and letting go of it.
+    ctx.network.on_open({
+        let ctx = ctx.clone();
+        move |id| open_card(&ctx, id)
+    });
+    ctx.network.on_unmount({
+        let ctx = ctx.clone();
+        move |id| unmount_card(&ctx, &id)
+    });
     ctx.computer.on_open({
         let ctx = ctx.clone();
         move |id| open_card(&ctx, id)
+    });
+    ctx.computer.on_shortcut({
+        let ctx = ctx.clone();
+        move |location| navigate(&ctx, location, true)
+    });
+    ctx.computer.on_device({
+        let ctx = ctx.clone();
+        move |device, mountpoint| device_action(&ctx, device, mountpoint)
+    });
+    ctx.computer.on_connect({
+        let ctx = ctx.clone();
+        move || {
+            if let Some(window) = ctx.window.upgrade() {
+                if let Err(error) =
+                    gtk::prelude::WidgetExt::activate_action(&window, "win.connect", None)
+                {
+                    show_banner(&ctx, &format!("Cannot open network connection: {error}"));
+                }
+            }
+        }
     });
     ctx.computer.on_unmount({
         let ctx = ctx.clone();
@@ -2101,6 +2459,13 @@ fn wire_handlers(panel: &Rc<Panel>, view: &Rc<View>, columns: &Rc<Columns>, ctx:
 fn open_card(ctx: &Ctx, id: CardId) {
     let location = match id {
         CardId::Local(path) => Location::file(path),
+        CardId::Device {
+            mountpoint: Some(path),
+            ..
+        } => Location::file(path),
+        CardId::Device {
+            mountpoint: None, ..
+        } => return,
         // The mount point comes from the table rather than from a rule about where
         // mount points are made: the record is what the mount was made against,
         // and a card whose share has since been re-mounted elsewhere should open
@@ -2116,6 +2481,74 @@ fn open_card(ctx: &Ctx, id: CardId) {
         }
     };
     navigate(ctx, location, true);
+}
+
+fn device_action(ctx: &Ctx, device: PathBuf, mountpoint: Option<PathBuf>) {
+    let Some(handle) = ctx.handle.borrow().clone() else {
+        return;
+    };
+    let Some(name) = device.file_name() else {
+        return;
+    };
+    let root = PathBuf::from(format!("/run/user/{}/ufm/devices", paths::uid()));
+    let mounting = mountpoint.is_none();
+    let target = mountpoint.unwrap_or_else(|| root.join(name));
+    if mounting {
+        if let Err(error) = std::fs::create_dir_all(&target) {
+            show_banner(ctx, &format!("Cannot prepare device mount: {error}"));
+            return;
+        }
+        for path in [
+            root.parent().expect("device mount root has a parent"),
+            root.as_path(),
+            target.as_path(),
+        ] {
+            if let Err(error) =
+                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+            {
+                show_banner(ctx, &format!("Cannot prepare device mount: {error}"));
+                return;
+            }
+        }
+    }
+    thread::spawn(move || {
+        let action = if mounting {
+            "device-mount"
+        } else {
+            "device-unmount"
+        };
+        let result = OsCommand::new("/usr/bin/pkexec")
+            .arg("org.uflinux.files.mount")
+            .arg(action)
+            .arg("--device")
+            .arg(&device)
+            .arg("--target")
+            .arg(&target)
+            .output();
+        let (success, message) = match result {
+            Ok(output) => (output.status.success(), {
+                let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                if output.status.success() {
+                    if mounting {
+                        "Volume mounted".to_string()
+                    } else {
+                        "Volume safe to remove".to_string()
+                    }
+                } else if detail.is_empty() {
+                    "Could not change the volume mount".to_string()
+                } else {
+                    detail
+                }
+            }),
+            Err(error) => (false, format!("Cannot start device helper: {error}")),
+        };
+        handle.send(Event::DeviceAction {
+            message,
+            success,
+            target,
+            mounted: mounting,
+        });
+    });
 }
 
 /// Let go of a share, on a worker.
@@ -2611,7 +3044,7 @@ fn search_actions(ctx: &Ctx) -> Vec<Rc<gio::SimpleAction>> {
     find.connect_activate({
         let ctx = ctx.clone();
         move |_action, _parameter| {
-            ctx.find.show();
+            ctx.find.show_here();
             if let Some(entry) = ctx.search.borrow().as_ref() {
                 entry.set_visible(false);
             }
@@ -3167,14 +3600,38 @@ fn sync_star(ctx: &Ctx) {
     enable(&window, "star", !targets(ctx).is_empty());
 }
 
-/// Enable or disable the preview. One row is the whole condition: any row at all
-/// can be previewed, because the popover decides what to say from what the row
-/// is, and a folder with no text and no picture still gets its facts.
+/// The Computer overview has no selected file to inspect; other views can show
+/// facts even before a row is selected.
 fn sync_preview(ctx: &Ctx) {
     let Some(window) = ctx.window.upgrade() else {
         return;
     };
-    enable(&window, "preview", targets(ctx).len() == 1);
+    enable(
+        &window,
+        "preview",
+        !ctx.shared
+            .state
+            .borrow()
+            .current
+            .as_ref()
+            .is_some_and(|location| {
+                matches!(
+                    location.virtual_dir(),
+                    Some(VirtualDir::Computer | VirtualDir::Network)
+                )
+            }),
+    );
+}
+
+fn sync_inspector(ctx: &Ctx) {
+    if !ctx.preview.widget().is_visible() {
+        return;
+    }
+    let (Some(window), Some(handle)) = (ctx.window.upgrade(), ctx.handle.borrow().clone()) else {
+        return;
+    };
+    ctx.preview
+        .show_entries(&window, &handle, &ctx.thumbs, &targets(ctx));
 }
 
 /// Enable or disable the chooser. Depends on what the one selected row *is* — a
@@ -3304,37 +3761,44 @@ fn context_actions(ctx: &Ctx) -> Vec<Rc<gio::SimpleAction>> {
             ctx.popup.hide();
             // Two popovers over one row answer one question, so the preview steps
             // aside rather than competing for the same corner of the screen.
-            ctx.preview.hide(&window);
             ctx.popup.show(&window, &menu_rows(&ctx, true), None);
         }
     });
 
-    // The spacebar preview. Enabled for exactly one row, like Properties: the
-    // question a preview answers is about one thing, and a popover that tried to
-    // summarise six files would be a report rather than a glance.
+    // Space toggles the inspector. A multi-selection gets a count, while one
+    // selected file gets its preview and facts.
     let preview = gio::SimpleAction::new("preview", None);
     preview.connect_activate({
         let ctx = ctx.clone();
         move |_action, _parameter| {
-            let (Some(window), Some(handle)) = (ctx.window.upgrade(), ctx.handle.borrow().clone())
-            else {
-                return;
-            };
-            let picked = targets(&ctx);
-            let [entry] = picked.as_slice() else {
-                return;
-            };
-            // The preview anchors its autohide grab on the window's focus, so a
-            // window left without one — just after a dialog or chooser closed and
-            // took it — would show a popover that dismisses itself as it maps.
-            // A real preview is asked for from a focused row; putting focus back on
-            // whatever listing is on screen makes the popover behave the same here.
-            if gtk::prelude::GtkWindowExt::focus(&window).is_none()
-                && let Some(visible) = ctx.modes.visible_child()
+            if let Some(window) = ctx.window.upgrade()
+                && gtk::prelude::GtkWindowExt::focus(&window)
+                    .is_some_and(|focus| focus.is::<gtk::Entry>() || focus.is::<gtk::SearchEntry>())
             {
-                visible.grab_focus();
+                return;
             }
-            ctx.preview.toggle(&window, &handle, &ctx.thumbs, entry);
+            let visible = !ctx.preview.widget().is_visible();
+            ctx.preview.widget().set_visible(visible);
+            if visible
+                && ctx
+                    .preview
+                    .widget()
+                    .parent()
+                    .is_some_and(|parent| parent.is::<gtk::Overlay>())
+                && let Some(panel) = ctx.panel.upgrade()
+                && panel
+                    .widget()
+                    .parent()
+                    .is_some_and(|parent| parent.is::<gtk::Overlay>())
+            {
+                panel.widget().set_visible(false);
+            }
+            edit_prefs(&ctx.shared, |prefs| prefs.preview_visible = visible);
+            if visible {
+                sync_inspector(&ctx);
+            } else if let Some(window) = ctx.window.upgrade() {
+                ctx.preview.clear(&window);
+            }
         }
     });
 
@@ -3397,7 +3861,8 @@ fn install_accels(app: &gtk::Application) {
     // every window would be a claim about the others that nothing here keeps.
     app.set_accels_for_action("win.close", &["<Ctrl>W"]);
     app.set_accels_for_action("win.hidden", &["<Ctrl>H"]);
-    app.set_accels_for_action("win.search", &["<Ctrl>F"]);
+    app.set_accels_for_action("win.location", &["<Ctrl>L"]);
+    app.set_accels_for_action("win.find", &["<Ctrl>F", "<Ctrl><Shift>F"]);
     // The star. `<Ctrl>T` rather than a letter with a tradition elsewhere: `T` is
     // the initial of the only word the command has, and the chord is free.
     app.set_accels_for_action("win.star", &["<Ctrl>T"]);
@@ -3409,7 +3874,7 @@ fn install_accels(app: &gtk::Application) {
     app.set_accels_for_action("win.bookmark", &["<Ctrl>D"]);
     // `<Ctrl>F` is the filter, which is the one a user reaching for search in a
     // folder wants. The index is the wider thing, so it gets the wider chord.
-    app.set_accels_for_action("win.find", &["<Ctrl><Shift>F"]);
+
     app.set_accels_for_action("win.new-window", &["<Ctrl>N"]);
     // `<Ctrl>K` rather than `<Ctrl>L`: the location bar took that one, and a
     // keyboard shortcut for connecting is the difference between trying a share
@@ -3501,6 +3966,44 @@ fn path_label(location: &Location) -> gtk::Label {
     label.set_max_width_chars(48);
     label.set_selectable(true);
     label
+}
+
+fn update_crumbs(ctx: &Ctx, location: &Location) {
+    while let Some(child) = ctx.crumbs.first_child() {
+        ctx.crumbs.remove(&child);
+    }
+    if let Some(path) = location.as_path() {
+        let mut chain = Vec::new();
+        let mut current = Some(path);
+        while let Some(part) = current {
+            chain.push(part.to_path_buf());
+            current = part.parent();
+        }
+        chain.reverse();
+        for path in chain {
+            let label = if path == paths::home() {
+                "Home".to_string()
+            } else if path == Path::new("/") {
+                "/".to_string()
+            } else {
+                path.file_name().map_or_else(
+                    || path.display().to_string(),
+                    |v| v.to_string_lossy().into_owned(),
+                )
+            };
+            let button = gtk::Button::with_label(&label);
+            button.connect_clicked({
+                let ctx = ctx.clone();
+                move |_| navigate(&ctx, Location::file(path.clone()), true)
+            });
+            ctx.crumbs.append(&button);
+        }
+    } else {
+        let label = gtk::Label::new(Some(&location.display()));
+        label.set_margin_start(12);
+        label.set_margin_end(12);
+        ctx.crumbs.append(&label);
+    }
 }
 
 /// The error strip. A banner rather than a dialog because a failed folder is
@@ -3648,7 +4151,7 @@ mod tests {
         let prefs = Preferences::default();
         assert_eq!(
             initial(&["not a location".to_string()], &prefs),
-            Location::file(paths::home())
+            Location::computer()
         );
     }
 
@@ -3898,7 +4401,7 @@ mod tests {
             .iter()
             .filter_map(|card| match &card.id {
                 CardId::Mount(id) => Some(id.clone()),
-                CardId::Local(_) => None,
+                CardId::Local(_) | CardId::Device { .. } => None,
             })
             .collect()
     }

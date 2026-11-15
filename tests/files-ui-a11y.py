@@ -315,8 +315,7 @@ def select_at(trail):
             print("selection refused at index %d" % index)
             return 5
         return 0
-    print("no Selection interface above the node")
-    return 3
+    return None
 
 
 def menu_rows():
