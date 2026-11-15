@@ -207,6 +207,38 @@ reports `Mounted` — the record is the only handle on a live mount, and losing 
 strands a mount point no window can eject. A `Stale` share is dropped without a
 detach and left to the next sweep.
 
+## Every window follows the table
+
+Each window holds its own copy of the table inside its `Runner`, so a command in
+one window changes a file and nothing else. Every mutation writes `mounts.json`,
+so the fix is for the other windows to read it: after any change — connect,
+disconnect, forget, flipping the login flag, or a sweep detaching something while
+nobody was looking — each open window reloads its copy, re-reads mountinfo, and
+rebuilds its sidebar rows, usage bars and cards from what the file says now.
+
+Re-reading rather than handing the asker's table to the others is what makes the
+broadcast cover a change with no asker at all: `--sweep-mounts` and a second copy
+of the application both write the same file, and a window that only listens for
+in-process messages would keep showing a share the kernel stopped agreeing with.
+
+Each window works out on its own which mount points its stale table listed and
+the reloaded one no longer does. That one comparison is what every event has in
+common, so the broadcast takes no parameters and `ufm-mount` gains no call for
+describing what just happened. For those paths the window's cached listing is
+dropped: a folder inside a share that another window let go is showing rows that
+no longer exist, and it should re-read rather than serve the vanished files from
+memory.
+
+Two things stay with the window the user pressed. Navigation belongs there —
+being moved off a folder is something that happened to the window you asked, not
+to a window sitting behind it — and so does the banner, since a window that did
+not ask for anything has nothing to report. A window standing inside a share
+somebody else detached is not moved either; it keeps its folder and loses its
+cache.
+
+The card flow and the status bar are repainted together. The count in the bar
+counts cards, so repainting cards alone would leave `3 items` printed over two.
+
 ## Cleaning up: `--sweep-mounts`
 
 Run at session start, before the window appears. It reads the table, reads

@@ -1515,6 +1515,15 @@ if printf '%s\n' "$CFRAME" | grep -qF "$(printf 'table cell\tvideos2024\t')"; th
 else
     fail "a share the user listed is a card of its own on My Computer (no card named 'videos2024')"
 fi
+# The same share is a sidebar row in this window as well. Both halves are needed
+# before anything is taken away: a check that something disappeared is only worth
+# what the check was worth that it was there, and this window asks for nothing
+# below — it is the one that has to be told.
+if printf '%s\n' "$CFRAME" | grep -qF "$(printf 'list item\tvideos2024\t')"; then
+    ok "a window that did not list the share shows its row too"
+else
+    fail "a window that did not list the share shows its row too (no row named 'videos2024')"
+fi
 # And it says which state it is in. A share the kernel has no record of is neither
 # broken nor connected, and a card that said neither would leave a user guessing
 # about a row that is sitting in the sidebar.
@@ -1598,9 +1607,10 @@ fi
 # unit test can see.
 #
 # Both commands below go to the folder window and are read back from its own subtree.
-# The Computer window is left open holding the card it was given: a command repaints
-# the window that ran it, which is how an unmount already works, and the check that
-# the share is a card of its own was made above, while it was still listed.
+# The Computer window is left open on purpose: the table is a file every window reads,
+# so a command run here has to repaint that window too, and the checks that it does
+# are at the end of this section. What the share looked like over there — a row as
+# well as a card — is checked above, while it was still listed.
 #
 # The four rows a mount row can offer. All four are registered on every window and
 # none is ever disabled: what a share can do right now decides which rows are put in
@@ -1734,6 +1744,35 @@ if printf '%s\n' "$WFRAME" | grep -qF "$(printf '\tNetwork\t')"; then
     fail "the heading goes with the last share in it"
 else
     ok "the heading goes with the last share in it"
+fi
+# Now the window that asked for nothing. The table is a file on disk that every
+# window reads, so a share forgotten here has to have left that window's sidebar
+# and card flow as surely as it left this one's — otherwise the two windows are
+# two different claims about what the user has, and only one of them is a lie.
+i=0
+while [ "$i" -lt 50 ]; do
+    CFRAME=$(python3 "$A11Y" dump-frame Computer 2>/dev/null || true)
+    printf '%s\n' "$CFRAME" | grep -qF "$(printf 'list item\tvideos2024\t')" || break
+    i=$((i + 1))
+    sleep 0.2
+done
+if printf '%s\n' "$CFRAME" | grep -qF "$(printf 'list item\tvideos2024\t')"; then
+    fail "forgetting a share takes its row out of the window that did not ask"
+else
+    ok "forgetting a share takes its row out of the window that did not ask"
+fi
+if printf '%s\n' "$CFRAME" | grep -qF "$(printf 'table cell\tvideos2024\t')"; then
+    fail "forgetting a share takes its card out of the window that did not ask"
+else
+    ok "forgetting a share takes its card out of the window that did not ask"
+fi
+# The count in that window's bar counts what it is showing now. Two cards left:
+# Home and the system drive. A bar still saying three over two cards is the same
+# mistake as a row left over a share that is gone, one widget further down.
+if printf '%s\n' "$CFRAME" | grep -qF "$(printf '\t2 items\t')"; then
+    ok "the other window's status line counts the cards it has left"
+else
+    fail "the other window's status line counts the cards it has left"
 fi
 
 # --- --new-window really is a separate process --------------------------------------

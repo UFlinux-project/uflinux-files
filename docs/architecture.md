@@ -345,23 +345,24 @@ with one field differing — a state read a moment later, say — would silently
 that cannot be selected and a capacity line that never appears, with nothing failing to
 say so.
 
-A command repaints the window that ran it, and only that window. A second window keeps the
-card and the row it was given until something makes it rebuild, which is how an unmount
-already behaved and is unchanged here; the harness leaves the Computer window open across
-a Forget on purpose, so the boundary is at least written down somewhere a person can read
-it. Closing it from the harness would have asserted the current behaviour without making
-it better.
+A command repaints every window, and the broadcast is a reload rather than a handover.
+Each window holds its own copy of the mount table and every mutation writes
+`mounts.json`, so telling the others what happened means telling them to read the file
+again — which is also how a change made by `--sweep-mounts`, or by a second copy of the
+application, reaches a window no command touched. The asker is in the list like
+everyone else; what stays with it is navigation and the banner, because being moved off
+a folder and being told what just happened both belong to the window the user pressed.
 
-That boundary is drawn per kind of state rather than across the window, because the kinds
-do not fail the same way. The two collections the user builds a row at a time — stars and
-bookmarks — are broadcast: a command that changes one of them applies the change to what
-the file says at that moment and then hands the file's contents to every open window, so
-no window goes on drawing a row the user just removed somewhere else. A mount row is not
-like those two. What a share's row reports is a fact about the kernel that the window never
-had in the first place, and a stale answer there is a row that says `Mounted` about a
-server that stopped answering — which is a state the view already knows how to render, and
-one the next repaint of that window corrects. Preferences are the third case, and are
-read-modified-written without a broadcast; see *Where state lives*.
+That boundary is drawn per kind of state rather than across the window, because the
+kinds do not fail the same way. The two collections the user builds a row at a time —
+stars and bookmarks — are broadcast by handing the file's contents to every open
+window, since a window that keeps its own copy of a list is a window that goes on
+drawing a row the user just removed somewhere else. A mount row is broadcast the other
+way, by making each window throw its copy away and re-read, because a share's row
+reports a fact about the kernel no window's memory is entitled to hold: a row that says
+`Mounted` about a server that stopped answering is wrong whether or not this process is
+the one that noticed. Preferences are the third case, and are read-modified-written
+without a broadcast; see *Where state lives*.
 
 The reason all three are read-modified-written at all is the same, and it is a bug story.
 Each window used to hold the copy it loaded when it opened and save that copy whole on
@@ -988,10 +989,11 @@ A crash leaves the previous file intact rather than a truncated one, which
 matters most for the mount table, where a half-written file would mean a share
 the user cannot unmount from the UI.
 
-Three of these files are read by every open window and written by whichever one changes
-something: the star list, the bookmarks, and the preferences. None of them is owned by the
-window that happens to be focused, so none of them is written from a copy a window loaded
-when it opened — each change re-reads the file first, and the two collections then hand
-what the file says back to every window open. The reason is in *What a mount row offers*;
-the mechanism is the `Store` trait in `ui/window.rs`, whose only job is to make the
-forget-about-the-read shape hard to write by accident.
+Four of these files are read by every open window and written by whichever one changes
+something: the star list, the bookmarks, the preferences, and the mount table. None of
+them is owned by the window that happens to be focused, so none of them is written from
+a copy a window loaded when it opened — each change re-reads the file first, and the
+two collections then hand what the file says back to every window open, while the mount
+table is re-read whole by each of them. The reason is in *What a mount row offers*; the
+mechanism for the first two is the `Store` trait in `ui/window.rs`, whose only job is to
+make the forget-about-the-read shape hard to write by accident.

@@ -46,6 +46,7 @@ that cannot answer for itself — Home, Trash, a plain folder — is offered
 no rows at all, which opens no popover. |
 | `uflinux-files` (two windows) | the tests register two windows' state against one temporary config directory, so the file both windows share is the thing under test rather than a fixture's environment: a star put on in one window survives a star put on in the other, which is the check the whole-file save fails; a star taken away stays away rather than arriving back from a window that never saw its removal, which is the check a merge of the two copies fails; two windows adding a bookmark each keep theirs, and a bookmark one window removed is not put back by another writing; an edit with nothing to change writes no file at all, so a command that acted on a row that has gone cannot rewrite what the other window just saved; and a preference written by one window keeps a preference another wrote a moment earlier, which is the read-modify-write half without the broadcast. |
 | `uflinux-files` (mount rows) | the rows a share's row offers follow the state the row was built from and nothing else: a connected share gets Disconnect, a share whose kernel entry died gets Disconnect and Forget, a share that is listed without being mounted gets Reconnect and Forget; Reconnect is left off a share that would have to be asked for a password, and a `Stale` share is never offered it because mounting over a dead endpoint cannot work; every state also carries the login row, whose label is the opposite of the flag the record holds and which is a different row than the same share unmarked; every row carries the record's id rather than a position, so a menu left open across a rebuild cannot act on a different share. |
+| `uflinux-files` (following the mount table) | the tests build a window's state against one temporary mount root and rewrite the table file underneath it between two reads, so what is under test is a window discovering a change it never asked for: a share written to disk by somebody else arrives as both a sidebar row and a card, and nothing the window had is discarded on the way; a share taken off disk takes its row and its card with it and leaves the window naming the mount point it just lost, which is the list used to drop cached listings of a detached share; a record whose login flag was flipped on disk reaches the row still carrying the share, since an answer changing is not a share disappearing; and following the table twice lets go of nothing the second time, which is the check that the comparison is between two tables rather than against an empty one. |
 | `uflinux-files` (job table) | a report never reaches the strip more than once per throttle window, and the first one always does; a job with no total shows a bar with no fraction rather than a fake one; a tally reads `512 KiB of 1.0 MiB` for bytes and `4 of 9` for rows; finishing the only job empties the table and says so exactly once; pulling the brakes reaches every job on the table, including a second one registered after the first; a report naming a job that already finished is dropped rather than resurrected; the strip's text is read back from the widgets rather than from a parallel copy of it, so it cannot disagree with what is drawn. |
 | `uflinux-files` (My Computer) | Home and the system drive are always cards and a desktop folder becomes one only when it exists; a connected share says `Connected`, carries its protocol's icon and renders its capacity as `256 KiB free of 1.0 MiB`; a share the kernel has lost is still listed but says `Disconnected`, shows its mount point where the capacity would go and cannot be opened; a filesystem that reports no size gets no bar; a share's label beats the last component of its URI; activating a card reaches the open hook exactly once with the card's own id, and a Disconnect button reaches the unmount hook with the record id rather than the label. |
 | `uflinux-files` (history) | an XBEL record becomes a row only for a local file that still exists; a `added` timestamp is decoded to a fixed instant, a UTC offset is subtracted rather than ignored, and `modified` stands in when `added` is absent; percent escapes are decoded; a file written twice is one row carrying the newer time; newest first, capped at the limit; a missing history file is an empty list rather than an error. |
@@ -357,11 +358,17 @@ matching thing each time. Pressing it twice also leaves the fixture as it was fo
 is what lets the Forget check below be written against an unmarked record. Forget
 then takes the record out of the file, out of the sidebar, and takes the `Network` heading
 with it — a heading is drawn wherever the group changes, so one left over an empty group
-is a section of the sidebar with nothing in it. The Computer window is left open across
-that, holding the card it was given: a command repaints the window that ran it and no
-other, which is how an unmount already behaves, and the check that the share is a card of
-its own was made above while it was still listed. Closing the window here would have
-asserted that boundary without making it better.
+is a section of the sidebar with nothing in it.
+
+The Computer window is left open across that on purpose, because it is the window that
+asked for nothing. It is checked holding the share before the press — as a card, which is
+how it was always checked, and now as a sidebar row too, since a check that something
+left is only worth what the check was worth that it arrived — and then re-read after
+Forget, where its row, its card and the count in its status bar are all asserted to have
+followed the file. The bar matters as much as the widgets beside it: it counts cards, so
+a flow rebuilt down to two with `3 items` still printed over it is the same mistake as a
+row left standing over a share that is gone. Four checks, all of them about a window that
+never received a keypress.
 
 The properties checks are the reason the probe's `press` takes an optional frame name. A
 folder window's titlebar carries a button labelled `Close`, and a depth-first walk from
