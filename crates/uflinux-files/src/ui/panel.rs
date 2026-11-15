@@ -19,7 +19,8 @@ use std::rc::Rc;
 
 use gtk::prelude::*;
 
-use ufm_core::config::PanelGroup;
+use ufm_core::Location;
+use ufm_core::config::{Bookmark, PanelGroup};
 use ufm_core::entry::human_size;
 use ufm_core::paths;
 use ufm_core::sort::SortKey;
@@ -41,8 +42,13 @@ pub enum Place {
     /// The computer panel: mounts, usage, and what is stale.
     Computer,
     Trash,
-    /// A bookmark or a folder the user pinned.
+    /// A folder the user pinned that is not one of the bookmarks below — kept
+    /// for a caller that has a path and no record behind it.
     Folder(PathBuf),
+    /// A bookmark, shown under its own name. The record rather than a path, so
+    /// a bookmark the user renamed says the name they gave it and not the last
+    /// component of where it points.
+    Bookmark(Bookmark),
     /// A network share from the mount table. `label` is what to show, because
     /// the slug is not something a person wrote.
     Mount {
@@ -71,6 +77,7 @@ impl Place {
                 || path.display().to_string(),
                 |n| n.to_string_lossy().into_owned(),
             ),
+            Self::Bookmark(bookmark) => bookmark.display(),
             Self::Mount { label, .. } => label.clone(),
         }
     }
@@ -89,7 +96,12 @@ impl Place {
             Self::Recent => "document-open-recent",
             Self::Computer => "computer",
             Self::Trash => "user-trash",
-            Self::Folder(_) => "folder",
+            // The themed folder for a pinned folder and for a bookmark, whatever a
+            // bookmark points at. The record has an `icon` field for a name a user
+            // chose, and a name that turns out to be missing renders as the
+            // fallback image GTK draws for it — which in a sidebar of fifteen rows
+            // is a blank square rather than a hint about what the row is.
+            Self::Folder(_) | Self::Bookmark(_) => "folder",
             Self::Mount { .. } => "network-server",
         }
     }
@@ -106,7 +118,8 @@ impl Place {
             | Self::Music
             | Self::Pictures
             | Self::Videos
-            | Self::Folder(_) => PanelGroup::Folders,
+            | Self::Folder(_)
+            | Self::Bookmark(_) => PanelGroup::Folders,
             Self::Starred | Self::Recent | Self::Trash | Self::Computer => PanelGroup::System,
             Self::Mount { .. } => PanelGroup::Network,
         }
@@ -139,24 +152,42 @@ impl Place {
         places
     }
 
+    /// The standard places with the user's bookmarks spliced into the Folders
+    /// group, in the order the user put them.
+    ///
+    /// The splice point matters more than it looks. A heading is drawn wherever
+    /// the group changes, so bookmarks appended after the standard list would
+    /// open a second `Folders` heading below `Trash` — a sidebar that says the
+    /// same word twice and files the user under it. Hence before the first row
+    /// that is not a folder, which is where a person looking for one looks.
+    #[must_use]
+    pub fn with_bookmarks(bookmarks: &[Bookmark]) -> Vec<Self> {
+        let mut places = Self::standard();
+        let at = places
+            .iter()
+            .position(|place| place.group() != PanelGroup::Folders)
+            .unwrap_or(places.len());
+        places.splice(at..at, bookmarks.iter().cloned().map(Self::Bookmark));
+        places
+    }
+
     /// Where clicking the row goes.
     #[must_use]
-    pub fn location(&self) -> ufm_core::Location {
+    pub fn location(&self) -> Location {
         match self {
-            Self::Home => ufm_core::Location::file(paths::home()),
-            Self::Desktop => ufm_core::Location::file(paths::desktop_dir()),
-            Self::Computer => ufm_core::Location::computer(),
+            Self::Home => Location::file(paths::home()),
+            Self::Desktop => Location::file(paths::desktop_dir()),
+            Self::Computer => Location::computer(),
             // The `//` is not decoration: `Location::parse` only accepts a bare
             // absolute path or a `scheme://rest` URI, so a bare `recent:` is an
             // error rather than the Recent folder.
-            Self::Recent => ufm_core::Location::parse("recent://").expect("recent is a location"),
-            Self::Starred => {
-                ufm_core::Location::parse("starred://").expect("starred is a location")
-            }
-            Self::Trash => ufm_core::Location::file(paths::trash_dir()),
-            Self::Folder(path) => ufm_core::Location::file(path.clone()),
-            Self::Mount { id, .. } => ufm_core::Location::file(paths::mount_root().join(id)),
-            other => ufm_core::Location::file(paths::home().join(other.label())),
+            Self::Recent => Location::parse("recent://").expect("recent is a location"),
+            Self::Starred => Location::parse("starred://").expect("starred is a location"),
+            Self::Trash => Location::file(paths::trash_dir()),
+            Self::Folder(path) => Location::file(path.clone()),
+            Self::Bookmark(bookmark) => bookmark.location.clone(),
+            Self::Mount { id, .. } => Location::file(paths::mount_root().join(id)),
+            other => Location::file(paths::home().join(other.label())),
         }
     }
 }
@@ -507,6 +538,65 @@ mod tests {
     }
 
     #[test]
+    fn a_bookmark_row_says_the_name_the_user_gave_it() {
+        let here = Location::parse("/data/foto").expect("a path is a location");
+        let named = Place::Bookmark(Bookmark {
+            location: here.clone(),
+            label: Some("Fotky".into()),
+            icon: None,
+        });
+        assert_eq!(named.label(), "Fotky");
+        let plain = Place::Bookmark(Bookmark {
+            location: here,
+            label: None,
+            icon: None,
+        });
+        assert_eq!(
+            plain.label(),
+            "foto",
+            "a bookmark with no name of its own takes the folder's"
+        );
+        assert_eq!(plain.location(), Location::parse("/data/foto").unwrap());
+    }
+
+    #[test]
+    fn bookmarks_go_inside_the_folders_group_and_not_below_it() {
+        let bookmark = Bookmark {
+            location: Location::parse("/srv/work").expect("a path is a location"),
+            label: Some("Work".into()),
+            icon: None,
+        };
+        let marked = Place::Bookmark(bookmark.clone());
+        let places = Place::with_bookmarks(std::slice::from_ref(&bookmark));
+        let at = places
+            .iter()
+            .position(|place| *place == marked)
+            .expect("the bookmark should be a row");
+        let computer = places
+            .iter()
+            .position(|place| *place == Place::Computer)
+            .expect("Computer should still be a row");
+        assert!(
+            at < computer,
+            "a bookmark belongs with the folders, not under the system rows"
+        );
+        // The reason for the splice rather than an append: one heading per group.
+        // Walking the groups and counting the runs is what `set_places` does when
+        // it decides where to draw a heading, so a second run of folders here
+        // would be a second `Folders` heading in the sidebar.
+        let groups: Vec<PanelGroup> = places.iter().map(Place::group).collect();
+        let mut runs = 0_usize;
+        let mut previous: Option<PanelGroup> = None;
+        for group in &groups {
+            if previous != Some(*group) && *group == PanelGroup::Folders {
+                runs += 1;
+            }
+            previous = Some(*group);
+        }
+        assert_eq!(runs, 1, "the folder rows should be one contiguous run");
+    }
+
+    #[test]
     fn every_place_has_an_icon_and_a_group() {
         let places = vec![
             Place::Home,
@@ -521,6 +611,11 @@ mod tests {
             Place::Computer,
             Place::Trash,
             Place::Folder(PathBuf::from("/x")),
+            Place::Bookmark(Bookmark {
+                location: Location::parse("/x").expect("a path is a location"),
+                label: None,
+                icon: None,
+            }),
             Place::Mount {
                 id: "x".into(),
                 label: "x".into(),

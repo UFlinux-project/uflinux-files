@@ -331,6 +331,49 @@ position, so the code that reads a row back apart to repaint it cannot mistake t
 badge for the icon — the two are the same widget type, and one of them is the thing
 the row is named for.
 
+## Bookmarks
+
+A bookmark is a location the user asked to keep a row for, and it is the one piece of
+sidebar state that is not derived: the XDG folders are found, the mounts come from the
+mount table, the two collections are computed, and a bookmark exists only because some-
+body said it should. `ufm_core::config::Bookmarks` owns the file — load, save, `add`,
+`remove`, `move_item` — and, like the star list, knows nothing about GTK. `add` dedupes
+by location and appends, so the order in the file is the order the user asked for and
+re-bookmarking a folder cannot produce the same row twice.
+
+The window holds one `Bookmarks`, loaded once, for the same reason as the stars: the
+sidebar is built from memory rather than from a file read per navigation. The store is
+in the window rather than in the panel because a bookmark is drawn *and* written, and
+the panel that draws it has no opinion about where the list came from — `set_places`
+takes a `Vec<Place>` in the order it was handed and draws a heading wherever the group
+changes, which is all a sidebar needs to know.
+
+That last rule is what decides where bookmarks go. A heading is drawn on every change
+of group, so bookmarks appended after the standard places would open a second `Folders`
+heading below `Trash` — a sidebar that says the same word twice and files the user under
+it. `Place::with_bookmarks` therefore splices them before the first row that is not a
+folder, which is both the one-heading answer and the place a person looking for a
+bookmark looks. The order among bookmarks is the user's; the position of the block is
+not, and is the kind of thing no user has ever asked to change.
+
+`Place` has a `Bookmark` variant rather than reusing `Folder(PathBuf)` so that a
+bookmark the user renamed can say the name they gave it; the record travels with the
+row, and `display()` falls back from that name to the folder's last component. The
+record's `icon` field is deliberately unread: a themed icon name that turns out to be
+missing renders as GTK's fallback, which in a sidebar of fifteen rows is a blank square
+rather than a hint. Every bookmark row is a folder until there is a UI for choosing.
+
+One action serves both directions, like the star, and the label is decided per menu
+from whether the folder on screen is already in the store. The condition is the folder
+in the title bar rather than the selection: a bookmark names a place to return to, and a
+row inside a folder is not that folder. That also makes the command work where a
+selection-dependent one would not — over an empty folder, or with three rows picked — and
+it is why the row appears in a menu opened over the background as well as over a row.
+Changing it rebuilds the sidebar wholesale, which is what `set_places` already does for
+mounts, and re-highlights the current place afterwards because a rebuild drops the
+selection. Nothing is re-read from disk: unlike a star, which changes what a listing
+says about itself, a bookmark changes only the sidebar.
+
 ## File operations
 
 Copy, move, rename, trash, delete and new folder live in one UI module, and
@@ -763,7 +806,7 @@ dialog, a banner or a row in a list.
 | File | What |
 | --- | --- |
 | `~/.config/uflinux/filemanager/preferences.json` | view mode, sort, column widths, sidebar |
-| `~/.config/uflinux/filemanager/bookmarks.json` | bookmarks |
+| `~/.config/uflinux/filemanager/bookmarks.json` | sidebar bookmarks, in the order the user put them |
 | `~/.config/uflinux/filemanager/mounts.json` | mount table |
 | `~/.config/uflinux/filemanager/credentials.json` | saved credentials, `0600` |
 | `~/.config/uflinux/filemanager/mounts/*.conf` | per-mount credential files, `0600` |

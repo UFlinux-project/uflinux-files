@@ -187,6 +187,8 @@ pub enum Command {
     NewFolder,
     Star,
     Unstar,
+    Bookmark,
+    Unbookmark,
     Rename,
     Trash,
     Delete,
@@ -199,12 +201,14 @@ pub enum Command {
 
 impl Command {
     /// Every row, in the order the sections below lay them out.
-    const ALL: [Self; 13] = [
+    const ALL: [Self; 15] = [
         Self::Open,
         Self::OpenWith,
         Self::NewFolder,
         Self::Star,
         Self::Unstar,
+        Self::Bookmark,
+        Self::Unbookmark,
         Self::Rename,
         Self::Trash,
         Self::Delete,
@@ -223,6 +227,8 @@ impl Command {
             Self::NewFolder => "New Folder",
             Self::Star => "Star",
             Self::Unstar => "Unstar",
+            Self::Bookmark => "Bookmark This Folder",
+            Self::Unbookmark => "Remove Bookmark",
             Self::Rename => "Rename",
             Self::Trash => "Move to Trash",
             Self::Delete => "Delete Permanently",
@@ -242,6 +248,7 @@ impl Command {
             Self::OpenWith => "win.open-with",
             Self::NewFolder => "win.new-folder",
             Self::Star | Self::Unstar => "win.star",
+            Self::Bookmark | Self::Unbookmark => "win.bookmark",
             Self::Rename => "win.rename",
             Self::Trash => "win.trash",
             Self::Delete => "win.delete",
@@ -257,9 +264,13 @@ impl Command {
         match self {
             Self::Open | Self::OpenWith => Section::Open,
             Self::NewFolder | Self::Paste => Section::Add,
-            Self::Star | Self::Unstar | Self::Rename | Self::Trash | Self::Delete => {
-                Section::Change
-            }
+            Self::Star
+            | Self::Unstar
+            | Self::Bookmark
+            | Self::Unbookmark
+            | Self::Rename
+            | Self::Trash
+            | Self::Delete => Section::Change,
             Self::Copy | Self::Cut => Section::Take,
             Self::Extract | Self::Properties => Section::About,
         }
@@ -337,6 +348,25 @@ pub struct Scope {
     /// the window for the same reason as [`Scope::openable`] — the rows carry the
     /// flag, and only the window has them.
     pub starred: bool,
+    /// The folder the menu is standing in is already in the sidebar, so the row
+    /// should say "Remove Bookmark". Asked of the window rather than of the rows
+    /// because a bookmark names a folder, not a row: the rows a menu covers live
+    /// *in* the thing being bookmarked, and only the window knows what that is.
+    /// Only meaningful together with [`Scope::in_current`] — anywhere else the
+    /// row would name one folder and bookmark another.
+    pub bookmarked: bool,
+}
+
+/// The bookmark row for a menu over a folder that is bookmarked when `bookmarked`
+/// says so. The sibling of [`star_row`], and the same shape for the same reason:
+/// one command that goes both ways, and the label is what says which way.
+#[must_use]
+fn bookmark_row(bookmarked: bool) -> Command {
+    if bookmarked {
+        Command::Unbookmark
+    } else {
+        Command::Bookmark
+    }
 }
 
 /// The star row for a menu over rows that are starred when `starred` says so.
@@ -375,6 +405,10 @@ fn background_rows(scope: Scope) -> Vec<Command> {
         if scope.pastable {
             rows.push(Command::Paste);
         }
+        // Over the folder itself the bookmark row is the only one here that acts
+        // on what the menu is already pointing at, so it belongs. The two rows
+        // above it add something to the folder; this one says something about it.
+        rows.push(bookmark_row(scope.bookmarked));
     }
     rows
 }
@@ -401,6 +435,14 @@ fn one_row(entry: &Entry, scope: Scope) -> Vec<Command> {
     // lightest thing this group offers, and the row that undoes it is the same
     // row with a different label.
     rows.push(star_row(scope.starred));
+    // Straight after the star, because it is the other reversible row here — and
+    // because it acts on the folder the menu is standing in rather than on the
+    // row, which is why it appears only when those are the same folder. A user
+    // who right-clicks a row to bookmark the folder holding it is asking for the
+    // same thing as one who right-clicks the empty space beside it.
+    if scope.in_current {
+        rows.push(bookmark_row(scope.bookmarked));
+    }
     rows.extend([
         Command::Rename,
         Command::Trash,
@@ -427,6 +469,13 @@ fn many_rows(scope: Scope) -> Vec<Command> {
     // true when every one of them is starred, so the row cannot promise to undo
     // something it did not do to all of them.
     rows.push(star_row(scope.starred));
+    // The folder is one thing however many rows are selected, so the bookmark row
+    // needs no such agreement — and it stays where the single-row menu puts it,
+    // because a menu whose rows move depending on how many rows are selected is a
+    // menu you cannot learn.
+    if scope.in_current {
+        rows.push(bookmark_row(scope.bookmarked));
+    }
     rows.extend([Command::Trash, Command::Delete, Command::Copy, Command::Cut]);
     if scope.extracting {
         rows.push(Command::Extract);
@@ -630,6 +679,7 @@ mod tests {
         openable: false,
         pastable: false,
         starred: false,
+        bookmarked: false,
     };
 
     /// A press in one of the older Miller columns.
@@ -639,6 +689,7 @@ mod tests {
         openable: false,
         pastable: false,
         starred: false,
+        bookmarked: false,
     };
 
     /// Fire a gesture's `pressed` by hand. The harness has no pointer, so a
@@ -679,7 +730,10 @@ mod tests {
 
     #[test]
     fn nothing_selected_is_the_folder_menu() {
-        assert_eq!(rows_for(&[], HERE), vec![Command::NewFolder]);
+        assert_eq!(
+            rows_for(&[], HERE),
+            vec![Command::NewFolder, Command::Bookmark]
+        );
     }
 
     #[test]
@@ -690,6 +744,7 @@ mod tests {
                 Command::Open,
                 Command::NewFolder,
                 Command::Star,
+                Command::Bookmark,
                 Command::Rename,
                 Command::Trash,
                 Command::Delete,
@@ -698,6 +753,51 @@ mod tests {
                 Command::Properties,
             ]
         );
+    }
+
+    #[test]
+    fn a_bookmarked_folder_is_offered_the_row_that_takes_the_bookmark_off() {
+        // The star's shape, and for the star's reasons: one row either way, and a
+        // label rather than a "toggle" that hides which way it goes.
+        let marked = Scope {
+            bookmarked: true,
+            ..HERE
+        };
+        for picked in [
+            vec![folder("one")],
+            vec![folder("one"), file("note.txt")],
+            vec![],
+        ] {
+            let rows = rows_for(&picked, marked);
+            assert!(
+                rows.contains(&Command::Unbookmark),
+                "a folder already in the sidebar should say so"
+            );
+            assert!(
+                !rows.contains(&Command::Bookmark),
+                "and should not offer to put it there twice"
+            );
+            assert_eq!(
+                rows.iter()
+                    .filter(|row| **row == Command::Unbookmark)
+                    .count(),
+                1,
+                "the bookmark should be offered once"
+            );
+        }
+        // In an older column the row would name one folder and bookmark another.
+        let elsewhere = Scope {
+            bookmarked: true,
+            ..THERE
+        };
+        assert!(
+            !rows_for(&[folder("one")], elsewhere).contains(&Command::Unbookmark),
+            "a menu in another column cannot say which folder it would bookmark"
+        );
+        // Several rows selected bookmark the folder they all live in, which needs
+        // no agreement between them the way unstarring several does.
+        let many = rows_for(&[folder("one"), file("note.txt")], HERE);
+        assert!(many.contains(&Command::Bookmark));
     }
 
     #[test]
@@ -879,6 +979,7 @@ mod tests {
                 openable: false,
                 pastable: true,
                 starred: false,
+                bookmarked: false,
             },
         ));
         assert_eq!(
@@ -888,6 +989,7 @@ mod tests {
                 vec!["New Folder".to_string(), "Paste".to_string()],
                 vec![
                     "Star".to_string(),
+                    "Bookmark This Folder".to_string(),
                     "Rename".to_string(),
                     "Move to Trash".to_string(),
                     "Delete Permanently".to_string()
@@ -899,7 +1001,12 @@ mod tests {
     }
 
     #[test]
-    fn a_menu_over_the_background_is_one_group() {
+    fn a_menu_over_the_background_is_divided_the_same_way_as_any_other() {
+        // Two groups rather than one, which is what the bookmark row changed. The
+        // rows are not related to each other: one pair puts something into the
+        // folder, the other says something about the folder, and the sections are
+        // what draws the line between those two kinds of answer. A menu that
+        // dumped all three together would read as three ways to add a file.
         assert_eq!(
             sections(&model(&rows_for(
                 &[],
@@ -908,10 +1015,14 @@ mod tests {
                     extracting: false,
                     openable: false,
                     pastable: true,
-                    starred: false
+                    starred: false,
+                    bookmarked: false
                 }
             ))),
-            vec![vec!["New Folder".to_string(), "Paste".to_string()]]
+            vec![
+                vec!["New Folder".to_string(), "Paste".to_string()],
+                vec!["Bookmark This Folder".to_string()]
+            ]
         );
     }
 
@@ -939,7 +1050,10 @@ mod tests {
             popup.show(&window, &rows_for(&[], HERE), None);
             assert_eq!(
                 popup.rows(),
-                vec![vec!["New Folder".to_string(), "Paste".to_string()]]
+                vec![
+                    vec!["New Folder".to_string()],
+                    vec!["Bookmark This Folder".to_string()]
+                ]
             );
             popup.hide();
             assert!(!popup.is_visible(), "hide should close it");

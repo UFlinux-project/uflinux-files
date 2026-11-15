@@ -30,6 +30,11 @@ the model over D-Bus and never opens a window.
   `starred://` is assembled from it, most recent first. A star whose folder is
   deleted goes with it; one whose share is simply unmounted is listed as
   unavailable rather than dropped.
+- **Sidebar bookmarks**: `<Ctrl>D` puts the folder the window is standing in in the
+  sidebar, and takes it out again if it is already there. Bookmarks are spliced into
+  the Folders group rather than listed below the system rows, so the sidebar says
+  `Folders` once, and a bookmark keeps the folder's own name until there is a way to
+  rename it.
 - **Archives as folders**: zip, tar and its codecs, and 7z open like a directory
   and unpack with `<Ctrl>E` into a folder named after them. Read-only browsing
   plus extract; no write-back.

@@ -288,7 +288,7 @@ impl Preferences {
 }
 
 /// A bookmark, stored so `GtkBookmarkList` could read it if it ever wants to.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Bookmark {
     pub location: Location,
     /// `None` means "use the folder's own name".
@@ -573,9 +573,13 @@ mod tests {
         let dl = Location::parse("/home/u/Downloads").unwrap();
         b.add(docs.clone(), None);
         b.add(dl.clone(), Some("Files down".into()));
-        b.add(docs.clone(), None);
+        b.add(docs.clone(), Some("Docs again".into()));
         assert_eq!(b.items.len(), 2);
-        assert_eq!(b.items[0].display(), "Docs");
+        assert_eq!(
+            b.items[0].display(),
+            "Docs",
+            "a repeat is dropped whole, label included"
+        );
         assert_eq!(b.items[1].display(), "Files down");
         b.move_item(1, 0);
         assert_eq!(b.items[0].display(), "Files down");
@@ -602,6 +606,17 @@ mod tests {
             back.items[0].location,
             Location::parse("archive:///t/a.zip!/").unwrap()
         );
+    }
+
+    #[test]
+    fn a_half_written_bookmark_file_is_an_error_not_a_forget() {
+        // The generic case lives in `atomic`; this one is here because the
+        // consequence is specific: a list read as empty would be written back as
+        // empty at the next toggle, and the bookmarks would be gone for good.
+        let t = Temp::new("bookmarks-corrupt");
+        let path = t.0.join("bookmarks.json");
+        std::fs::write(&path, b"{\"version\":1,\"items\":[{\"location\":").unwrap();
+        assert!(Bookmarks::load(&path).is_err());
     }
 
     #[test]

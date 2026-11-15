@@ -31,7 +31,7 @@ use gtk::prelude::*;
 
 use ufm_core::Location;
 use ufm_core::Starred;
-use ufm_core::config::{Preferences, ViewMode};
+use ufm_core::config::{Bookmark, Bookmarks, Preferences, ViewMode};
 use ufm_core::entry::{Entry, EntryFlags};
 use ufm_core::location::VirtualDir;
 use ufm_core::paths;
@@ -70,6 +70,25 @@ thread_local! {
 /// to [`crate::runner`], so a window and `--sweep-mounts` cannot disagree about
 /// how long a share is allowed to sit unused.
 const SWEEP_INTERVAL: Duration = Duration::from_secs(60);
+
+/// The window's state, with the two lists a window keeps on disk read once.
+///
+/// Both are read here rather than per listing: each is small, each changes only
+/// through the window that holds it, and every change writes the file back. A
+/// window opened later picks up what an earlier one saved, because this runs per
+/// window and the file is the only thing between them.
+fn shared_state(prefs: Preferences, readers: Arc<Readers>, start: &Location) -> Rc<Shared> {
+    Rc::new(Shared {
+        prefs: RefCell::new(prefs),
+        starred: RefCell::new(Starred::load(&Starred::path()).unwrap_or_default()),
+        bookmarks: RefCell::new(Bookmarks::load(&Bookmarks::path()).unwrap_or_default()),
+        state: RefCell::new(State::new(start)),
+        readers,
+        missed: Cell::new(false),
+        reading: Cell::new(false),
+        spoken: RefCell::new(None),
+    })
+}
 
 /// Open a window showing `urls`, or the home folder when given none.
 ///
@@ -122,17 +141,7 @@ pub fn open(app: &gtk::Application, urls: &[String]) {
     // because the mount table and the capacities live in the window's state.
     let computer = Rc::new(ComputerView::new());
 
-    let shared = Rc::new(Shared {
-        prefs: RefCell::new(prefs),
-        // Read once here rather than per listing: the list is small, changes
-        // only through this window, and every change writes the file back.
-        starred: RefCell::new(Starred::load(&Starred::path()).unwrap_or_default()),
-        state: RefCell::new(State::new(&start)),
-        readers,
-        missed: Cell::new(false),
-        reading: Cell::new(false),
-        spoken: RefCell::new(None),
-    });
+    let shared = shared_state(prefs, readers, &start);
 
     // The presentations that are not the grid/list stack.
     let modes = mode_stack(&view, &columns, &computer, mode);
@@ -382,6 +391,10 @@ struct Shared {
     /// what lets a badge appear in a folder, a search page and the collection
     /// itself from one copy of the truth.
     starred: RefCell<Starred>,
+    /// The sidebar's bookmarks, kept in memory for the life of the window and
+    /// saved on every change — the same shape as [`Shared::starred`], and for the
+    /// same reason: the sidebar is rebuilt from it rather than read per row.
+    bookmarks: RefCell<Bookmarks>,
     state: RefCell<State>,
     readers: Arc<Readers>,
     /// Whether the kernel reported a change to the folder on screen while a
@@ -420,6 +433,14 @@ impl Shared {
     /// listings come from so the two cannot disagree about what exists.
     fn hints(&self, path: &std::path::Path) -> FsHints {
         self.readers.local().hints(path)
+    }
+
+    /// The bookmarks, as an owned list. Copied rather than borrowed because the
+    /// callers build a sidebar out of them and cannot hold the borrow across a
+    /// call that repaints — the panel is free to ask what the places are while
+    /// the store is still being read.
+    fn bookmark_items(&self) -> Vec<Bookmark> {
+        self.bookmarks.borrow().items.clone()
     }
 }
 
@@ -663,7 +684,7 @@ fn navigate(ctx: &Ctx, location: Location, record: bool) {
 /// Highlight the sidebar row a location belongs to, or clear the highlight.
 fn select_place(ctx: &Ctx, location: &Location) {
     if let Some(panel) = ctx.panel.upgrade() {
-        match place_for(location) {
+        match place_for(&ctx.shared.bookmark_items(), location) {
             Some(place) => panel.select(&place),
             None => panel.clear_selection(),
         }
@@ -1441,9 +1462,11 @@ fn filter(entries: &[Entry], query: &str) -> Vec<Entry> {
         .collect()
 }
 
-/// The sidebar rows: the standard places plus whatever is mounted.
+/// The sidebar rows: the standard places, the user's bookmarks, and whatever is
+/// mounted. The order belongs to [`Place::with_bookmarks`]; the mounts are added
+/// last because they are their own group and appear below both.
 fn places(shared: &Rc<Shared>) -> Vec<Place> {
-    let mut places = Place::standard();
+    let mut places = Place::with_bookmarks(&shared.bookmark_items());
     let state = shared.state.borrow();
     for record in state.runner.table() {
         places.push(Place::Mount {
@@ -1479,7 +1502,18 @@ fn usages(shared: &Rc<Shared>) -> Vec<Usage> {
 }
 
 /// The sidebar row a location belongs to, so the panel can agree with the view.
-fn place_for(location: &Location) -> Option<Place> {
+///
+/// The bookmarks are searched as well as the standard places, and by location
+/// rather than by name: a folder the user bookmarked has two candidate rows —
+/// none, and the bookmark — and it is the bookmark that should light up, since
+/// that is the row they put there to get back to it.
+fn place_for(bookmarks: &[Bookmark], location: &Location) -> Option<Place> {
+    if let Some(bookmark) = bookmarks
+        .iter()
+        .find(|bookmark| &bookmark.location == location)
+    {
+        return Some(Place::Bookmark(bookmark.clone()));
+    }
     Place::standard()
         .into_iter()
         .find(|place| place.location() == *location)
@@ -1649,6 +1683,10 @@ fn menu() -> gio::Menu {
     // built before there is one. The context menu has the rows on hand and says
     // "Star" or "Unstar" properly — see [`popup::Command`].
     files.append(Some("Star"), Some("win.star"));
+    // The same compromise one row down: the header menu cannot know which way the
+    // toggle goes, so it names the direction that adds. The context menu and
+    // <kbd>Ctrl</kbd>D do not have the problem — the folder is known by then.
+    files.append(Some("Bookmark This Folder"), Some("win.bookmark"));
     files.append(Some("Rename"), Some("win.rename"));
     files.append(Some("Move to Trash"), Some("win.trash"));
     files.append(Some("Delete Permanently"), Some("win.delete"));
@@ -2152,6 +2190,7 @@ fn op_actions(ctx: &Ctx) -> Vec<Rc<gio::SimpleAction>> {
     let undo = undo_action(ctx);
 
     let star = star_action(ctx);
+    let bookmark = bookmark_action(ctx);
 
     let facts = one_row_action("properties", ctx, |window, handle, entry| {
         props::show(&window, &handle, entry);
@@ -2165,6 +2204,7 @@ fn op_actions(ctx: &Ctx) -> Vec<Rc<gio::SimpleAction>> {
         Rc::new(new_folder),
         rename,
         star,
+        bookmark,
         discard_action("trash", false, ctx),
         discard_action("delete", true, ctx),
         pickup_action("copy", ops::Transfer::Copy, ctx),
@@ -2375,6 +2415,100 @@ fn sync_ops(ctx: &Ctx) {
     sync_properties(ctx);
     sync_preview(ctx);
     sync_star(ctx);
+    sync_bookmark(ctx);
+}
+
+/// Enable or disable the bookmark. The condition is the folder in the title bar
+/// rather than the selection: a bookmark is a name for a place you can return to,
+/// and the place a window is standing in is the one thing a user cannot mistake
+/// for another. So the command needs a real folder — `computer://` and the two
+/// collections are not places a later window can be pointed at.
+fn sync_bookmark(ctx: &Ctx) {
+    let Some(window) = ctx.window.upgrade() else {
+        return;
+    };
+    enable(&window, "bookmark", target_folder(ctx).is_some());
+}
+
+/// Whether the folder on screen is already in the sidebar, which is what decides
+/// whether a menu says `Bookmark` or `Remove Bookmark`. Asked of the store rather
+/// than of the sidebar's rows, because the rows are a rendering of it.
+fn current_bookmarked(ctx: &Ctx) -> bool {
+    let Some(folder) = target_folder(ctx) else {
+        return false;
+    };
+    ctx.shared
+        .bookmark_items()
+        .iter()
+        .any(|bookmark| bookmark.location == folder)
+}
+
+/// `bookmark`: put the folder in the title bar in the sidebar, or take it out.
+///
+/// One action for both directions, like `star`, and for the same reason: a menu
+/// that offered both would ask the user which one takes effect. The label is
+/// decided per opening by [`popup::Scope::bookmarked`], which can tell the two
+/// apart because it is built after the folder is known.
+///
+/// The folder in the title bar and not the selected row, because a bookmark names
+/// a place to return to and a row inside a folder is not that folder. Nothing is
+/// read from disk: the store is in memory, the sidebar is rebuilt from it, and the
+/// only cost is writing one small file.
+fn bookmark_action(ctx: &Ctx) -> Rc<gio::SimpleAction> {
+    let action = gio::SimpleAction::new("bookmark", None);
+    action.connect_activate({
+        let ctx = ctx.clone();
+        move |_action, _parameter| {
+            let Some(folder) = target_folder(&ctx) else {
+                return;
+            };
+            let name = folder
+                .file_name()
+                .map_or_else(|| folder.display(), ToString::to_string);
+            let message = {
+                let mut bookmarks = ctx.shared.bookmarks.borrow_mut();
+                if bookmarks
+                    .items
+                    .iter()
+                    .any(|bookmark| bookmark.location == folder)
+                {
+                    bookmarks.remove(&folder);
+                    format!("Bookmark removed for {name}")
+                } else {
+                    // No label: the folder's own name is what the row should say
+                    // until the user decides it should say something else, and
+                    // there is no UI for that decision yet.
+                    bookmarks.add(folder.clone(), None);
+                    format!("Bookmarked {name}")
+                }
+            };
+            let _ = ctx.shared.bookmarks.borrow().save(&Bookmarks::path());
+            bookmarks_changed(&ctx, &message);
+        }
+    });
+    Rc::new(action)
+}
+
+/// Tell the sidebar its bookmarks changed, and keep the row that matches the
+/// folder on screen lit.
+///
+/// The whole list is rebuilt rather than one row inserted. A sidebar is a few
+/// dozen rows and the rebuild is what [`Panel`] already does for mounts, so a diff
+/// would be a second way to get the headings wrong. Rebuilding drops the
+/// selection, which is why the current place is re-highlighted afterwards —
+/// without it, bookmarking the folder you are standing in would leave the sidebar
+/// agreeing with nothing.
+fn bookmarks_changed(ctx: &Ctx, message: &str) {
+    if let Some(panel) = ctx.panel.upgrade() {
+        panel.set_places(places(&ctx.shared));
+        panel.set_usage(usages(&ctx.shared));
+    }
+    let current = ctx.shared.state.borrow().current.clone();
+    if let Some(location) = current {
+        select_place(ctx, &location);
+    }
+    show_banner(ctx, message);
+    sync_bookmark(ctx);
 }
 
 /// Enable or disable the star. Any row can be starred, and any number of them
@@ -2571,6 +2705,7 @@ fn menu_rows(ctx: &Ctx, in_current: bool) -> Vec<popup::Command> {
         openable: open_with_target(ctx).is_some(),
         pastable: can_paste(ctx),
         starred: all_starred(&picked),
+        bookmarked: current_bookmarked(ctx),
     };
     popup::rows_for(&picked, scope)
 }
@@ -2595,6 +2730,7 @@ fn show_context_menu(ctx: &Ctx, widget: &gtk::Widget, target: popup::Target, x: 
         openable: open_with_target(ctx).is_some(),
         pastable: can_paste(ctx),
         starred: all_starred(&picked),
+        bookmarked: current_bookmarked(ctx),
     };
     ctx.popup.show(
         &window,
@@ -2615,6 +2751,12 @@ fn install_accels(app: &gtk::Application) {
     // The star. `<Ctrl>T` rather than a letter with a tradition elsewhere: `T` is
     // the initial of the only word the command has, and the chord is free.
     app.set_accels_for_action("win.star", &["<Ctrl>T"]);
+    // The bookmark. `<Ctrl>D` is what the browsers and the GNOME files use for it,
+    // and unlike the star there is a tradition to follow rather than invent. In an
+    // entry the key deletes forward, which the entry's own controller keeps — the
+    // same arrangement that lets <kbd>Ctrl</kbd>V paste a file without pasting into
+    // a name being renamed.
+    app.set_accels_for_action("win.bookmark", &["<Ctrl>D"]);
     // `<Ctrl>F` is the filter, which is the one a user reaching for search in a
     // folder wants. The index is the wider thing, so it gets the wider chord.
     app.set_accels_for_action("win.find", &["<Ctrl><Shift>F"]);
@@ -2899,7 +3041,23 @@ mod tests {
 
     #[test]
     fn a_known_folder_has_a_sidebar_row_and_an_unknown_one_does_not() {
-        assert!(place_for(&Location::file(paths::home())).is_some());
-        assert!(place_for(&Location::file("/definitely/not/a/place")).is_none());
+        assert!(place_for(&[], &Location::file(paths::home())).is_some());
+        assert!(place_for(&[], &Location::file("/definitely/not/a/place")).is_none());
+    }
+
+    #[test]
+    fn a_bookmarked_folder_becomes_a_place_under_the_name_it_was_given() {
+        let work = Location::file("/srv/work");
+        let bookmarks = [Bookmark {
+            location: work.clone(),
+            label: Some("Work".to_string()),
+            icon: None,
+        }];
+        let found = place_for(&bookmarks, &work);
+        assert_eq!(
+            found.map(|place| place.label()),
+            Some("Work".to_string()),
+            "a bookmark lights its own row rather than leaving the sidebar blank"
+        );
     }
 }

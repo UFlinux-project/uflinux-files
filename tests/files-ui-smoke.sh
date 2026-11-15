@@ -759,7 +759,7 @@ fi
 # because the window is standing on an ordinary folder. The two together are the point of
 # the assertion: the rows track what the window can actually do right now, which is also
 # what keeps the header menu honest.
-want=$(printf '%s\n' - Shift+Control+N Control+T F2 Delete Shift+Delete Control+C Control+X Control+V Alt+Enter | sort)
+want=$(printf '%s\n' - Shift+Control+N Control+T Control+D F2 Delete Shift+Delete Control+C Control+X Control+V Alt+Enter | sort)
 got=$(python3 "$A11Y" menu 2>/dev/null | sort)
 if [ "$got" = "$want" ]; then
     ok "the menu holds exactly the rows for one folder, each carrying its chord"
@@ -1164,6 +1164,68 @@ fi
 kill "$STAR2" 2>/dev/null || :
 if ! wait_no_frame "Starred"; then
     fail "an empty collection says so (its window would not close)"
+fi
+
+# --- the bookmark ---------------------------------------------------------------
+# A bookmark is one file and one row in the sidebar, so the two things worth
+# asserting outside the unit tests are that the command writes the file and that
+# the row it describes appears with the folder's name. The label the menu flips
+# to — "Remove Bookmark" — is the popup's decision and covered by that module's
+# tests; an AT client sees a menu row's chord rather than its text, so the tree
+# here could not tell the two rows apart even though a user can.
+#
+# The folder bookmarked is the one the window is standing on, which is the fixture
+# rather than a row inside it: a bookmark names a place to return to, and the
+# window's own folder is the one thing a user cannot mistake for another.
+BOOK_FILE=$XDG_CONFIG_HOME/uflinux/filemanager/bookmarks.json
+act bookmark "[]" "[]"
+i=0
+while [ "$i" -lt 50 ] && [ ! -f "$BOOK_FILE" ]; do
+    i=$((i + 1))
+    sleep 0.2
+done
+if [ -f "$BOOK_FILE" ] && grep -qF "$TARGET" "$BOOK_FILE"; then
+    ok "bookmarking the folder writes it to the bookmark list"
+else
+    fail "bookmarking the folder writes it to the bookmark list (no '$TARGET' in $BOOK_FILE)"
+fi
+# The row, read from this window's own subtree. The name is the folder's last
+# component, which is what a bookmark with no name of its own takes; the header's
+# path label says the same word inside a longer path, so the match is on a name
+# field rather than a substring.
+BFRAME=$(python3 "$A11Y" dump-frame "$TARGET" 2>/dev/null || true)
+if printf '%s\n' "$BFRAME" | grep -qF "$(printf 'list item\talpha\t')"; then
+    ok "the bookmark appears as a named row in the sidebar"
+else
+    fail "the bookmark appears as a named row in the sidebar (no list item named 'alpha')"
+fi
+# One heading above the folder rows, which is the reason bookmarks are spliced
+# into the group rather than appended after it: a heading is drawn wherever the
+# group changes, so appending would say "Folders" a second time below "Trash".
+if [ "$(printf '%s\n' "$BFRAME" | grep -cF "$(printf '\tFolders\t')")" -eq 1 ]; then
+    ok "the sidebar says Folders once"
+else
+    fail "the sidebar says Folders once ($(printf '%s\n' "$BFRAME" | grep -cF "$(printf '\tFolders\t')") headings)"
+fi
+# The same command takes it back out, which is the half a toggle gets wrong: a
+# second activation that only ever added would leave a row the user cannot
+# remove. The file stays, emptied — a list with nothing in it is still a list.
+act bookmark "[]" "[]"
+i=0
+while [ "$i" -lt 50 ] && grep -qF "$TARGET" "$BOOK_FILE" 2>/dev/null; do
+    i=$((i + 1))
+    sleep 0.2
+done
+if [ -f "$BOOK_FILE" ] && ! grep -qF "$TARGET" "$BOOK_FILE"; then
+    ok "the same command takes the bookmark back out"
+else
+    fail "the same command takes the bookmark back out ($TARGET still in $BOOK_FILE)"
+fi
+refresh
+if printf '%s\n' "$DUMP" | grep -qF "$(printf 'list item\talpha\t')"; then
+    fail "the row goes away with the bookmark"
+else
+    ok "the row goes away with the bookmark"
 fi
 
 # --- a second location opens a window in the running instance -----------------------
