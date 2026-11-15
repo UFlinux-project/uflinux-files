@@ -30,6 +30,7 @@ use ufm_core::entry::Entry;
 
 use super::job::{Event, Handle};
 use super::jobs::{Brake, Jobs, Kind, Reporter, Unit};
+use super::undo::{self, Displaced, Effect, Record, Stash, Trashed};
 
 /// No cancellation flag, for the calls that finish in one system call and would
 /// only grow an argument list by taking one. The operations that can take a
@@ -247,7 +248,7 @@ pub enum Choose {
 
 impl Step {
     /// The name to say in a message about this step.
-    fn label(&self) -> String {
+    pub(crate) fn label(&self) -> String {
         self.from.file_name().unwrap_or("item").to_string()
     }
 }
@@ -320,28 +321,39 @@ pub struct Outcome {
     /// A failure that changed nothing reports nothing here, which is what stops
     /// a refused operation from costing a directory read.
     pub changed: Vec<Location>,
+    /// What the operation did, in the terms an inverse needs — `Some` for the
+    /// operations that can be put back, and only for those. The window hands this
+    /// to the job table, which is what makes the Undo button sensitive.
+    ///
+    /// Carried by the outcome rather than reported separately because the record
+    /// and the report describe one event: an operation that failed halfway has a
+    /// record of the part it did, and a record that arrived beside a different
+    /// message would be a claim about a folder the banner does not describe.
+    pub undo: Option<Record>,
 }
 
 impl Outcome {
-    fn done(message: impl Into<String>) -> Self {
+    pub(crate) fn done(message: impl Into<String>) -> Self {
         Self {
             ok: true,
             message: message.into(),
             changed: Vec::new(),
+            undo: None,
         }
     }
 
-    fn failed(message: impl Into<String>) -> Self {
+    pub(crate) fn failed(message: impl Into<String>) -> Self {
         Self {
             ok: false,
             message: message.into(),
             changed: Vec::new(),
+            undo: None,
         }
     }
 
     /// Say which folder this left behind. Takes `&mut self` because every call
     /// site has the location to hand before it starts working.
-    fn note(&mut self, folder: &Location) {
+    pub(crate) fn note(&mut self, folder: &Location) {
         if !self.changed.contains(folder) {
             self.changed.push(folder.clone());
         }
@@ -351,7 +363,7 @@ impl Outcome {
     /// a report. A banner is the only place a skipped row can be mentioned, and
     /// a row that vanished without a word reads as a bug.
     #[must_use]
-    fn with_skipped(mut self, skipped: &[String]) -> Self {
+    pub(crate) fn with_skipped(mut self, skipped: &[String]) -> Self {
         if skipped.is_empty() {
             return self;
         }
@@ -590,7 +602,7 @@ fn epoch_seconds(seconds: i64) -> SystemTime {
 }
 
 /// `base`, or a free name beside it when `base` is taken.
-fn accept(base: &Location, taken: impl Fn(&Location) -> bool) -> Location {
+pub(crate) fn accept(base: &Location, taken: impl Fn(&Location) -> bool) -> Location {
     if !taken(base) {
         return base.clone();
     }
@@ -658,14 +670,14 @@ fn split_name(name: &str) -> (&str, &str) {
 }
 
 /// Whether a location already names something on disk.
-fn exists(location: &Location) -> bool {
+pub(crate) fn exists(location: &Location) -> bool {
     location
         .as_path()
         .is_some_and(|path| gio::File::for_path(path).query_exists(NO_CANCEL))
 }
 
 /// The `GIO` handle for a location, when it is a path the kernel can see.
-fn file(location: &Location) -> Option<gio::File> {
+pub(crate) fn file(location: &Location) -> Option<gio::File> {
     location.as_path().map(gio::File::for_path)
 }
 
@@ -705,7 +717,7 @@ fn run(
     result.map_err(|error| error.to_string())
 }
 
-fn is_directory(file: &gio::File, brake: &Brake) -> bool {
+pub(crate) fn is_directory(file: &gio::File, brake: &Brake) -> bool {
     file.query_file_type(
         gio::FileQueryInfoFlags::NOFOLLOW_SYMLINKS,
         Some(brake.gio()),
@@ -791,7 +803,7 @@ fn child_names(dir: &gio::File, brake: &Brake) -> Result<Vec<PathBuf>, glib::Err
 }
 
 /// Remove a row and, when it is a folder, everything inside it.
-fn remove_all(file: &gio::File, brake: &Brake) -> Result<(), glib::Error> {
+pub(crate) fn remove_all(file: &gio::File, brake: &Brake) -> Result<(), glib::Error> {
     if is_directory(file, brake) {
         for name in child_names(file, brake)? {
             remove_all(&file.child(&name), brake)?;
@@ -892,6 +904,7 @@ pub fn discard(handle: &Handle, jobs: &Jobs, entries: &[Entry], permanent: bool)
             let mut deleted = 0_usize;
             let mut failures: Vec<String> = Vec::new();
             let mut changed: Vec<Location> = Vec::new();
+            let mut homes: Vec<Location> = Vec::new();
             let mut stopped = false;
             for (index, entry) in picked.iter().enumerate() {
                 if brake.pulled() {
@@ -910,7 +923,10 @@ pub fn discard(handle: &Handle, jobs: &Jobs, entries: &[Entry], permanent: bool)
                     discard_one(&target, brake)
                 };
                 match removed {
-                    Ok(Gone::Trashed) => trashed += 1,
+                    Ok(Gone::Trashed) => {
+                        trashed += 1;
+                        homes.push(entry.location.clone());
+                    }
                     Ok(Gone::Deleted) => deleted += 1,
                     Err(message) => {
                         failures.push(format!("{}: {message}", entry.name));
@@ -946,9 +962,46 @@ pub fn discard(handle: &Handle, jobs: &Jobs, entries: &[Entry], permanent: bool)
             outcome.ok = failures.is_empty();
             outcome.message = report(&parts, &failures);
             outcome.changed = changed;
+            outcome.undo = (!homes.is_empty()).then(|| Record {
+                effect: Effect::Trashed(where_trashed(&homes)),
+                replaced: Vec::new(),
+                lost: Vec::new(),
+                stash: None,
+            });
             outcome
         },
     );
+}
+
+/// Match rows that went to the trash against the entries holding their bytes.
+///
+/// One read of the trash's `info/` for the whole batch, which is why this happens
+/// here rather than per row when undo runs: the trash is smallest and freshest
+/// now, and a batch of forty rows costs one directory read rather than forty.
+///
+/// A row whose entry is not found keeps its home and loses its entry, which is how
+/// a row trashed onto a filesystem with no trash directory this program can see is
+/// reported: undo names it and says it is not in the trash, rather than pretending
+/// it was never thrown away.
+fn where_trashed(homes: &[Location]) -> Vec<Trashed> {
+    let mut roots: Vec<std::path::PathBuf> = Vec::new();
+    for home in homes {
+        if let Some(path) = home.as_path() {
+            for root in undo::roots(path) {
+                if !roots.contains(&root) {
+                    roots.push(root);
+                }
+            }
+        }
+    }
+    let found = undo::index(&roots);
+    homes
+        .iter()
+        .map(|home| Trashed {
+            home: home.clone(),
+            entry: home.as_path().and_then(|path| found.get(path)).cloned(),
+        })
+        .collect()
 }
 
 /// Run a planned paste. `transfer` comes from the clipboard the plan came from.
@@ -1039,11 +1092,21 @@ fn paste_all(
     let mut written = 0_u64;
     let mut failures: Vec<String> = Vec::new();
     let mut stopped = false;
+    let mut stash = Stash::default();
+    // Where each row that landed came from and went to, read backwards by undo.
+    let mut landed: Vec<(Location, Location)> = Vec::new();
     for step in steps {
         if brake.pulled() {
             stopped = true;
             break;
         }
+        // Only a step the user answered by replacing can destroy anything, and
+        // the bytes it destroys are the only ones nothing can invent again later.
+        let displaced = if step.replace {
+            stash.keep(step, brake)
+        } else {
+            Displaced::Nothing
+        };
         let base = written;
         let mut told = |copied: i64, _of: i64| {
             let on = u64::try_from(copied).unwrap_or(0);
@@ -1063,11 +1126,26 @@ fn paste_all(
                 stopped = true;
                 break;
             }
+            // A step that displaced a row and then failed left the folder short
+            // of a file the paste never actually replaced, so it comes back.
+            if displaced != Displaced::Nothing {
+                stash.return_it(&step.to, brake);
+            }
             failures.push(format!("{}: {message}", step.label()));
             continue;
         }
         done += 1;
         written += step.bytes.unwrap_or(0);
+        // A copy that merged into a folder that was already there cannot have its
+        // target deleted again: the folder outlives the copy, and the rows inside
+        // it that this paste never wrote belong to whoever put them there.
+        let keepable = transfer == Transfer::Move || displaced != Displaced::Folder;
+        if keepable {
+            landed.push(match transfer {
+                Transfer::Move => (step.to.clone(), step.from.clone()),
+                Transfer::Copy => (step.from.clone(), step.to.clone()),
+            });
+        }
         if let Some(parent) = step.to.parent() {
             outcome.note(&parent);
         }
@@ -1093,6 +1171,13 @@ fn paste_all(
     }
     outcome.ok = failures.is_empty();
     outcome.message = report(&parts, &failures);
+    let (replaced, lost, store) = stash.into_parts();
+    outcome.undo = (!landed.is_empty() || !replaced.is_empty()).then_some(Record {
+        effect: Effect::Moved(landed),
+        replaced,
+        lost,
+        stash: store,
+    });
     outcome.with_skipped(skipped)
 }
 
@@ -1154,6 +1239,9 @@ pub fn rename(handle: &Handle, entry: &Entry, name: &str) {
                 Ok(()) => {
                     let mut renamed = Outcome::done(String::new());
                     renamed.note(&folder);
+                    // The name it had before is the whole record: a rename cannot
+                    // replace anything, because a taken name is refused earlier.
+                    renamed.undo = Some(Record::moved(&from, &to));
                     renamed
                 }
                 Err(error) => Outcome::failed(format!("{label}: {error}")),
@@ -1181,6 +1269,9 @@ pub fn create_folder(handle: &Handle, folder: &Location, name: &str) {
             Ok(()) => {
                 let mut created = Outcome::done(format!("Created {label}."));
                 created.note(&place);
+                // Putting a folder back means removing it, which is why the record
+                // names the folder itself rather than the folder holding it.
+                created.undo = Some(Record::created(to.clone()));
                 created
             }
             Err(error) => Outcome::failed(format!("{label}: {error}")),
@@ -1360,7 +1451,7 @@ fn compose(
 }
 
 /// `N items`, spelled out for one.
-fn count(n: usize) -> String {
+pub(crate) fn count(n: usize) -> String {
     if n == 1 {
         "1 item".to_string()
     } else {
@@ -1369,7 +1460,7 @@ fn count(n: usize) -> String {
 }
 
 /// Put what happened in front of what went wrong, for the banner.
-fn report(parts: &[String], failures: &[String]) -> String {
+pub(crate) fn report(parts: &[String], failures: &[String]) -> String {
     let done = parts.join(", ");
     let failed = failures.join("; ");
     if failed.is_empty() {

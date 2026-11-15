@@ -35,6 +35,7 @@ mod props;
 mod row;
 mod search;
 mod thumb;
+mod undo;
 mod view;
 mod watch;
 mod window;

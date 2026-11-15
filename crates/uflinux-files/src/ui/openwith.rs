@@ -275,6 +275,7 @@ fn start(parent: &gtk::ApplicationWindow, handle: &Handle, entry: &Entry, kind: 
                             ok: false,
                             message: error.to_string(),
                             changed: Vec::new(),
+                            undo: None,
                         },
                     }),
                 },
@@ -301,6 +302,7 @@ fn refused(message: &str) -> Outcome {
         ok: false,
         message: message.to_string(),
         changed: Vec::new(),
+        undo: None,
     }
 }
 

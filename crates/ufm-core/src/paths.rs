@@ -42,6 +42,46 @@ pub fn extracted_dir() -> PathBuf {
     cache_root().join("uflinux-files").join("extracted")
 }
 
+/// The user's trash directory, in the layout the freedesktop trash specification
+/// defines: `files/` holds the rows and `info/` holds one `.trashinfo` sidecar
+/// per row, naming where it came from.
+///
+/// Reached as a plain directory rather than as a `trash:` URI. The `GIO` trash
+/// backend that answers `trash://` is part of `GVfs`, and a minimal system — an
+/// Alpine install with no volume manager, which is what this file manager is
+/// packaged for — has no `GVfs` to ask, so a trash built on the URI would come up
+/// empty there. Reading the specification's layout directly works wherever
+/// `g_file_trash` wrote into it, which is the same set of systems.
+///
+/// One limitation follows, and undo states it rather than hiding it: the
+/// specification also allows a per-filesystem `.Trash-$UID` at the root of the
+/// filesystem a row lived on, and finding that one needs to know where the
+/// filesystems are mounted. Rows trashed from the home filesystem are always
+/// found here; rows trashed from elsewhere are found only when a trash directory
+/// for them is passed alongside.
+#[must_use]
+pub fn trash_dir() -> PathBuf {
+    if let Ok(dir) = std::env::var("UFLINUX_FILES_TRASH_DIR") {
+        return PathBuf::from(dir);
+    }
+    data_root().join("Trash")
+}
+
+/// Where a replaced row is kept until the window forgets it, so that undoing a
+/// replace can put the bytes back rather than report them lost.
+///
+/// Under the cache rather than the configuration: this is recoverable data with a
+/// lifetime measured in minutes, and a directory the user never asks to see. It is
+/// cleared whenever the window records a newer operation, which is what keeps a
+/// session from quietly filling the disk with files nobody will ask for back.
+#[must_use]
+pub fn undone_dir() -> PathBuf {
+    if let Ok(dir) = std::env::var("UFLINUX_FILES_UNDONE_DIR") {
+        return PathBuf::from(dir);
+    }
+    cache_root().join("uflinux-files").join("undone")
+}
+
 /// Where network shares get mounted: `/run/user/$UID/ufm`.
 ///
 /// A per-user runtime directory means the mount table is gone when the session
@@ -198,9 +238,46 @@ mod tests {
 
     #[test]
     fn fallbacks_are_absolute() {
-        for p in [config_root(), cache_root(), data_root()] {
+        for p in [
+            config_root(),
+            cache_root(),
+            data_root(),
+            trash_dir(),
+            undone_dir(),
+        ] {
             assert!(p.is_absolute(), "{}", p.display());
         }
+    }
+
+    #[test]
+    fn trash_lives_where_the_specification_puts_it() {
+        // The name matters: undo reads `info/` and `files/` by hand, and a
+        // directory named anything else is a trash this program did not write.
+        let _guard = crate::test_env();
+        unset_env("UFLINUX_FILES_TRASH_DIR");
+        set_env("XDG_DATA_HOME", "/var/lib/test-user");
+        assert_eq!(
+            trash_dir(),
+            PathBuf::from("/var/lib/test-user/Trash"),
+            "the trash follows `$XDG_DATA_HOME`, which is what a private home in a test means"
+        );
+        unset_env("XDG_DATA_HOME");
+    }
+
+    #[test]
+    fn replaced_rows_are_kept_where_they_can_be_swept() {
+        let _guard = crate::test_env();
+        unset_env("UFLINUX_FILES_UNDONE_DIR");
+        set_env("XDG_CACHE_HOME", "/tmp/ufm-cache");
+        assert_eq!(
+            undone_dir(),
+            PathBuf::from("/tmp/ufm-cache/uflinux-files/undone"),
+            "the stash is under the cache, beside the other recoverable scratch"
+        );
+        set_env("UFLINUX_FILES_UNDONE_DIR", "/tmp/ufm-undone");
+        assert_eq!(undone_dir(), PathBuf::from("/tmp/ufm-undone"));
+        unset_env("UFLINUX_FILES_UNDONE_DIR");
+        unset_env("XDG_CACHE_HOME");
     }
 
     #[test]

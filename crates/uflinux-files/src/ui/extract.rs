@@ -28,6 +28,7 @@ use ufm_core::{Error, Location};
 use super::job::{Event, Handle};
 use super::jobs::{Jobs, Kind, Unit};
 use super::ops::{self, Outcome};
+use super::undo::Record;
 
 /// Unpack the container at `location` into a folder beside it, on a worker.
 ///
@@ -110,11 +111,13 @@ pub fn extract(handle: &Handle, jobs: &Jobs, location: Location) {
                     ok: true,
                     message: format!("Extracting {label} stopped."),
                     changed: changed.into_iter().collect(),
+                    undo: None,
                 },
                 Err(error) => Outcome {
                     ok: false,
                     message: complaint(&container, &error),
                     changed: Vec::new(),
+                    undo: None,
                 },
             }
         },
@@ -181,7 +184,10 @@ fn arrived(report: ufm_archive::Report, changed: Option<Location>) -> Outcome {
         // paste is.
         ok: report.skipped.is_empty(),
         message: report.summary(),
-        changed: changed.into_iter().collect(),
+        changed: changed.clone().into_iter().collect(),
+        // Everything the archive wrote sits inside the one folder it made, so
+        // undoing the extraction is removing that folder — no per-member record.
+        undo: changed.map(Record::created),
     };
     if !report.skipped.is_empty() {
         outcome.message = format!("{}; {}", outcome.message, report.skipped.join("; "));
@@ -195,6 +201,7 @@ fn refused(message: &str) -> Outcome {
         ok: false,
         message: message.to_string(),
         changed: Vec::new(),
+        undo: None,
     }
 }
 

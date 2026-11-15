@@ -51,6 +51,7 @@ use super::props;
 use super::row::Row;
 use super::search::{Found, Outcome, Search};
 use super::thumb::Pipeline;
+use super::undo;
 use super::view::View;
 use super::watch::Live;
 use crate::runner::{Layout, Report, Runner};
@@ -255,18 +256,21 @@ fn wire_find(ctx: &Ctx) {
     });
 }
 
-/// Tie the job strip to the action that stops the jobs it reports.
+/// Tie the job strip to the actions that answer for what it reports.
 ///
 /// The strip's Cancel button carries `win.cancel`, and the action is registered
 /// disabled. What is left is the rule connecting the two: the button is sensitive
 /// exactly while something runs, which the table reports rather than the window,
 /// because a job can finish on a worker at any moment and the window has no other
-/// way to notice.
+/// way to notice. `win.undo` is on the same callback for the same reason: an
+/// operation is spent the moment it is undone, and that moment is not one the
+/// window chose.
 fn wire_jobs(ctx: &Ctx) {
     let window = ctx.window.clone();
-    ctx.jobs.on_change(move |running| {
+    ctx.jobs.on_change(move |status| {
         if let Some(window) = window.upgrade() {
-            enable(&window, "cancel", running);
+            enable(&window, "cancel", status.running);
+            enable(&window, "undo", status.undoable);
         }
     });
 }
@@ -921,6 +925,13 @@ fn changed(shared: &Rc<Shared>, ctx: &Ctx, paths: &[PathBuf], overflowed: bool) 
 /// deepest, so this is the same pair the reload button runs, and the two never
 /// read one folder twice.
 fn operated(ctx: &Ctx, outcome: ops::Outcome) {
+    // The record goes to the table before the banner is shown, so that the Undo
+    // button is sensitive by the time the message that offers it has been read.
+    // An operation that changed nothing carries no record, which is what stops a
+    // refused paste from lighting a button that would undo the operation before it.
+    if let Some(record) = outcome.undo {
+        ctx.jobs.record(record);
+    }
     if !outcome.message.is_empty() {
         show_banner(ctx, &outcome.message);
     }
@@ -1361,6 +1372,12 @@ fn menu() -> gio::Menu {
     // than shortened to `Delete`, because a menu that offers both has to say which
     // one can be undone.
     let files = gio::Menu::new();
+    // First, and above the commands that act on a row: it is the only row here
+    // that acts on the last operation rather than on the selection, and a user
+    // who has just watched something they did go wrong looks at the top of the
+    // list, not the middle. Disabled until there is something to undo, so the row
+    // is honest about a folder nothing has touched yet.
+    files.append(Some("Undo"), Some("win.undo"));
     // First among the commands that act on a row, because it is the one a user
     // reaches for before anything else: the folder opened by double-click and the
     // default handler disagree, or there is no default handler, and this is where
@@ -1744,22 +1761,8 @@ fn op_actions(ctx: &Ctx) -> Vec<Rc<gio::SimpleAction>> {
         }
     });
 
-    let rename = gio::SimpleAction::new("rename", None);
-    rename.connect_activate({
-        let ctx = ctx.clone();
-        move |_action, _parameter| {
-            let Some((window, handle)) = sink_for(&ctx) else {
-                return;
-            };
-            // Renaming a selection of three has no obvious answer, so the command
-            // asks for exactly one row and stays quiet otherwise rather than
-            // guessing which of them the user meant.
-            let picked = targets(&ctx);
-            let [entry] = picked.as_slice() else {
-                return;
-            };
-            ops::ask_rename(&window, &handle, entry);
-        }
+    let rename = one_row_action("rename", ctx, |window, handle, entry| {
+        ops::ask_rename(&window, &handle, entry);
     });
 
     let paste = gio::SimpleAction::new("paste", None);
@@ -1805,47 +1808,22 @@ fn op_actions(ctx: &Ctx) -> Vec<Rc<gio::SimpleAction>> {
     // there a job to stop?" changes while the window sits still, because a worker
     // finishes whenever it finishes. See [`cancel_action`].
     let cancel = cancel_action(ctx);
+    // The same treatment for the same reason: an operation becomes available to
+    // undo when its worker reports, and stops being available when it is spent.
+    // See [`undo_action`].
+    let undo = undo_action(ctx);
 
-    let facts = gio::SimpleAction::new("properties", None);
-    facts.connect_activate({
-        let ctx = ctx.clone();
-        move |_action, _parameter| {
-            let Some((window, handle)) = sink_for(&ctx) else {
-                return;
-            };
-            // One row, for the same reason renaming asks for one: a dialog about
-            // three files has no obvious shape, and a user who selected three
-            // usually wanted the folder they are looking at rather than a summary
-            // of a third of it.
-            let picked = targets(&ctx);
-            let [entry] = picked.as_slice() else {
-                return;
-            };
-            props::show(&window, &handle, entry);
-        }
+    let facts = one_row_action("properties", ctx, |window, handle, entry| {
+        props::show(&window, &handle, entry);
     });
 
-    let chooser = gio::SimpleAction::new("open-with", None);
-    chooser.connect_activate({
-        let ctx = ctx.clone();
-        move |_action, _parameter| {
-            let Some((window, handle)) = sink_for(&ctx) else {
-                return;
-            };
-            // One row again, and for the same reason as the chooser's own list:
-            // "which of these three should the editor open?" has no answer that a
-            // dialog could act on.
-            let picked = targets(&ctx);
-            let [entry] = picked.as_slice() else {
-                return;
-            };
-            openwith::show(&window, &handle, entry);
-        }
+    let chooser = one_row_action("open-with", ctx, |window, handle, entry| {
+        openwith::show(&window, &handle, entry);
     });
 
     vec![
         Rc::new(new_folder),
-        Rc::new(rename),
+        rename,
         discard_action("trash", false, ctx),
         discard_action("delete", true, ctx),
         pickup_action("copy", ops::Transfer::Copy, ctx),
@@ -1853,9 +1831,60 @@ fn op_actions(ctx: &Ctx) -> Vec<Rc<gio::SimpleAction>> {
         Rc::new(paste),
         Rc::new(unpack),
         cancel,
-        Rc::new(chooser),
-        Rc::new(facts),
+        undo,
+        chooser,
+        facts,
     ]
+}
+
+/// An action whose handler acts on exactly one selected row, and stays quiet
+/// otherwise rather than guessing which of them the user meant.
+///
+/// Renaming a selection of three has no obvious answer, and neither does a dialog
+/// about three files or a chooser asked which of three to open: a user who
+/// selected three usually wanted the folder they are looking at rather than a
+/// summary of a third of it. `act` runs on the one row the selection holds.
+fn one_row_action(
+    name: &str,
+    ctx: &Ctx,
+    act: impl Fn(gtk::ApplicationWindow, Handle, &Entry) + 'static,
+) -> Rc<gio::SimpleAction> {
+    let action = gio::SimpleAction::new(name, None);
+    action.connect_activate({
+        let ctx = ctx.clone();
+        move |_action, _parameter| {
+            let Some((window, handle)) = sink_for(&ctx) else {
+                return;
+            };
+            let picked = targets(&ctx);
+            let [entry] = picked.as_slice() else {
+                return;
+            };
+            act(window, handle, entry);
+        }
+    });
+    Rc::new(action)
+}
+
+/// `undo`: put the last operation this window did back.
+///
+/// Built disabled like `win.cancel`, and for the same reason — the moment an
+/// operation becomes undoable is a worker reporting an outcome, not a moment the
+/// window picked, so [`wire_jobs`] connects the action to the job table. The table
+/// holds one record, which is what makes the button say no the second time.
+fn undo_action(ctx: &Ctx) -> Rc<gio::SimpleAction> {
+    let undo = gio::SimpleAction::new("undo", None);
+    undo.set_enabled(false);
+    undo.connect_activate({
+        let ctx = ctx.clone();
+        move |_action, _parameter| {
+            let Some(handle) = ctx.handle.borrow().clone() else {
+                return;
+            };
+            undo::undo(&handle, &ctx.jobs);
+        }
+    });
+    Rc::new(undo)
 }
 
 /// `cancel`: stop everything this window has running.
@@ -2162,6 +2191,11 @@ fn install_accels(app: &gtk::Application) {
     app.set_accels_for_action("win.copy", &["<Ctrl>C"]);
     app.set_accels_for_action("win.cut", &["<Ctrl>X"]);
     app.set_accels_for_action("win.paste", &["<Ctrl>V"]);
+    // The usual chord, and one deep. `<Ctrl>Z` reaches an entry too, where it
+    // undoes typing — but an entry binds the key on its own controller and handles
+    // the event before the window's accelerator sees it, the same way it keeps
+    // `<Ctrl>V` from pasting a file into the middle of a name being renamed.
+    app.set_accels_for_action("win.undo", &["<Ctrl>Z"]);
     // `<Ctrl>E` is free here: the trash is on `Delete`, where GNOME keeps it in
     // the keyboard rather than on a chord, so the letter most people expect for
     // extract is not spoken for.

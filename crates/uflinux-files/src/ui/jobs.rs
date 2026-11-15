@@ -33,6 +33,7 @@ use ufm_core::entry::human_size;
 use ufm_vfs::Cancel;
 
 use super::job::{Event, Handle};
+use super::undo::Record;
 
 /// How often a worker may report. The queue behind a report is a self-pipe — one
 /// event costs a write and a main-loop wake-up — so a copy of a hundred thousand
@@ -57,6 +58,11 @@ pub enum Kind {
     Delete,
     /// Unpacking a container.
     Extract,
+    /// Putting the last operation back. Its own kind rather than a reuse of
+    /// `Move`, because restoring from the trash moves rows that were not moved
+    /// out in the first place and the strip's word has to match what the bar is
+    /// counting.
+    Undo,
 }
 
 impl Kind {
@@ -69,6 +75,7 @@ impl Kind {
             Self::Trash => "Moving to trash",
             Self::Delete => "Deleting",
             Self::Extract => "Extracting",
+            Self::Undo => "Undoing",
         }
     }
 }
@@ -270,12 +277,24 @@ struct Strip {
     bar: gtk::ProgressBar,
 }
 
-/// What the table calls when the answer to "is anything running?" changes.
+/// What the table can answer about itself at the moment something changed: is
+/// anything running, and is there an operation to put back. Both go out together
+/// because both are read by the same callback, which sets two action sensitivities
+/// and costs one call either way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Status {
+    /// Whether pulling the cancel button would stop something.
+    pub running: bool,
+    /// Whether the Undo button has anything to undo.
+    pub undoable: bool,
+}
+
+/// What the table calls when the answer to either of those changes.
 ///
 /// Named rather than written out at the field, because the type as written is
 /// long enough that clippy calls it complex, and the name says what the boxed
 /// closure is for.
-type OnChange = Box<dyn FnMut(bool)>;
+type OnChange = Box<dyn FnMut(Status)>;
 
 /// The table of running jobs and the strip that shows them. One per window,
 /// owned by the window's handlers the way the popup and the preview are.
@@ -286,12 +305,21 @@ pub struct Jobs {
     /// at most — only the operations that spawn a worker register here — so a
     /// `Vec` beats a map and keeps the choice deterministic.
     runs: RefCell<Vec<Job>>,
+    /// The last operation that can be put back, one deep. Kept here rather than
+    /// on the window because the table is already the thing that hears about
+    /// operations finishing, and already the thing the strip's sensitivity is
+    /// read from.
+    ///
+    /// One rather than a stack: each new record sweeps the previous one's stash,
+    /// so what a session holds is bounded by the last operation's displaced files
+    /// rather than by everything the window has done since it opened.
+    record: RefCell<Option<Record>>,
     /// `None` until [`Jobs::install`], which is what lets the record exist in a
     /// program with no window, and in a test with no display.
     strip: RefCell<Option<Strip>>,
-    /// Called whenever the answer to "is anything running?" changes, which is
-    /// how the window keeps the cancel action sensitive exactly when pulling it
-    /// would do something.
+    /// Called whenever the answer to "is anything running?" or "is there anything
+    /// to undo?" changes, which is how the window keeps the two actions sensitive
+    /// exactly when pulling them would do something.
     on_change: RefCell<Option<OnChange>>,
 }
 
@@ -302,6 +330,7 @@ impl Jobs {
         Self {
             next: Cell::new(1),
             runs: RefCell::new(Vec::new()),
+            record: RefCell::new(None),
             strip: RefCell::new(None),
             on_change: RefCell::new(None),
         }
@@ -337,9 +366,11 @@ impl Jobs {
         self.paint();
     }
 
-    /// Hear about the strip going empty and non-empty, which is how the window
-    /// keeps `win.cancel` sensitive exactly when pulling it would do something.
-    pub fn on_change(&self, on_change: impl FnMut(bool) + 'static) {
+    /// Hear about the strip going empty and non-empty and about the last
+    /// operation becoming available to undo, which is how the window keeps
+    /// `win.cancel` and `win.undo` sensitive exactly when pulling them would do
+    /// something.
+    pub fn on_change(&self, on_change: impl FnMut(Status) + 'static) {
         *self.on_change.borrow_mut() = Some(Box::new(on_change));
     }
 
@@ -419,6 +450,35 @@ impl Jobs {
         !self.runs.borrow().is_empty()
     }
 
+    /// Take the record of the last operation, making the table offer it back. The
+    /// bytes a replacement were kept in are swept from the previous record, which
+    /// is what bounds what a session holds on disk.
+    pub fn record(&self, record: Record) {
+        if let Some(old) = self.record.borrow_mut().replace(record) {
+            old.sweep();
+        }
+        self.paint();
+    }
+
+    /// Take the record out, which is what the Undo action does before running it:
+    /// the operation is spent either way, so a second press must not repeat it and
+    /// an undo that failed cannot be retried from a record that no longer describes
+    /// the folder.
+    pub fn take(&self) -> Option<Record> {
+        let record = self.record.borrow_mut().take();
+        if record.is_some() {
+            self.paint();
+        }
+        record
+    }
+
+    /// Whether there is an operation to put back — the answer the undo action
+    /// mirrors.
+    #[must_use]
+    pub fn is_undoable(&self) -> bool {
+        self.record.borrow().is_some()
+    }
+
     /// What the strip's label says right now. Empty when there is no strip or no
     /// job. For tests, and for nothing that has to be fast.
     #[must_use]
@@ -465,8 +525,8 @@ impl Jobs {
         Some(RefMut::map(runs, |jobs| &mut jobs[index]))
     }
 
-    /// Repaint the strip from the table and announce any change in "is anything
-    /// running?". The oldest job wins the label: it is the one the user asked
+    /// Repaint the strip from the table and announce any change in what the two
+    /// actions can do. The oldest job wins the label: it is the one the user asked
     /// for first, and the one most likely to be why the window feels slow.
     fn paint(&self) {
         let runs = self.runs.borrow();
@@ -477,13 +537,16 @@ impl Jobs {
             strip.bar.set_text(tally.as_deref());
             strip.bar.set_show_text(tally.is_some());
         }
-        let running = !runs.is_empty();
+        let status = Status {
+            running: !runs.is_empty(),
+            undoable: self.record.borrow().is_some(),
+        };
         if let Some(strip) = self.strip.borrow().as_ref() {
-            strip.root.set_visible(running);
+            strip.root.set_visible(status.running);
         }
         drop(runs);
         if let Some(on_change) = self.on_change.borrow_mut().as_mut() {
-            on_change(running);
+            on_change(status);
         }
     }
 }
@@ -498,6 +561,7 @@ impl fmt::Debug for Jobs {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Jobs")
             .field("running", &self.runs.borrow().len())
+            .field("undoable", &self.record.borrow().is_some())
             .finish_non_exhaustive()
     }
 }
@@ -509,6 +573,7 @@ mod tests {
     use crate::ui::tk;
     use std::cell::RefCell;
     use std::rc::Rc;
+    use ufm_core::Location;
 
     /// A table with its strip built, which is what a window has and what most of
     /// these assertions are about.
@@ -620,14 +685,68 @@ mod tests {
             let heard = Rc::new(RefCell::new(String::new()));
             {
                 let heard = Rc::clone(&heard);
-                jobs.on_change(move |running| {
-                    heard.borrow_mut().push_str(if running { "y" } else { "n" });
+                jobs.on_change(move |status: Status| {
+                    heard
+                        .borrow_mut()
+                        .push_str(if status.running { "y" } else { "n" });
                 });
             }
             let (id, _) = jobs.begin(Kind::Delete, "gone.txt", Some(1), Unit::Rows);
             jobs.finish(id);
             assert_eq!(heard.borrow().as_str(), "yn");
         });
+    }
+
+    #[test]
+    fn the_same_callback_hears_about_a_record_arriving_and_being_spent() {
+        tk::ui(|| {
+            let jobs = Jobs::new();
+            let heard = Rc::new(RefCell::new(String::new()));
+            {
+                let heard = Rc::clone(&heard);
+                jobs.on_change(move |status: Status| {
+                    heard
+                        .borrow_mut()
+                        .push_str(if status.undoable { "u" } else { "-" });
+                });
+            }
+            jobs.record(record_at("/tmp/a"));
+            assert!(jobs.take().is_some(), "the record is there to be spent");
+            assert!(jobs.take().is_none(), "and spending it is not repeatable");
+            assert_eq!(heard.borrow().as_str(), "-u-");
+        });
+    }
+
+    #[test]
+    fn a_record_makes_the_undo_action_sensitive_and_a_taken_one_does_not() {
+        let jobs = Jobs::new();
+        assert!(!jobs.is_undoable(), "nothing to put back in a fresh window");
+        jobs.record(record_at("/tmp/a"));
+        assert!(jobs.is_undoable());
+        let _taken = jobs.take();
+        assert!(!jobs.is_undoable());
+    }
+
+    #[test]
+    fn a_newer_record_sweeps_what_the_older_one_was_keeping() {
+        let dir = std::env::temp_dir().join("ufm-jobs-sweep");
+        std::fs::create_dir_all(&dir).expect("a stash to sweep");
+        std::fs::write(dir.join("old"), b"bytes").expect("a kept file");
+        let jobs = Jobs::new();
+        let mut keeping = Record::created(Location::file("/tmp/new"));
+        keeping.stash = Some(dir.clone());
+        jobs.record(keeping);
+        jobs.record(record_at("/tmp/b"));
+        assert!(
+            !dir.exists(),
+            "the displaced bytes of the operation the window forgot are gone too"
+        );
+    }
+
+    /// A record with no bytes behind it, for assertions about the slot rather
+    /// than about what is in it.
+    fn record_at(path: &str) -> Record {
+        Record::moved(&Location::file(path), &Location::file("/tmp/elsewhere"))
     }
 
     #[test]

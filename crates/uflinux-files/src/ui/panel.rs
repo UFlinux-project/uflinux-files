@@ -153,7 +153,7 @@ impl Place {
             Self::Starred => {
                 ufm_core::Location::parse("starred://").expect("starred is a location")
             }
-            Self::Trash => ufm_core::Location::file(paths::home().join(".local/share/Trash")),
+            Self::Trash => ufm_core::Location::file(paths::trash_dir()),
             Self::Folder(path) => ufm_core::Location::file(path.clone()),
             Self::Mount { id, .. } => ufm_core::Location::file(paths::mount_root().join(id)),
             other => ufm_core::Location::file(paths::home().join(other.label())),
