@@ -1517,7 +1517,7 @@ fi
 # the window that ran it, which is how an unmount already works, and the check that
 # the share is a card of its own was made above, while it was still listed.
 #
-# The three rows a mount row can offer. All three are registered on every window and
+# The four rows a mount row can offer. All four are registered on every window and
 # none is ever disabled: what a share can do right now decides which rows are put in
 # front of the user, not whether the command exists. An action that was never
 # registered and one that is disabled are told apart here by `Describe` answering
@@ -1538,7 +1538,7 @@ if printf '%s\n' "$WFRAME" | grep -qF "$(printf '\tNetwork\t')"; then
 else
     fail "the share sits under a heading of its own"
 fi
-for row in disconnect reconnect forget-share; do
+for row in disconnect reconnect forget-share autostart-share; do
     if describe "$row" | grep -qF '(true'; then
         ok "a mount row's $row action is one the window answers"
     else
@@ -1568,6 +1568,48 @@ if grep -qF "$MOUNT_ID" "$MOUNT_FILE" && grep -qF '"last_error": "mount error:' 
     ok "a share that failed to reconnect keeps its reason beside the record"
 else
     fail "a share that failed to reconnect keeps its reason beside the record"
+fi
+# Connect at login, which is the one row of the four whose whole job is a boolean in
+# the record: nothing is mounted, nothing is detached, and the answer has to be in
+# `mounts.json` before the process exits, because the next session reads that file and
+# not this window. Pressed twice, so the check covers both directions of the flip and
+# leaves the fixture as it found it — a record that does not connect at login, which is
+# what the `forget-share` block below was written against.
+act autostart-share "[<'$MOUNT_ID'>]" "[]"
+i=0
+while [ "$i" -lt 50 ]; do
+    grep -qF '"autostart": true' "$MOUNT_FILE" && break
+    i=$((i + 1))
+    sleep 0.2
+done
+if grep -qF '"autostart": true' "$MOUNT_FILE"; then
+    ok "marking a share connect at login is written to the table"
+else
+    fail "marking a share connect at login is written to the table ($(cat "$MOUNT_FILE"))"
+fi
+WFRAME=$(python3 "$A11Y" dump-frame "$TARGET" 2>/dev/null || true)
+if printf '%s\n' "$WFRAME" | grep -qF "this share will connect at login"; then
+    ok "marking a share connect at login says so in the window that asked"
+else
+    fail "marking a share connect at login says so in the window that asked"
+fi
+act autostart-share "[<'$MOUNT_ID'>]" "[]"
+i=0
+while [ "$i" -lt 50 ]; do
+    grep -qF '"autostart": false' "$MOUNT_FILE" && break
+    i=$((i + 1))
+    sleep 0.2
+done
+if grep -qF '"autostart": false' "$MOUNT_FILE"; then
+    ok "pressing the same row again takes the share back out of the next session"
+else
+    fail "pressing the same row again takes the share back out of the next session ($(cat "$MOUNT_FILE"))"
+fi
+WFRAME=$(python3 "$A11Y" dump-frame "$TARGET" 2>/dev/null || true)
+if printf '%s\n' "$WFRAME" | grep -qF "this share will no longer connect at login"; then
+    ok "unmarking a share says the opposite of what marking it said"
+else
+    fail "unmarking a share says the opposite of what marking it said"
 fi
 # Forget, which is the row that has to be careful: it drops the record without
 # detaching anything, so it refuses a share the kernel still reports connected. This

@@ -59,11 +59,15 @@ pub enum Place {
     /// row's identity rather than riding beside it: the row's menu is read off
     /// them, so a share that went stale or lost its password has to become a
     /// different row, not the same row offering different rows in its menu.
+    /// `autostart` is the third such answer, for the same reason: it decides
+    /// whether the menu says "Connect at Login" or "Do Not Connect at Login", and
+    /// a row that got it wrong would offer the user the row they just pressed.
     Mount {
         id: String,
         label: String,
         state: MountState,
         can_reconnect: bool,
+        autostart: bool,
     },
 }
 
@@ -320,6 +324,7 @@ pub fn menu_for(place: &Place) -> Vec<MenuRow> {
             id,
             can_reconnect,
             state,
+            autostart,
             ..
         } => {
             let row = |label, action| MenuRow {
@@ -328,28 +333,47 @@ pub fn menu_for(place: &Place) -> Vec<MenuRow> {
                 target: Some(id.clone()),
             };
             let forget = || row("Forget", "win.forget-share");
+            // The one row in this menu about the next session rather than this
+            // one, which is why it appears in every state: a share that is dead,
+            // or not mounted, or connected right now is a share the user may
+            // equally want mounted tomorrow. It reads as a label that flips rather
+            // than a ticked box because every other row here is a command, and a
+            // single checked row among plain ones reads as a setting for the menu
+            // rather than for the share.
+            let login = if *autostart {
+                row("Do Not Connect at Login", "win.autostart-share")
+            } else {
+                row("Connect at Login", "win.autostart-share")
+            };
             match state {
                 // Connected: only letting go. Reconnect would be a no-op and
                 // Forget would strand a live mount, so neither is offered —
                 // disconnect first, from here or from the card.
-                MountState::Mounted => vec![row("Disconnect", "win.disconnect")],
+                MountState::Mounted => vec![row("Disconnect", "win.disconnect"), login],
                 // The point exists and is dead, so the useful row is the one that
                 // detaches it; `mount` over a dead endpoint cannot succeed, which
                 // is why there is no Reconnect here even though the share is
                 // anything but connected. Detaching a stale point is what
                 // Disconnect does, and what the sweep does on a timer.
-                MountState::Stale => vec![row("Disconnect", "win.disconnect"), forget()],
+                MountState::Stale => {
+                    vec![row("Disconnect", "win.disconnect"), login, forget()]
+                }
                 // Nothing mounted and nothing in the way: mount it again, or stop
                 // listing it. No Disconnect row, because there is nothing to
                 // detach. A share that would have to be asked for a password has
                 // no Reconnect row either — reconnecting is deliberately the row
                 // that costs one click, and a share needing an answer is a share
                 // to open the Connect dialog for, where the answer can be given.
+                // The login row is offered anyway, because `--connect-at-login`
+                // refuses such a share and says why in its report: the row is
+                // honest about a preference, where a Reconnect row would promise a
+                // mount.
                 MountState::Absent => {
                     let mut rows = Vec::new();
                     if *can_reconnect {
                         rows.push(row("Reconnect", "win.reconnect"));
                     }
+                    rows.push(login);
                     rows.push(forget());
                     rows
                 }
@@ -677,7 +701,8 @@ mod tests {
                 id: "smb-nas-filmy".into(),
                 label: "nas/filmy".into(),
                 state: MountState::Mounted,
-                can_reconnect: true
+                can_reconnect: true,
+                autostart: false,
             }
             .label(),
             "nas/filmy"
@@ -808,6 +833,7 @@ mod tests {
             label: "nas/filmy".into(),
             state,
             can_reconnect,
+            autostart: false,
         };
         let labels = |state, can_reconnect| -> Vec<&'static str> {
             menu_for(&mount(state, can_reconnect))
@@ -815,24 +841,32 @@ mod tests {
                 .map(|row| row.label)
                 .collect()
         };
-        // Connected: let go, and nothing else. Reconnect would be a no-op and
-        // Forget would strand a mount that is in use.
-        assert_eq!(labels(MountState::Mounted, true), ["Disconnect"]);
+        // Connected: let go, and say whether tomorrow repeats it. Reconnect would
+        // be a no-op and Forget would strand a mount that is in use.
+        assert_eq!(
+            labels(MountState::Mounted, true),
+            ["Disconnect", "Connect at Login"]
+        );
         // Dead: detach it, or give up on it. Reconnecting over a dead endpoint
         // cannot work, so the row that would promise that is not there.
         assert_eq!(
             labels(MountState::Stale, true),
-            ["Disconnect", "Forget"],
+            ["Disconnect", "Connect at Login", "Forget"],
             "a stale point has to be detached before it can be mounted again"
         );
         // Never mounted, password on disk: mount it again or stop listing it.
-        assert_eq!(labels(MountState::Absent, true), ["Reconnect", "Forget"]);
+        assert_eq!(
+            labels(MountState::Absent, true),
+            ["Reconnect", "Connect at Login", "Forget"]
+        );
         // Never mounted and the password was not saved. Reconnecting would fail
         // before reaching the network, so the row is left out rather than shown
-        // disabled — the Connect dialog is where that answer gets given.
+        // disabled — the Connect dialog is where that answer gets given. The login
+        // row stays, because it promises a preference and not a mount: the session
+        // run refuses such a share and reports the refusal.
         assert_eq!(
             labels(MountState::Absent, false),
-            ["Forget"],
+            ["Connect at Login", "Forget"],
             "a share that would have to be asked is not offered a one-click mount"
         );
         for row in menu_for(&mount(MountState::Absent, true)) {
@@ -851,6 +885,63 @@ mod tests {
                 row.label
             );
         }
+    }
+
+    #[test]
+    fn the_login_row_says_the_opposite_of_what_the_share_already_does() {
+        // The row is the only one in this menu whose label is a state rather than a
+        // command, so the two labels are the whole feedback that the press worked.
+        // A row that always said "Connect at Login" would leave a user pressing it
+        // repeatedly and seeing the same menu.
+        let mount = |autostart| Place::Mount {
+            id: "smb-nas-filmy".into(),
+            label: "nas/filmy".into(),
+            state: MountState::Mounted,
+            can_reconnect: true,
+            autostart,
+        };
+        let login = |autostart| {
+            menu_for(&mount(autostart))
+                .into_iter()
+                .find(|row| row.action == "win.autostart-share")
+                .expect("a mount row always offers the login row")
+        };
+        assert_eq!(login(false).label, "Connect at Login");
+        assert_eq!(login(true).label, "Do Not Connect at Login");
+        // One row, whichever way it reads: two would mean the menu was asking
+        // which of two opposite things to do.
+        assert_eq!(
+            menu_for(&mount(true))
+                .iter()
+                .filter(|row| row.action == "win.autostart-share")
+                .count(),
+            1
+        );
+        assert_eq!(
+            menu_for(&mount(false))
+                .iter()
+                .filter(|row| row.action == "win.autostart-share")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn a_share_marked_for_login_is_a_different_row_than_the_same_share_unmarked() {
+        // The panel matches a usage bar, a selection, and a menu to a row by
+        // comparing `Place` values, so a field that changes what the menu offers
+        // has to change the row's identity too — otherwise ticking the box would
+        // leave the old row on screen with the old label.
+        let place = |autostart| Place::Mount {
+            id: "smb-nas-filmy".into(),
+            label: "nas/filmy".into(),
+            state: MountState::Mounted,
+            can_reconnect: true,
+            autostart,
+        };
+        assert_ne!(place(true), place(false));
+        // And the name does not change with it, or the row would jump.
+        assert_eq!(place(true).label(), place(false).label());
     }
 
     #[test]
@@ -878,6 +969,7 @@ mod tests {
                 label: "x".into(),
                 state: MountState::Absent,
                 can_reconnect: false,
+                autostart: false,
             },
         ];
         for place in places {
@@ -893,6 +985,7 @@ mod tests {
             label: "nas/filmy".into(),
             state: MountState::Mounted,
             can_reconnect: true,
+            autostart: false,
         };
         assert_eq!(place.group(), PanelGroup::Network);
         assert!(place.location().is_real());

@@ -191,8 +191,9 @@ UI says so rather than retrying a mount that would fail the same way.
 The state is also what a share's sidebar row is allowed to offer, so the three
 cases are a menu rather than only a label: `Mounted` offers Disconnect, `Stale`
 offers Disconnect and Forget, `Absent` offers Reconnect — when its password is
-already on disk — and Forget. See *What a mount row offers* in
-`docs/architecture.md`.
+already on disk — and Forget. Every state also offers the one row that is a
+function of the record rather than of the kernel, described under *Connecting at
+login* below. See *What a mount row offers* in `docs/architecture.md`.
 
 Reconnect reuses the stored record and the stored password and takes no new
 input, which is why the row is only offered when the answer is already known;
@@ -239,3 +240,52 @@ started when the last window closes; the file manager's own limit is 900 seconds
 meant to be there. The idle clock is the mount record's last use, updated when a
 listing is read through it, not the mount point's atime — which a `noatime` NFS
 mount does not maintain at all.
+
+## Connecting at login
+
+The `autostart` flag on a record is the whole feature: a share's menu row flips
+it, `mounts.json` stores it, the idle sweep spares shares that carry it, and
+`--connect-at-login` acts on it. There is no second file and no second daemon —
+the table already knows which shares exist, and a session unit that reads it is
+one short-lived process rather than something to keep resident.
+
+The row is a label that says the opposite of the current answer ("Connect at
+Login" on a share that does not, "Do Not Connect at Login" on one that does)
+and an action that toggles, rather than a check button carrying a boolean. That
+keeps
+`panel::MenuRow` the same `{label, action, target}` triple it is for the other
+three rows, and the label is itself the feedback about what state the press
+found. `Runner::set_autostart` reports whether the answer *changed*, so the
+banner can distinguish "now it will" from "it already did".
+
+`--connect-at-login` is a separate mode from `--sweep-mounts`, and the two
+refuse to be combined in one invocation, because they do opposite things: one
+detaches what is dead, the other mounts what is wanted. Run sweep first and
+connect second and the second run finds clean mount points. It is a separate
+mode rather than a flag on sweep for the same reason — a session starter should
+not be able to ask for both at once and get an order nobody specified.
+
+The run asks nobody anything, since it happens before a window exists. Each
+marked share gets one of four answers, and two of them are not failures:
+
+- `mounted` — the share was absent, nothing was needed to try, and the mount
+  worked
+- `already` — the share was already connected, so nothing was run. Two windows,
+  or a unit and a late manual run, will both ask; the second should be a no-op
+  and not a "device or resource busy" to interpret
+- `skipped` — nothing was attempted: the mount point is `Stale` (mounting over a
+  dead endpoint cannot work, and detaching it is sweep's job, which is why the
+  runs are separate), or the protocol takes a password that was never remembered
+  (`Runner::can_reconnect`, the same question the Reconnect row asks)
+- `failed` — the command ran and the kernel did not confirm a mount; the
+  backend's reason is recorded in `last_error` beside the record, as it is for
+  any other failure
+
+`Login::summary` prints `verb<TAB>id` with the reason indented under each — the
+shape `Sweep::summary` uses, so one session log reads as one format — and a run
+with nothing marked says `nothing marked connect at login` rather than printing
+nothing. `--json` reports `attempts` and `not_mounted`. The exit code is 0 for
+any run that got far enough to answer: a server that is not up yet is an
+ordinary morning, and the reason is beside the record for the Network group to
+show. A share whose server was down is one click from Reconnect in a window; the
+session that ran this command has nothing it could do differently.

@@ -1,10 +1,11 @@
 //! Command line, kept apart from `main` so the shape of the interface is tested
 //! and the entry point stays a dispatch.
 //!
-//! The set of modes is small on purpose. `--sweep-mounts` runs without GTK and is
-//! entered by something other than a human — the session starter — so its argument
-//! handling has to be boring and predictable. Everything else opens a window. The
-//! desktop icons provider used to be a mode here and is now its own program,
+//! The set of modes is small on purpose. The two that are not a window —
+//! `--sweep-mounts` and `--connect-at-login` — run without GTK and are entered by
+//! something other than a human, the session starter, so their argument handling
+//! has to be boring and predictable. Everything else opens a window. The desktop
+//! icons provider used to be a mode here and is now its own program,
 //! `uflinux-files-provider`: sharing this executable meant sharing its import
 //! table, and GTK's GL stack made the provider cost three times its budget without
 //! ever running a line of provider code.
@@ -23,6 +24,9 @@ pub enum Command {
     /// Clean up after mounts that are no longer mounts, then exit. See
     /// [`crate::runner`].
     Sweep(Sweep),
+    /// Mount the shares the user marked connect-at-login, then exit. See
+    /// [`crate::runner::Runner::connect_at_login`].
+    Connect(Connect),
     /// Open a window. The default.
     Ui(Ui),
 }
@@ -37,6 +41,15 @@ pub struct Ui {
     /// a window already on screen. What the desktop entry's `new-window` action
     /// passes; see [`crate::ui`] for what it costs in single-instance behaviour.
     pub new_window: bool,
+}
+
+/// The flags `--connect-at-login` accepts.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Connect {
+    /// Print the outcome as JSON instead of lines, for the same reason [`Sweep`]
+    /// has the flag: the caller is a session tool, not a person reading a
+    /// terminal.
+    pub json: bool,
 }
 
 /// The flags `--sweep-mounts` accepts.
@@ -67,6 +80,8 @@ impl Error for Usage {}
 pub fn parse(args: &[String]) -> Result<Command, Usage> {
     let mut sweep = Sweep::default();
     let mut sweeping = false;
+    let mut connecting = false;
+    let mut json = false;
     let mut urls: Vec<String> = Vec::new();
     let mut new_window = false;
     let mut help = false;
@@ -77,7 +92,8 @@ pub fn parse(args: &[String]) -> Result<Command, Usage> {
             "--help" | "-h" => help = true,
             "--version" => version = true,
             "--sweep-mounts" => sweeping = true,
-            "--json" => sweep.json = true,
+            "--connect-at-login" => connecting = true,
+            "--json" => json = true,
             "--new-window" => new_window = true,
             "--idle-after" => {
                 let value = iter
@@ -109,8 +125,21 @@ pub fn parse(args: &[String]) -> Result<Command, Usage> {
     if version {
         return Ok(Command::Version);
     }
+    // Two modes that do opposite things: one detaches what is no longer mounted,
+    // the other mounts what the user asked to have mounted. Which one to run
+    // first is a question nobody can answer for the caller, so a command line
+    // that asks for both is a command line that means one of them.
+    if sweeping && connecting {
+        return Err(Usage(
+            "--sweep-mounts and --connect-at-login are separate runs".into(),
+        ));
+    }
     if sweeping {
+        sweep.json = json;
         return Ok(Command::Sweep(sweep));
+    }
+    if connecting {
+        return Ok(Command::Connect(Connect { json }));
     }
     Ok(Command::Ui(Ui { urls, new_window }))
 }
@@ -125,11 +154,15 @@ uflinux-files — browse files, archives and network shares
 Usage:
   uflinux-files [PATH|URL ...]          open a window, one tab per location
   uflinux-files --sweep-mounts          clean up dead mounts and leftover files
+  uflinux-files --connect-at-login      mount the shares marked connect at login
   uflinux-files --version
 
 Options for --sweep-mounts:
   --idle-after SECONDS   also detach shares unused for at least this long
   --json                 report what was done as one JSON object
+
+Options for --connect-at-login:
+  --json                 report what was attempted as one JSON object
 
 Other options:
   --new-window           open a new window instead of focusing an open one
@@ -216,6 +249,48 @@ mod tests {
     }
 
     #[test]
+    fn connect_at_login_is_a_mode_of_its_own_and_takes_no_locations() {
+        assert_eq!(
+            parse(&args(&["--connect-at-login"])),
+            Ok(Command::Connect(Connect::default()))
+        );
+        assert_eq!(
+            parse(&args(&["--connect-at-login", "--json"])),
+            Ok(Command::Connect(Connect { json: true }))
+        );
+    }
+
+    #[test]
+    fn the_two_session_modes_are_separate_runs_because_they_do_opposite_things() {
+        // One detaches what the kernel has forgotten, the other mounts what the
+        // user asked for. A unit file that grew both would run one of them by
+        // accident, so it is refused rather than ordered by whichever came first.
+        let error =
+            parse(&args(&["--sweep-mounts", "--connect-at-login"])).expect_err("should be refused");
+        assert!(
+            error.to_string().contains("separate runs"),
+            "the message should say what to do instead: {error}"
+        );
+    }
+
+    #[test]
+    fn json_belongs_to_whichever_session_mode_was_asked_for() {
+        // The flag used to be read straight into the sweep's flags, which meant a
+        // `--connect-at-login --json` line opened a window and printed nothing.
+        assert_eq!(
+            parse(&args(&["--sweep-mounts", "--json"])),
+            Ok(Command::Sweep(Sweep {
+                idle_after: None,
+                json: true,
+            }))
+        );
+        assert_eq!(
+            parse(&args(&["--connect-at-login", "--json"])),
+            Ok(Command::Connect(Connect { json: true }))
+        );
+    }
+
+    #[test]
     fn an_unknown_option_is_refused_rather_than_treated_as_a_location() {
         let error = parse(&args(&["--frobnicate"])).expect_err("should be refused");
         assert_eq!(error.to_string(), "unknown option --frobnicate");
@@ -249,7 +324,13 @@ mod tests {
     #[test]
     fn usage_names_every_mode_it_accepts() {
         let text = usage();
-        for needle in ["--sweep-mounts", "--idle-after", "--json", "--new-window"] {
+        for needle in [
+            "--sweep-mounts",
+            "--idle-after",
+            "--connect-at-login",
+            "--json",
+            "--new-window",
+        ] {
             assert!(text.contains(needle), "usage is missing {needle}");
         }
         assert!(

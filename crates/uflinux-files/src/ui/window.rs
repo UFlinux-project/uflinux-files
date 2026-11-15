@@ -1492,16 +1492,18 @@ fn mount_rows(shared: &Rc<Shared>) -> Vec<Place> {
         .collect()
 }
 
-/// One mount row, carrying the two answers its menu is built from: the kernel's
-/// about the mount point and the store's about the password. Both come from what
-/// the runner already holds in memory plus one small file, so rebuilding the rows
-/// on every listing costs what reading a folder costs.
+/// One mount row, carrying the three answers its menu is built from: the kernel's
+/// about the mount point, the store's about the password, and the table's about the
+/// next session. All three come from what the runner already holds in memory plus
+/// one small file, so rebuilding the rows on every listing costs what reading a
+/// folder costs.
 fn mount_place(runner: &Runner, record: &MountRecord) -> Place {
     Place::Mount {
         id: record.id.clone(),
         label: record.share.label(),
         state: runner.state(&record.id),
         can_reconnect: runner.can_reconnect(&record.share),
+        autostart: record.autostart,
     }
 }
 
@@ -1921,8 +1923,8 @@ fn wire_actions(app: &gtk::Application, window: &gtk::ApplicationWindow, ctx: &C
     sync_buttons(ctx);
 }
 
-/// The three commands a mount row's menu offers, each about the share the row
-/// names rather than about the folder in the title bar.
+/// The four commands a mount row's menu offers, each about the share the row names
+/// rather than about the folder in the title bar.
 ///
 /// None is ever disabled, for the reason [`bookmark_actions`] gives: the gate is
 /// the menu, which [`panel::menu_for`] builds only for a mount row and only in the
@@ -1930,9 +1932,9 @@ fn wire_actions(app: &gtk::Application, window: &gtk::ApplicationWindow, ctx: &C
 /// open — another window, the sweep on its timer, the share's own daemon dying — so
 /// each handler asks again and says what it finds.
 ///
-/// Two of the three run on a worker because both block on a helper process. The
-/// third edits one small file and answers in the same turn, which is why the three
-/// do not share a shape even though they share a menu.
+/// Two of the four run on a worker because both block on a helper process. The other
+/// two edit one small file and answer in the same turn, which is why they do not
+/// share a shape even though they share a menu.
 fn mount_actions(ctx: &Ctx) -> Vec<Rc<gio::SimpleAction>> {
     let disconnect = gio::SimpleAction::new("disconnect", Some(glib::VariantTy::STRING));
     disconnect.connect_activate({
@@ -1967,7 +1969,23 @@ fn mount_actions(ctx: &Ctx) -> Vec<Rc<gio::SimpleAction>> {
         }
     });
 
-    vec![Rc::new(disconnect), Rc::new(reconnect), Rc::new(forget)]
+    let autostart = gio::SimpleAction::new("autostart-share", Some(glib::VariantTy::STRING));
+    autostart.connect_activate({
+        let ctx = ctx.clone();
+        move |_action, parameter| {
+            let Some(id) = share_named(parameter) else {
+                return;
+            };
+            set_share_autostart(&ctx, &id);
+        }
+    });
+
+    vec![
+        Rc::new(disconnect),
+        Rc::new(reconnect),
+        Rc::new(forget),
+        Rc::new(autostart),
+    ]
 }
 
 /// The record id a sidebar menu row named.
@@ -2049,6 +2067,50 @@ fn forget_share(ctx: &Ctx, id: &str) {
     }
     ctx.computer.set_cards(&card_data(&ctx.shared));
     show_banner(ctx, &report.message);
+}
+
+/// Flip whether a share connects at login, from the sidebar row that named it.
+///
+/// The action toggles rather than sets, because the menu row it comes from reads as
+/// the opposite of the current answer and carries no boolean of its own: one
+/// parameter shape for all four mount rows keeps [`panel::MenuRow`] a label plus an
+/// action plus an id, and the row's label is already the feedback about what state
+/// the press found. A menu left open across a change in another window therefore
+/// acts on the state as it is now, which is what the other three rows do too.
+///
+/// Inline like [`forget_share`], for the same reason: one small file is rewritten
+/// and no helper runs, so a worker would only delay the repaint by a frame.
+fn set_share_autostart(ctx: &Ctx, id: &str) {
+    let wanted = {
+        let state = ctx.shared.state.borrow();
+        !state
+            .runner
+            .table()
+            .get(id)
+            .is_some_and(|record| record.autostart)
+    };
+    let changed = {
+        let mut state = ctx.shared.state.borrow_mut();
+        state.runner.set_autostart(id, wanted)
+    };
+    // Repaint either way. The rows are built from the table, so a press that found
+    // the share gone — forgotten in another window — has to drop the row rather
+    // than leave it offering a menu for a share that is not listed.
+    if let Some(panel) = ctx.panel.upgrade() {
+        panel.set_places(places(&ctx.shared));
+        panel.set_usage(usages(&ctx.shared));
+    }
+    ctx.computer.set_cards(&card_data(&ctx.shared));
+    let message = match (changed, wanted) {
+        (true, true) => "this share will connect at login",
+        (true, false) => "this share will no longer connect at login",
+        // Either the share is not listed or it already said this. Both read as
+        // "nothing changed", which is the honest answer and not a failure: the
+        // state the user asked for is the state the table is in.
+        (false, true) => "this share already connects at login",
+        (false, false) => "this share does not connect at login",
+    };
+    show_banner(ctx, message);
 }
 
 /// Where the window can go: back, forward, up, and a re-read of where we are.
@@ -3398,6 +3460,7 @@ mod tests {
             label: "filmy".to_string(),
             state: MountState::Mounted,
             can_reconnect: true,
+            autostart: false,
         };
         let point = mount.location();
         let found = place_for(&[], &[mount], &point);

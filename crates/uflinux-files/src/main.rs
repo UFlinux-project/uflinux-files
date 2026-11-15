@@ -15,10 +15,12 @@ mod cli;
 
 // The connect dialog calls `mount` and `forget`; a card's or a sidebar row's
 // Disconnect calls `unmount`, Reconnect calls `reconnect`, Forget calls
-// `forget_share`, and `--sweep-mounts` calls `sweep`. `list` is the one method
-// still waiting for a caller: it exists so a share can be recorded before it is
-// ever mounted, which is what "connect at login" means, and nothing offers that
-// preference yet. Until then this keeps the one honest name rather than
+// `forget_share`, the login row calls `set_autostart`, `--sweep-mounts` calls
+// `sweep` and `--connect-at-login` calls `connect_at_login`. `list` is the one
+// method still waiting for a caller: it exists so a share can be recorded before
+// it is ever mounted, and a share marked from the sidebar reached that state
+// through `mount` or through a record the table already had. Until something
+// offers a share without mounting it, this keeps the one honest name rather than
 // deleting a capability the mount table already models.
 #[allow(dead_code)]
 mod runner;
@@ -26,7 +28,7 @@ mod ui;
 
 use std::process::ExitCode;
 
-use runner::{Layout, Runner};
+use runner::{Layout, Login, Runner};
 use ufm_mount::sweep::{Action, Sweep, SweepItem};
 
 fn main() -> ExitCode {
@@ -41,6 +43,7 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         Ok(cli::Command::Sweep(options)) => sweep(&options),
+        Ok(cli::Command::Connect(options)) => connect(options),
         Ok(cli::Command::Ui(options)) => ui(&options),
         Err(usage) => {
             eprintln!("uflinux-files: {usage}");
@@ -76,6 +79,49 @@ fn sweep(options: &cli::Sweep) -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// Mount the shares the user asked to have mounted, and print what happened.
+///
+/// Like [`sweep`], the exit code is about the run rather than about each share: a
+/// server that is not up yet is an ordinary morning, and the reason is stored
+/// beside the record for the Network group to show. What makes this run worth
+/// watching is its output, not its status — a session unit that failed here would
+/// have failed to answer, not failed to mount.
+fn connect(options: cli::Connect) -> ExitCode {
+    let mut runner = Runner::open(Layout::system());
+    let login = runner.connect_at_login();
+    if options.json {
+        println!("{}", json_login(&login));
+    } else {
+        print!("{}", login.summary());
+    }
+    ExitCode::SUCCESS
+}
+
+/// The outcome as one JSON object, in the shape [`json`] gives a sweep: a list of
+/// per-share results plus a count, so a session tool can decide whether to bother
+/// the user without parsing prose.
+fn json_login(login: &Login) -> String {
+    let attempts: Vec<_> = login
+        .attempts()
+        .iter()
+        .map(|attempt| {
+            serde_json::json!({
+                "id": attempt.id,
+                "label": attempt.label,
+                "result": attempt.verb(),
+                "attempted": attempt.attempted,
+                "mounted": attempt.ok,
+                "message": attempt.message,
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "attempts": attempts,
+        "not_mounted": login.not_mounted(),
+    })
+    .to_string()
 }
 
 /// The summary as one JSON object: what this run removed, what still needs a

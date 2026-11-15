@@ -77,6 +77,106 @@ impl Report {
     }
 }
 
+/// One share's place in a connect-at-login run.
+///
+/// The outcome rather than a [`Report`], because the two halves of the answer are
+/// asked separately: whether anything was attempted, and whether the share is
+/// mounted now. A share that was already connected is what the user asked for and
+/// is not a failure, and a share sitting on a dead mount point is not a failure
+/// either — it is a share that needs the sweep before it needs a mount. Folding
+/// those into `ok` alone would make a session log read as three broken servers
+/// where one command did the right thing three times.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Attempt {
+    /// The record this attempt is about. Always present: a connect-at-login run
+    /// only ever talks about shares the table already names.
+    pub id: String,
+    /// What to call the share, taken from the record rather than from the mount
+    /// point, because the message is read by a person.
+    pub label: String,
+    /// Whether a mount command was run. `false` means the share was left as it
+    /// was, which is a decision and not a failure to decide.
+    pub attempted: bool,
+    /// Whether the share is mounted as a result of this run.
+    pub ok: bool,
+    /// What happened, in the user's terms. Safe to print, for the reasons
+    /// [`Report`] gives.
+    pub message: String,
+}
+
+impl Attempt {
+    /// The word for this outcome, matching what [`Login::summary`] prints. Four
+    /// states, because there are four honest answers and two of them are not
+    /// failures.
+    #[must_use]
+    pub fn verb(&self) -> &'static str {
+        match (self.attempted, self.ok) {
+            (true, true) => "mounted",
+            (true, false) => "failed",
+            (false, true) => "already",
+            (false, false) => "skipped",
+        }
+    }
+}
+
+/// What a connect-at-login run did, in the order the table lists the shares.
+///
+/// The shape [`ufm_mount::sweep::Sweep`] has, for the same reason: this runs from
+/// a session unit with no terminal attached, so the record of the run is whatever
+/// it prints. A run that tried nothing is not an error — a user who never ticked
+/// the box has nothing to connect — and a run whose server was down is not one the
+/// session can act on either, since the reason is already written beside the
+/// record and Reconnect is one click in a window.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Login {
+    attempts: Vec<Attempt>,
+}
+
+impl Login {
+    /// Every share the table marked connect-at-login, whether it was attempted or
+    /// not. A run that reports nothing about a marked share would leave a user
+    /// unable to tell "not tried" from "not even looked at".
+    #[must_use]
+    pub fn attempts(&self) -> &[Attempt] {
+        &self.attempts
+    }
+
+    /// Whether the table had nothing marked, which is the common case and worth
+    /// saying out loud rather than printing nothing.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.attempts.is_empty()
+    }
+
+    /// How many shares are not mounted as a result. `already` counts as mounted;
+    /// `skipped` and `failed` do not.
+    #[must_use]
+    pub fn not_mounted(&self) -> usize {
+        self.attempts.iter().filter(|a| !a.ok).count()
+    }
+
+    /// Lines of `verb<TAB>id` with the reason indented under each, the shape
+    /// [`ufm_mount::sweep::Sweep::summary`] uses so one session log reads as one
+    /// format.
+    #[must_use]
+    pub fn summary(&self) -> String {
+        use std::fmt::Write as _;
+        if self.attempts.is_empty() {
+            return "nothing marked connect at login\n".into();
+        }
+        let mut out = String::new();
+        for attempt in &self.attempts {
+            let _ = writeln!(out, "{}\t{}", attempt.verb(), attempt.id);
+            let _ = writeln!(out, "\t{}", attempt.message);
+        }
+        out
+    }
+
+    fn record(&mut self, attempt: Attempt) {
+        self.attempts.push(attempt);
+    }
+}
+
 /// Everything a [`Runner`] touches that a test might want somewhere else.
 ///
 /// A test builds a `Runner` over a temporary directory and a directory of stub
@@ -188,6 +288,27 @@ impl Runner {
             self.table = table;
         }
         self.observer.reload();
+    }
+
+    /// Remember or forget a share for the next session, which is what the
+    /// "Connect at login" row in a share's menu means.
+    ///
+    /// The flag is kept beside the record rather than in a file of its own: it is
+    /// one boolean about one share, and the mount table is already the thing that
+    /// knows which shares exist. Setting it on a share that has never been mounted
+    /// is legitimate — that is the shape of "mount this when I log in" — and costs
+    /// a mount point, which `--connect-at-login` creates.
+    ///
+    /// Returns whether the answer changed, so a caller can say "now this share
+    /// connects at login" instead of repeating that back after a no-op.
+    pub fn set_autostart(&mut self, id: &str, autostart: bool) -> bool {
+        if !self.table.set_autostart(id, autostart) {
+            return false;
+        }
+        // Unlike the password store, a lost write here is visible: the box would
+        // come back unticked next session, so the caller is told nothing happened
+        // rather than being handed `true`.
+        self.table.save().is_ok()
     }
 
     /// Note that a share carried traffic, which is what stops an idle auto-unmount
@@ -329,6 +450,76 @@ impl Runner {
     #[must_use]
     pub fn can_reconnect(&self, share: &Share) -> bool {
         !share.protocol.uses_password() || self.has_password(share)
+    }
+
+    /// Mount every share the user marked connect-at-login, and say what happened
+    /// to each of them.
+    ///
+    /// The point of this run is that nobody is asked anything: it happens from a
+    /// session unit, before a window exists, so a share that would need a password
+    /// or a polkit prompt is left alone rather than started and watched fail. That
+    /// is the same test [`Self::can_reconnect`] makes for a Reconnect row, for the
+    /// same reason — an attempt known in advance to fail costs a mount point and a
+    /// confusing error, and buys nothing.
+    ///
+    /// A share already mounted is reported and left as it is. Two windows, or a
+    /// session unit and a late `--connect-at-login`, will both ask; the second one
+    /// should be a no-op and not a "device or resource busy" the user has to
+    /// interpret. A share sitting on a *dead* mount point is likewise left alone:
+    /// mounting over a stale mount point does not work, and detaching it is what
+    /// `--sweep-mounts` is for — the two runs are separate precisely so that this
+    /// one never has to guess whether it is allowed to run a `umount`.
+    ///
+    /// Nothing here returns `Err`. A server that is down until lunchtime is an
+    /// ordinary morning, and the reason is already stored beside the record for the
+    /// Network group to show, so the run reports per share and exits clean.
+    #[must_use]
+    pub fn connect_at_login(&mut self) -> Login {
+        let mut login = Login::default();
+        // One read for the whole run: every share is judged against the same
+        // snapshot of the kernel's state, so a share that appears partway through
+        // does not make the earlier answers inconsistent with the later ones.
+        self.observer.reload();
+        let marked: Vec<(String, String, Share, MountState)> = self
+            .table
+            .autostart()
+            .into_iter()
+            .map(|record| {
+                (
+                    record.id.clone(),
+                    record.label(),
+                    record.share.clone(),
+                    self.observer.state(&record.mountpoint),
+                )
+            })
+            .collect();
+        for (id, label, share, state) in marked {
+            let (attempted, ok, message) = match state {
+                MountState::Mounted => (false, true, format!("{label} was already connected")),
+                MountState::Stale => (
+                    false,
+                    false,
+                    format!("{label} is mounted but nothing answers there; clean it up first"),
+                ),
+                MountState::Absent if !self.can_reconnect(&share) => (
+                    false,
+                    false,
+                    format!("{label} needs a password that was never remembered"),
+                ),
+                MountState::Absent => {
+                    let report = self.mount(&share, None);
+                    (true, report.ok, report.message)
+                }
+            };
+            login.record(Attempt {
+                id,
+                label,
+                attempted,
+                ok,
+                message,
+            });
+        }
+        login
     }
 
     /// Clean up after mounts that are no longer mounts: detach what the scan says
@@ -1239,5 +1430,192 @@ mod tests {
             fixture.path("net").join(share.label()).is_dir(),
             "the user's folder is theirs to keep"
         );
+    }
+
+    #[test]
+    fn marking_a_share_connect_at_login_is_saved_and_a_second_press_changes_nothing() {
+        let fixture = Fixture::new();
+        let share = share("nfs://srv/export");
+        let mut runner = fixture.runner();
+        let id = runner.list(&share).id.clone();
+        assert!(runner.set_autostart(&id, true), "the answer changed");
+        assert!(
+            !runner.set_autostart(&id, true),
+            "asking for the same answer again is not a change"
+        );
+        let saved = fs::read_to_string(MountTable::path_at(&fixture.path("conf"))).expect("table");
+        assert!(saved.contains("\"autostart\": true"), "{saved}");
+        assert!(
+            !runner.set_autostart("no-such-share", true),
+            "a share that is not listed cannot be marked"
+        );
+        let reloaded = fixture.runner();
+        assert!(
+            reloaded.table().get(&id).expect("record").autostart,
+            "the answer survives to the next session, which is the only session it matters to"
+        );
+    }
+
+    #[test]
+    fn a_login_run_with_nothing_marked_says_so_rather_than_printing_nothing() {
+        let fixture = Fixture::new();
+        let mut runner = fixture.runner();
+        let login = runner.connect_at_login();
+        assert!(login.is_empty());
+        assert_eq!(login.summary(), "nothing marked connect at login\n");
+        assert_eq!(login.not_mounted(), 0);
+    }
+
+    #[test]
+    fn a_marked_share_that_is_already_connected_is_reported_and_left_as_it_is() {
+        let fixture = Fixture::new();
+        let share = share("nfs://srv/export");
+        let target = point(&fixture, &share);
+        fs::create_dir_all(&target).expect("point");
+        fixture.claim(&target, "nfs");
+        let mut runner = fixture.runner();
+        let id = runner.list(&share).id.clone();
+        runner.set_autostart(&id, true);
+        let login = runner.connect_at_login();
+        let attempt = login.attempts().first().expect("one attempt");
+        assert_eq!(attempt.verb(), "already");
+        assert!(
+            attempt.message.contains("was already connected"),
+            "{}",
+            attempt.message
+        );
+        assert_eq!(
+            login.not_mounted(),
+            0,
+            "a share that was already there is a share that is mounted"
+        );
+        assert_eq!(runner.state(&id), MountState::Mounted);
+    }
+
+    #[test]
+    fn a_marked_share_sitting_on_a_dead_mount_point_is_left_for_the_sweep() {
+        let fixture = Fixture::new();
+        let share = share("sftp://host/data");
+        let target = point(&fixture, &share);
+        fixture.fuse_helper("sshfs", &target, "fuse.sshfs");
+        let mut runner = fixture.runner();
+        let id = runner.mount(&share, None).id.clone().expect("an id");
+        runner.set_autostart(&id, true);
+        // The daemon died: the kernel still names the point, nothing answers there.
+        fs::remove_dir(&target).expect("the mount point goes away");
+        let login = runner.connect_at_login();
+        let attempt = login.attempts().first().expect("one attempt");
+        assert_eq!(attempt.verb(), "skipped");
+        assert!(
+            attempt.message.contains("clean it up first"),
+            "{}",
+            attempt.message
+        );
+        assert_eq!(login.not_mounted(), 1);
+        // The record is untouched apart from the failure the run did not cause.
+        assert!(
+            runner.table().get(&id).is_some(),
+            "a share the sweep can fix keeps its row"
+        );
+    }
+
+    #[test]
+    fn a_marked_share_that_would_need_a_password_is_never_started() {
+        let fixture = Fixture::new();
+        let share = share("smb://user@srv/share");
+        let target = point(&fixture, &share);
+        fixture.kernel_helper(&target, "cifs");
+        let mut runner = fixture.runner();
+        let id = runner.list(&share).id.clone();
+        runner.set_autostart(&id, true);
+        let login = runner.connect_at_login();
+        let attempt = login.attempts().first().expect("one attempt");
+        assert_eq!(
+            attempt.verb(),
+            "skipped",
+            "nobody is there to type a password"
+        );
+        assert!(
+            attempt.message.contains("needs a password"),
+            "{}",
+            attempt.message
+        );
+        assert!(
+            !target.exists(),
+            "a mount point is not spent on an attempt known to fail"
+        );
+        // With the password remembered, the same share is worth attempting.
+        runner
+            .remember(&share, Some(Secret::from("hunter2")))
+            .expect("store");
+        let login = runner.connect_at_login();
+        assert_eq!(login.attempts().first().expect("one").verb(), "mounted");
+    }
+
+    #[test]
+    fn a_marked_share_that_is_not_mounted_gets_mounted_and_a_refusal_is_a_failure() {
+        let fixture = Fixture::new();
+        let up = share("nfs://srv/export");
+        let target = point(&fixture, &up);
+        fixture.kernel_helper(&target, "nfs");
+        let mut runner = fixture.runner();
+        let id = runner.list(&up).id.clone();
+        runner.set_autostart(&id, true);
+        let login = runner.connect_at_login();
+        let attempt = login.attempts().first().expect("one attempt");
+        assert!(attempt.attempted, "the share was not already there");
+        assert_eq!(attempt.verb(), "mounted");
+        assert_eq!(runner.state(&id), MountState::Mounted);
+        assert_eq!(login.not_mounted(), 0);
+
+        // The same share on a box whose helper mounts nothing: the run says so.
+        let broken = Fixture::new();
+        let down = share("nfs://srv/export");
+        let mut runner = broken.runner();
+        let id = runner.list(&down).id.clone();
+        runner.set_autostart(&id, true);
+        let login = runner.connect_at_login();
+        let attempt = login.attempts().first().expect("one attempt");
+        assert_eq!(attempt.verb(), "failed");
+        assert!(attempt.attempted, "the command was run and did not work");
+        assert_eq!(login.not_mounted(), 1);
+        assert!(
+            attempt.message.contains(&down.label()),
+            "the message names the share: {}",
+            attempt.message
+        );
+    }
+
+    #[test]
+    fn a_login_run_answers_every_marked_share_in_the_order_the_table_lists_them() {
+        let fixture = Fixture::new();
+        let mounted = share("nfs://srv/export");
+        let skipped = share("smb://user@srv/share");
+        fixture.kernel_helper(&point(&fixture, &mounted), "nfs");
+        let mut runner = fixture.runner();
+        for share in [&mounted, &skipped] {
+            let id = runner.list(share).id.clone();
+            runner.set_autostart(&id, true);
+        }
+        let login = runner.connect_at_login();
+        let ids: Vec<String> = login
+            .attempts()
+            .iter()
+            .map(|attempt| attempt.id.clone())
+            .collect();
+        assert_eq!(
+            ids,
+            vec![mounted.slug(), skipped.slug()],
+            "one row per marked share, in table order"
+        );
+        assert_eq!(
+            login.not_mounted(),
+            1,
+            "the password-less share is not mounted"
+        );
+        let summary = login.summary();
+        assert!(summary.contains("mounted\t"), "{summary}");
+        assert!(summary.contains("skipped\t"), "{summary}");
+        assert!(summary.contains(&skipped.label()), "{summary}");
     }
 }

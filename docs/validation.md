@@ -44,7 +44,7 @@ rows a bookmark offers are exactly Rename, Move Up, Move Down and Remove, each
 aimed at that bookmark's own URI rather than at a position, and a row for a place
 that cannot answer for itself — Home, Trash, a plain folder — is offered
 no rows at all, which opens no popover. |
-| `uflinux-files` (mount rows) | the rows a share's row offers follow the state the row was built from and nothing else: a connected share gets Disconnect, a share whose kernel entry died gets Disconnect and Forget, a share that is listed without being mounted gets Reconnect and Forget; Reconnect is left off a share that would have to be asked for a password, and a `Stale` share is never offered it because mounting over a dead endpoint cannot work; every row carries the record's id rather than a position, so a menu left open across a rebuild cannot act on a different share. |
+| `uflinux-files` (mount rows) | the rows a share's row offers follow the state the row was built from and nothing else: a connected share gets Disconnect, a share whose kernel entry died gets Disconnect and Forget, a share that is listed without being mounted gets Reconnect and Forget; Reconnect is left off a share that would have to be asked for a password, and a `Stale` share is never offered it because mounting over a dead endpoint cannot work; every state also carries the login row, whose label is the opposite of the flag the record holds and which is a different row than the same share unmarked; every row carries the record's id rather than a position, so a menu left open across a rebuild cannot act on a different share. |
 | `uflinux-files` (job table) | a report never reaches the strip more than once per throttle window, and the first one always does; a job with no total shows a bar with no fraction rather than a fake one; a tally reads `512 KiB of 1.0 MiB` for bytes and `4 of 9` for rows; finishing the only job empties the table and says so exactly once; pulling the brakes reaches every job on the table, including a second one registered after the first; a report naming a job that already finished is dropped rather than resurrected; the strip's text is read back from the widgets rather than from a parallel copy of it, so it cannot disagree with what is drawn. |
 | `uflinux-files` (My Computer) | Home and the system drive are always cards and a desktop folder becomes one only when it exists; a connected share says `Connected`, carries its protocol's icon and renders its capacity as `256 KiB free of 1.0 MiB`; a share the kernel has lost is still listed but says `Disconnected`, shows its mount point where the capacity would go and cannot be opened; a filesystem that reports no size gets no bar; a share's label beats the last component of its URI; activating a card reaches the open hook exactly once with the card's own id, and a Disconnect button reaches the unmount hook with the record id rather than the label. |
 | `uflinux-files` (history) | an XBEL record becomes a row only for a local file that still exists; a `added` timestamp is decoded to a fixed instant, a UTC offset is subtracted rather than ignored, and `modified` stands in when `added` is absent; percent escapes are decoded; a file written twice is one row carrying the newer time; newest first, capped at the limit; a missing history file is an empty list rather than an error. |
@@ -296,10 +296,16 @@ deliberately told to leave alone, which is what keeps the row standing for the w
 The card is checked where the Computer view is opened, and the row in the folder window's
 sidebar, under a `Network` heading, is checked before anything is asked of it, because
 everything after that point is asserted by the *absence* of it.
-The three commands behind the row are then activated over the bus. Reconnect fails, since
+The four commands behind the row are then activated over the bus. Reconnect fails, since
 this container has no NFS helper, and that failure is the assertion twice over: the reason
 appears in the window's banner, and the same reason is found in `mounts.json` beside the
-record, which is the half no unit test can reach because it only exists in a file. Forget
+record, which is the half no unit test can reach because it only exists in a file. The
+login row is pressed twice, and both directions of the flip are read back out of
+`mounts.json` — the record's `autostart` field is the entire effect of that row, so a
+press that only redrew the sidebar would pass every other check in this section and still
+leave the next session without the share it was promised; the banner is checked to say the
+matching thing each time. Pressing it twice also leaves the fixture as it was found, which
+is what lets the Forget check below be written against an unmarked record. Forget
 then takes the record out of the file, out of the sidebar, and takes the `Network` heading
 with it — a heading is drawn wherever the group changes, so one left over an empty group
 is a section of the sidebar with nothing in it. The Computer window is left open across

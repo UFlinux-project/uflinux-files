@@ -280,12 +280,17 @@ control. A bookmark's four rows are a function of the record: the record exists,
 Rename, Move Up, Move Down and Remove are all always true of it. A share's rows are a
 function of what the kernel says about its mount point *right now*, and the three states
 give three different answers — `Mounted` offers Disconnect, `Stale` offers Disconnect and
-Forget, `Absent` offers Reconnect and Forget. `panel::menu_for` takes all of that from the
-`Place` itself: `Place::Mount` carries the record's id, its label, the state the row was
-built from and whether a password is on disk, which is why the function stays a lookup
-rather than a call back into the window. `MountState` derives `Hash` for exactly this
-reason — a state that a row is allowed to remember has to be a state a row is allowed to
-carry.
+Forget, `Absent` offers Reconnect and Forget. On top of those state rows every state
+carries one row that is a function of the record instead: Connect at Login, or its
+opposite, described under *Connecting at login* in `docs/mounts.md`. `panel::menu_for`
+takes all of that from the `Place` itself: `Place::Mount` carries the record's id, its
+label, the state the row was built from, whether a password is on disk, and the
+autostart flag, which is why the function stays a lookup rather than a call back into
+the window. `MountState` derives `Hash` for exactly this reason — a state that a row is
+allowed to remember has to be a state a row is allowed to carry. The autostart flag is
+in the identity for the same reason: the row's label is built from it, and a flag that
+changed without the `Place` changing would leave a row showing the label for the answer
+it no longer holds.
 
 Two of those pairings are worth stating, because both look like omissions. A `Stale` row
 has no Reconnect: the mount point still has a kernel entry over a dead endpoint, so
@@ -307,7 +312,7 @@ everywhere else.
 
 Every row targets the record's id rather than its position, for the reason a bookmark row
 targets its URI: a position is a fact about a rendering, and a menu can sit open across a
-rebuild that changes it. The id outlives the rebuild or names nothing, and the three
+rebuild that changes it. The id outlives the rebuild or names nothing, and the four
 actions are STRING-targeted and never disabled — the menu is the gate, so the honest
 answer to a request about a share that has gone is a banner saying so rather than a
 greyed row that never explains itself.
@@ -322,6 +327,15 @@ still reports `Mounted`: the record is the only handle on a live mount, and dele
 would leave a mount point no window can eject any more. A `Stale` share is allowed
 through without a detach, which is the useful case — the entry is dead, the user wants the
 row gone, and the sweep at next session start detaches what is left.
+
+The login row runs inline for the same reason Forget does — one small file is rewritten
+and no helper runs — and its action toggles rather than sets, because the row it comes
+from is a label that already says the opposite of the current answer and carries no
+boolean of its own. `Runner::set_autostart` answers whether the flag changed, and the
+banner says which of the four things happened: it will now, it will no longer, it already
+did, or it does not. The last two are the share having gone from the table or the answer
+already being the one asked for; both are "nothing changed", which is honest and is not
+a failure, because the state the user asked for is the state the table is in.
 
 One builder, `mount_place`, produces a mount `Place` for the sidebar, for the selection
 and for the usage map, and that is a correctness rule rather than tidiness. `Place` is

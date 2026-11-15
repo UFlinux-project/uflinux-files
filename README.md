@@ -11,6 +11,7 @@ desktop icon model that `uflinux-desktop` draws.
     uflinux-files ~/Documents            # open a window at a folder
     uflinux-files computer://            # the My Computer panel
     uflinux-files --sweep-mounts         # clean up after an unclean shutdown
+    uflinux-files --connect-at-login     # mount the shares marked connect at login
 
 Desktop icons are served by a separate program, `uflinux-files-provider`, which holds
 the model over D-Bus and never opens a window.
@@ -43,9 +44,11 @@ the model over D-Bus and never opens a window.
 - **Network shares as folders**: SMB, NFS, SFTP, WebDAV and FTP are *mounted*
   rather than spoken, under `$XDG_RUNTIME_DIR/ufm`, so every view, thumbnail and
   file operation works on them without remote special-casing. A share's sidebar row
-  right-clicks into whatever its state allows: Disconnect while it is up, Reconnect
-  once it is down and its password is already saved, Forget when the row itself should
-  go. A share that fails to come back says why, in the window and beside the record.
+  row right-clicks into whatever its state allows: Disconnect while it is up,
+  Reconnect once it is down and its password is already saved, Forget when the
+  row itself should go, and Connect at Login on any of them — which is one
+  boolean in the mount table, acted on by `--connect-at-login`. A share that
+  fails to come back says why, in the window and beside the record.
 - **Search** over filenames, metadata and application entries, served by a
   D-Bus-activated indexer that exits when it has been idle. The same interface
   is what a start menu will use instead of its own application catalog.
