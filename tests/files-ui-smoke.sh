@@ -302,6 +302,78 @@ else
     fail "Cancel is disabled while nothing runs ($(describe cancel))"
 fi
 
+# --- undoing a discard ----------------------------------------------------------
+# The whole feature end to end: a row thrown away, the trash it lands in, the
+# sidecar that names where it came from, and the button that puts it back. The
+# trash is checked as the freedesktop layout rather than as a `trash:` URI
+# because reading the directory is what the undo actually does — `GIO`'s trash
+# URI belongs to `GVfs`, which this container has no more than a minimal
+# UFLinux install does, so an implementation built on the URI would pass a
+# check like this only by accident of the image.
+if describe undo | grep -qF '(false'; then
+    ok "Undo is disabled before anything has been done"
+else
+    fail "Undo is disabled before anything has been done ($(describe undo))"
+fi
+python3 "$A11Y" select two >/dev/null 2>&1 || :
+act trash "[]" "[]"
+i=0
+while [ "$i" -lt 50 ] && [ -e "$TARGET/two" ]; do
+    i=$((i + 1))
+    sleep 0.2
+done
+if [ ! -e "$TARGET/two" ]; then
+    ok "Discard moves the selected row out of the folder"
+else
+    fail "Discard moves the selected row out of the folder ($TARGET/two is still there)"
+fi
+TRASHED=$XDG_DATA_HOME/Trash
+if [ -d "$TRASHED/files/two" ] && [ -f "$TRASHED/info/two.trashinfo" ]; then
+    ok "the row lands in the trash beside a sidecar naming its origin"
+else
+    fail "the row lands in the trash beside a sidecar naming its origin (files: $([ -d "$TRASHED/files/two" ] && echo y || echo n), info: $([ -f "$TRASHED/info/two.trashinfo" ] && echo y || echo n))"
+fi
+if describe undo | grep -qF '(true'; then
+    ok "an operation makes Undo sensitive"
+else
+    fail "an operation makes Undo sensitive ($(describe undo))"
+fi
+act undo "[]" "[]"
+i=0
+while [ "$i" -lt 50 ] && [ ! -e "$TARGET/two" ]; do
+    i=$((i + 1))
+    sleep 0.2
+done
+if [ -e "$TARGET/two" ]; then
+    ok "Undo moves the row back out of the trash"
+else
+    fail "Undo moves the row back out of the trash (no $TARGET/two)"
+fi
+if [ ! -e "$TRASHED/files/two" ] && [ ! -e "$TRASHED/info/two.trashinfo" ]; then
+    ok "the entry leaves the trash with the row, rather than waiting to be emptied"
+else
+    fail "the entry leaves the trash with the row (files: $([ -e "$TRASHED/files/two" ] && echo y || echo n), info: $([ -e "$TRASHED/info/two.trashinfo" ] && echo y || echo n))"
+fi
+i=0
+while [ "$i" -lt 50 ]; do
+    refresh
+    printf '%s\n' "$DUMP" | grep -qF "Moved back" && break
+    i=$((i + 1))
+    sleep 0.2
+done
+if printf '%s\n' "$DUMP" | grep -qF "Moved back"; then
+    ok "the window says what it moved back"
+else
+    fail "the window says what it moved back"
+fi
+# One deep rather than a stack: the record is spent by the attempt, whether or
+# not it worked, so the button goes insensitive the moment it is pressed.
+if describe undo | grep -qF '(false'; then
+    ok "Undo spends itself, rather than offering the same undo twice"
+else
+    fail "Undo spends itself, rather than offering the same undo twice ($(describe undo))"
+fi
+
 # The prompt is a window of its own, so it shows up as a frame. Its entry arrives with
 # a suggested name already in it, which the check on the created folder confirms.
 act new-folder "[]" "[]"
@@ -332,7 +404,17 @@ if [ -d "$MADE" ]; then
 else
     fail "the prompt creates the folder it suggested (no $MADE)"
 fi
-refresh
+# The window notices through its own watcher, which costs a re-read — and after
+# the undo above there is a re-read already in flight, whose answer may land
+# before the new folder exists. So the check waits for the row rather than
+# looking once: the listing does pick the folder up on its own, and on a loaded
+# machine it simply takes a moment longer than one glance.
+i=0
+while [ "$i" -lt 50 ] && ! printf '%s\n' "$DUMP" | grep -qF "$(printf '\tUntitled folder\t')"; do
+    refresh
+    i=$((i + 1))
+    sleep 0.2
+done
 if printf '%s\n' "$DUMP" | grep -qF "$(printf '\tUntitled folder\t')"; then
     ok "the listing picks the new folder up on its own"
 else

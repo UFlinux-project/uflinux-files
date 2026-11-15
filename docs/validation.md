@@ -153,7 +153,16 @@ carry the right sensitivity for the start of a history; the grid lists the folde
 entries and counts them; the list mode swaps in a tree table with the four headings; the
 columns mode renders one pane per path level; `Describe` reports `paste` disabled while
 the clipboard is empty and `cancel` disabled while nothing runs, which is the job strip
-keeping its own visibility and the action's sensitivity to agree; the `new-folder` action opens a prompt, its button creates the
+keeping its own visibility and the action's sensitivity to agree; `undo` is disabled
+too, and the undo section then exercises the feature end to end from the shell's side:
+selecting a row and activating `trash` moves it out of the fixture and into the
+freedesktop trash directory under `$XDG_DATA_HOME`, beside a `.trashinfo` sidecar, which
+is what the check reads rather than a `trash:` URI — `GVfs` owns that URI and the
+container has no more of it than a minimal install would, so reading the directory is
+the only assertion that could fail for the right reason; `Describe` then reports `undo`
+enabled, activating it puts the row back and takes the sidecar with it, the banner says
+`Moved back`, and the action is disabled again, because a record is spent by the attempt
+rather than kept in case the first one was not wanted; the `new-folder` action opens a prompt, its button creates the
 folder the prompt suggested, the listing picks it up without being told to, and answering
 the prompt closes it; copying a folder and pasting it where a folder of that name already
 lives opens a prompt that names both sides, and answering it `Skip` leaves the disk alone
@@ -214,6 +223,22 @@ bytes on disk and answering `Skip` leaves them alone, and the window closes eith
 The unit tests cover the answers the harness cannot reach — a standing replace-all, a
 standing rename-all, a cancel that abandons the whole batch, a folder that merges rather
 than fails — because those are decisions about a plan, and a plan does not need a screen.
+
+The undo checks assert on the disk rather than on the tree for the same reason the
+collision checks do. A row that came back from the trash and a row that never left look
+the same in the accessibility tree from the moment the listing has been re-read, so what
+is checked is that `$TARGET/two` is gone, that it is standing in
+`$XDG_DATA_HOME/Trash/files` with its sidecar in `info/`, that it is back afterwards, and
+that the trash holds neither half once it is. The sidecar is checked in both directions
+because the two halves of the specification are enforced by different code: `GIO` writes
+the pair when a row is trashed, and nothing does when a row is moved back out by hand —
+a restore that renamed the entry and left the record behind would pass every other check
+here and leave a trash full of rows that cannot be found. What the harness cannot reach
+is the stash: a replace that displaces a file needs a collision, and a collision needs a
+prompt, and the prompt is already driven by the checks below. The unit tests cover that
+half — a displaced file that goes into the stash and comes back out, a displaced folder
+that is given up on instead, the order the two halves of an inverse run in, and a
+sidecar whose `Path=` line names bytes that are not valid `UTF-8`.
 
 The live-refresh checks double as the cache's end-to-end check, and that is the reason
 they are load-bearing rather than incidental. A listing is now remembered between

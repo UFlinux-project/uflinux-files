@@ -238,7 +238,15 @@ growing after the extension and a leading dot counted as part of the stem, so
 The result arrives as one event on the same queue a directory listing uses, so
 an operation refreshes the folder it changed and reports through the same banner
 a failed read uses. Nothing about an operation blocks the interface, and no
-operation needs a thread of its own beyond the one running it.
+operation needs a thread of its own beyond the one running it. The message and
+the refresh arrive together, which creates one ordering problem worth naming: a
+clean read of a folder hides the banner, and an operation that touched the
+folder on screen causes exactly such a read. So the message is held until after
+the re-read has been set in motion and put back by the event answering it —
+otherwise "Moved 1 item" would be hidden a fraction of a second after it
+appeared, and the user who moved a row would get no answer at all. Navigation
+clears the held message; a read failure replaces it, being the newer fact about
+the folder.
 
 A taken name is a question rather than a decision. The plan records one
 collision per row whose name the destination already has, holding both sides of
@@ -313,12 +321,55 @@ there is no timer, no fade, and no state to expire. Showing the oldest job rathe
 than the newest is a deliberate loss of information: a user watching a queue wants
 to know when the wait ends, and the count of what is behind it is in the label.
 
-What is deliberately not there yet is undo. The record a job keeps is the record
-undo needs — what moved where, and what was displaced — and it is kept while a job
-runs and then reported once, so the step from this to undo is to keep it. What is
-not there is the inverse: a trash operation knows what it trashed, but a move that
-overwrote a file did not keep the bytes it replaced, and an undo that cannot
-restore the displaced file is a redo of the mistake rather than its reversal.
+What is deliberately not there yet is a stack. One operation per window can be
+undone at a time, and the reasons are in [Undoing an operation](#undoing-an-operation)
+below.
+
+## Undoing an operation
+
+`ui/undo.rs` keeps one record per window and offers it back once. The record is
+not a log of what the worker did but a description of the effect, in three
+forms: rows that went to the trash, rows that changed place, and rows that were
+not there before. Those three cover every operation the window offers, and each
+has an inverse that does not need the original to still be around: fetch the
+entry out of the trash, move the row back to the name it had, or take the new
+row away again.
+
+The trash is read rather than asked. `GIO`'s `trash:` backend belongs to `GVfs`,
+which a minimal system has no reason to have installed, so the module reads the
+freedesktop layout directly: one pass over a trash's `info/`, each `.trashinfo`
+sidecar decoded to say where its row came from, the newest sidecar winning when
+two name the same origin. The `Path=` line is percent-decoded into bytes rather
+than into text, which is what lets a row whose name is not valid `UTF-8` still
+come back. A row whose entry cannot be matched is not forgotten: undo names it
+and says it is not in the trash, rather than reporting a row it never found.
+
+A replacement is the interesting case, because the operation destroyed bytes. A
+step that replaces a plain file moves the old file into a stash under the cache
+before the paste lands, and undo moves it out again — which is why the effect is
+applied first and the displaced rows restored after: the pasted row has to vacate
+the name before the row that used to hold it can go back into it. A folder is
+never stashed. Merging writes into the folder rather than over it, so moving it
+aside would lose the rows it already held, and a tree can be as large as the one
+that replaced it. What a merge cost is therefore said out loud in the operation's
+own banner — `replaced box, whose old contents are gone` — and the operation
+reports a partial success rather than a clean one. A copy that merged and nothing
+else leaves nothing to undo, and the button stays insensitive rather than
+offering to delete the copy.
+
+One deep, and spent by the attempt: the record is taken out of the table before
+the work starts, because an undo that failed partway has usually changed part of
+the folder and a second attempt would be working from a description that no
+longer matches the disk. Undoing is not itself undoable — the outcome it reports
+carries no record — and a newer operation replaces the record, sweeping the stash
+the older one was keeping. That last rule is what keeps a long session from
+quietly filling the disk with files nobody asked for back.
+
+Undo runs as a job like the operations it reverses: a row on the strip, a brake,
+and the same cancel button. It never overwrites either. Every restore asks for a
+free name through the same rule the paste planner uses, so an undo that would
+have destroyed something the user put there in the meantime fails on that row and
+says so instead of quietly replacing it.
 
 ## Search
 

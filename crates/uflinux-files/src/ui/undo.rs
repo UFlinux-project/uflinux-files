@@ -153,8 +153,6 @@ pub struct Record {
     /// path it was kept at. Put back after the effect is reversed, so that the
     /// name a move vacated is free for the file that used to hold it.
     pub replaced: Vec<(Location, Location)>,
-    /// Rows that are gone and cannot come back, each already worded for the banner.
-    pub lost: Vec<String>,
     /// The directory the replaced rows were kept in, when anything was.
     pub stash: Option<PathBuf>,
 }
@@ -167,7 +165,6 @@ impl Record {
         Self {
             effect: Effect::Moved(vec![(from.clone(), to.clone())]),
             replaced: Vec::new(),
-            lost: Vec::new(),
             stash: None,
         }
     }
@@ -180,7 +177,6 @@ impl Record {
         Self {
             effect: Effect::Created(vec![path]),
             replaced: Vec::new(),
-            lost: Vec::new(),
             stash: None,
         }
     }
@@ -213,7 +209,6 @@ impl Record {
         let Record {
             effect,
             replaced,
-            lost,
             stash,
         } = self;
         let mut undoing = Undoing::new(whole);
@@ -228,7 +223,7 @@ impl Record {
         if let Some(dir) = &stash {
             let _ = fs::remove_dir_all(dir);
         }
-        outcome.with_skipped(&lost)
+        outcome
     }
 }
 
@@ -254,6 +249,9 @@ impl Undoing {
 
     /// Fold one restored row into the report: the folder it landed in needs a
     /// re-read, the folder it left needs one too, and the strip counts it.
+    /// `landed` is the row, not its folder — every caller has the row to hand,
+    /// and the parent is taken here so that no call site can note a file where a
+    /// folder is meant, which is what [`Outcome::changed`] always holds.
     fn spoke(
         &mut self,
         reporter: &mut Reporter,
@@ -261,7 +259,9 @@ impl Undoing {
         landed: &Location,
         left: Option<Location>,
     ) {
-        self.outcome.note(landed);
+        if let Some(folder) = landed.parent() {
+            self.outcome.note(&folder);
+        }
         if let Some(left) = left {
             self.outcome.note(&left);
         }
@@ -316,12 +316,25 @@ fn back_from_trash(
         };
         let place = ops::accept(&row.home, ops::exists);
         match carry(entry, &place, brake) {
-            Ok(()) => undoing.spoke(
-                reporter,
-                &name,
-                &place,
-                entry.parent().or_else(|| row.home.parent()),
-            ),
+            Ok(()) => {
+                // The specification pairs a sidecar with its row, so a row that
+                // has left the trash takes its record with it. `GIO`'s trash does
+                // this itself; a plain move does not, and a trash left holding
+                // sidecars for rows that are no longer in it would have undo
+                // reporting a row that cannot be found every time it is opened.
+                // A sidecar that cannot be removed is not worth failing over:
+                // the row is back where it belongs, and a stray record costs a
+                // listing entry and nothing else.
+                if let Some(info) = sidecar_path_of(entry) {
+                    let _ = fs::remove_file(info);
+                }
+                undoing.spoke(
+                    reporter,
+                    &name,
+                    &place,
+                    entry.parent().or_else(|| row.home.parent()),
+                );
+            }
             Err(message) => undoing.failed(&name, message),
         }
     }
@@ -367,11 +380,7 @@ fn take_away(
             // The folder that lost the row is the one needing a re-read; the row
             // itself is gone by now, so noting it would ask for a walk of a
             // folder that no longer exists.
-            Ok(()) => {
-                if let Some(where_it_was) = path.parent() {
-                    undoing.spoke(reporter, &name, &where_it_was, None);
-                }
-            }
+            Ok(()) => undoing.spoke(reporter, &name, path, None),
             Err(message) => undoing.failed(&name, message),
         }
     }
@@ -603,4 +612,435 @@ fn sidecar_path(root: &Path, sidecar: &Path) -> Location {
         .map_or_else(String::new, |n| n.to_string_lossy().to_string());
     let bare = name.strip_suffix(SIDECAR).unwrap_or(&name);
     Location::file(root.join("files").join(bare))
+}
+
+/// The sidecar belonging to an entry: the same folder, `info/`, under the
+/// entry's own name plus its suffix — the inverse of [`sidecar_path`], which is
+/// how a row leaving the trash finds the record to take with it. `None` for a
+/// location that is not a path on disk, which no trash entry ever is.
+fn sidecar_path_of(entry: &Location) -> Option<PathBuf> {
+    let path = entry.as_path()?;
+    let root = path.parent()?.parent()?;
+    let mut leaf = OsString::from(path.file_name()?);
+    leaf.push(SIDECAR);
+    Some(root.join("info").join(leaf))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+    use std::time::Duration;
+
+    use super::super::job::Queue;
+
+    /// Tests that change the process environment have to hold this, because
+    /// `set_var` is unsafe in edition 2024 precisely because another thread may
+    /// be reading the environment at the same time.
+    fn env() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: Mutex<()> = Mutex::new(());
+        LOCK.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    #[allow(unsafe_code)]
+    fn set_env(key: &str, value: &str) {
+        // SAFETY: the guard means no other test in this binary is reading the
+        // environment while this happens.
+        unsafe { std::env::set_var(key, value) };
+    }
+
+    #[allow(unsafe_code)]
+    fn unset_env(key: &str) {
+        // SAFETY: as above.
+        unsafe { std::env::remove_var(key) };
+    }
+
+    /// A worker's pen and brake, for a record applied with no window in sight.
+    /// The queue is only there to own the pipe the reports go down.
+    fn worker() -> (Queue, Brake, Reporter) {
+        let queue = Queue::without_source().expect("a pipe can be made");
+        let jobs = Jobs::new();
+        let (id, brake) = jobs.begin(Kind::Undo, "undoing", None, Unit::Rows);
+        let reporter = Reporter::new(&queue.handle(), id);
+        (queue, brake, reporter)
+    }
+
+    /// A sidecar in a trash's `info/`, as the specification lays it out.
+    fn sidecar(trash: &Path, name: &str, body: &[u8]) -> PathBuf {
+        let info = trash.join("info");
+        fs::create_dir_all(&info).expect("a trash has an info folder");
+        let path = info.join(name);
+        fs::write(&path, body).expect("a sidecar can be written");
+        path
+    }
+
+    #[test]
+    fn a_sidecar_names_the_path_it_was_written_for() {
+        assert_eq!(
+            origin(b"[Trash Info]\nPath=/home/user/notes.txt\nDeletionDate=2026-11-15T00:00:00\n"),
+            Some(PathBuf::from("/home/user/notes.txt"))
+        );
+    }
+
+    #[test]
+    fn a_sidecar_path_is_unescaped_byte_by_byte() {
+        // What `GIO` writes for a name holding a space, a percent, a hash and a
+        // tab, and for one holding a non-ASCII letter.
+        assert_eq!(
+            origin(b"Path=/home/u/a%20b%25c%23d%09e/f%C3%A9.txt\n"),
+            Some(PathBuf::from("/home/u/a b%c#d\te/f\u{e9}.txt"))
+        );
+    }
+
+    #[test]
+    fn a_sidecar_path_survives_bytes_that_are_not_text() {
+        // A name the filesystem allows and `UTF-8` does not. Decoding into bytes
+        // rather than into `str` is what lets such a row be found again.
+        assert_eq!(
+            origin(b"Path=/tmp/\xc3\x28\n"),
+            Some(PathBuf::from(OsString::from_vec(b"/tmp/\xc3\x28".to_vec())))
+        );
+    }
+
+    #[test]
+    fn a_sidecar_that_names_no_absolute_path_is_no_use() {
+        assert_eq!(origin(b"Path=notes.txt\n"), None, "relative to nothing");
+        assert_eq!(origin(b"Path=\n"), None, "an empty path");
+        assert_eq!(
+            origin(b"[Trash Info]\nDeletionDate=x\n"),
+            None,
+            "a sidecar with no Path line"
+        );
+    }
+
+    #[test]
+    fn the_entry_sits_beside_its_sidecar_under_the_same_name() {
+        let root = Path::new("/trash");
+        assert_eq!(
+            sidecar_path(root, Path::new("/trash/info/notes.txt.trashinfo")),
+            Location::file("/trash/files/notes.txt"),
+        );
+        // The counter two rows of one name get appears in both places, which is
+        // what lets an entry be named from its sidecar alone.
+        assert_eq!(
+            sidecar_path(root, Path::new("/trash/info/notes (2).txt.trashinfo")),
+            Location::file("/trash/files/notes (2).txt"),
+        );
+    }
+
+    #[test]
+    fn the_users_own_trash_is_read_before_a_mounts_trash() {
+        let _guard = env();
+        let volume = tempfile::tempdir().expect("a filesystem with a trash in it");
+        let named = format!(".Trash-{}", paths::uid());
+        fs::create_dir_all(volume.path().join(&named))
+            .expect("the specification puts a trash at a filesystem root");
+        set_env("UFLINUX_FILES_TRASH_DIR", "/tmp/ufm-undo-trash");
+        let found = roots(&volume.path().join("a").join("b"));
+        unset_env("UFLINUX_FILES_TRASH_DIR");
+        assert_eq!(
+            found.first().map(PathBuf::as_path),
+            Some(Path::new("/tmp/ufm-undo-trash")),
+            "the user's own trash is the first place to look"
+        );
+        assert!(
+            found.contains(&volume.path().join(&named)),
+            "a row trashed onto another filesystem leaves a trash at that root"
+        );
+    }
+
+    #[test]
+    fn an_index_reads_a_trash_in_one_pass_and_keeps_the_newer_entry() {
+        let root = tempfile::tempdir().expect("a trash to read");
+        let trash = root.path();
+        fs::create_dir_all(trash.join("files")).expect("a trash has a files folder");
+        sidecar(trash, "notes.txt.trashinfo", b"Path=/home/u/notes.txt\n");
+        sidecar(
+            trash,
+            "notes (2).txt.trashinfo",
+            b"Path=/home/u/notes.txt\n",
+        );
+        sidecar(trash, "stray.txt", b"Path=/home/u/stray.txt\n");
+        // The second row was thrown away later, so it is the one holding the bytes
+        // that are there now.
+        let later = SystemTime::UNIX_EPOCH + Duration::from_secs(4_000_000_000);
+        let newer = trash.join("info").join("notes (2).txt.trashinfo");
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&newer)
+            .expect("a sidecar can be opened")
+            .set_times(fs::FileTimes::new().set_modified(later))
+            .expect("a sidecar can be dated");
+        let found = index(&[trash.to_path_buf()]);
+        assert_eq!(found.len(), 1, "one origin, one entry, junk ignored");
+        assert_eq!(
+            found.get(Path::new("/home/u/notes.txt")).cloned(),
+            Some(Location::file(trash.join("files").join("notes (2).txt"))),
+            "the newer sidecar wins, because it holds the bytes that are there now"
+        );
+    }
+
+    #[test]
+    fn a_folder_that_is_not_a_trash_indexes_as_empty() {
+        let root = tempfile::tempdir().expect("a folder with no info in it");
+        assert!(index(&[root.path().to_path_buf()]).is_empty());
+    }
+
+    #[test]
+    fn a_moved_row_goes_back_to_the_name_it_had() {
+        let root = tempfile::tempdir().expect("a folder to undo inside");
+        let was = root.path().join("note.txt");
+        let went = root.path().join("renamed.txt");
+        fs::write(&went, b"bytes").expect("a row to put back");
+        let (_queue, brake, mut reporter) = worker();
+        let outcome = Record::moved(&Location::file(&was), &Location::file(&went))
+            .apply(&brake, &mut reporter);
+        assert!(outcome.ok, "{}", outcome.message);
+        assert_eq!(outcome.message, "Moved back 1 item");
+        assert!(was.exists(), "the row is back under the name it had");
+        assert!(!went.exists(), "and gone from the name it was given");
+        assert_eq!(
+            outcome.changed,
+            vec![Location::file(root.path())],
+            "one folder needs a re-read, and it is the one on screen"
+        );
+    }
+
+    #[test]
+    fn a_created_row_is_taken_away_again() {
+        let root = tempfile::tempdir().expect("a folder to undo inside");
+        let made = root.path().join("Untitled folder");
+        fs::create_dir_all(made.join("deep")).expect("a folder with a folder in it");
+        let (_queue, brake, mut reporter) = worker();
+        let outcome = Record::created(Location::file(&made)).apply(&brake, &mut reporter);
+        assert!(outcome.ok, "{}", outcome.message);
+        assert_eq!(outcome.message, "Removed 1 item");
+        assert!(
+            !made.exists(),
+            "a folder undo makes goes with everything inside"
+        );
+        assert!(
+            outcome.changed.contains(&Location::file(root.path())),
+            "the folder that lost the row is the one needing a re-read"
+        );
+    }
+
+    #[test]
+    fn a_trashed_row_comes_back_out_of_the_entry_that_holds_it() {
+        let root = tempfile::tempdir().expect("a folder with a trash beside it");
+        let home = root.path().join("victim.txt");
+        let trash = root.path().join("Trash");
+        fs::create_dir_all(trash.join("files")).expect("a trash has a files folder");
+        let entry = trash.join("files").join("victim.txt");
+        fs::write(&entry, b"bytes").expect("bytes in the trash to fetch");
+        let record = Record {
+            effect: Effect::Trashed(vec![Trashed {
+                home: Location::file(&home),
+                entry: Some(Location::file(&entry)),
+            }]),
+            replaced: Vec::new(),
+            stash: None,
+        };
+        let (_queue, brake, mut reporter) = worker();
+        let outcome = record.apply(&brake, &mut reporter);
+        assert!(outcome.ok, "{}", outcome.message);
+        assert_eq!(outcome.message, "Moved back 1 item from the trash");
+        assert!(home.exists(), "the row is back where it came from");
+        assert!(!entry.exists(), "and no longer sitting in the trash");
+    }
+
+    #[test]
+    fn a_row_leaving_the_trash_takes_its_sidecar_with_it() {
+        let root = tempfile::tempdir().expect("a folder with a trash beside it");
+        let home = root.path().join("victim.txt");
+        let trash = root.path().join("Trash");
+        fs::create_dir_all(trash.join("files")).expect("a trash has a files folder");
+        let entry = trash.join("files").join("victim.txt");
+        fs::write(&entry, b"bytes").expect("bytes in the trash to fetch");
+        let info = sidecar(&trash, "victim.txt.trashinfo", b"Path=/does/not/matter\n");
+        let record = Record {
+            effect: Effect::Trashed(vec![Trashed {
+                home: Location::file(&home),
+                entry: Some(Location::file(&entry)),
+            }]),
+            replaced: Vec::new(),
+            stash: None,
+        };
+        let (_queue, brake, mut reporter) = worker();
+        let outcome = record.apply(&brake, &mut reporter);
+        assert!(outcome.ok, "{}", outcome.message);
+        assert!(!info.exists(), "the record goes with the row it describes");
+    }
+
+    #[test]
+    fn a_trashed_row_that_cannot_be_found_is_named_and_given_up_on() {
+        let record = Record {
+            effect: Effect::Trashed(vec![Trashed {
+                home: Location::file("/tmp/nowhere.txt"),
+                entry: None,
+            }]),
+            replaced: Vec::new(),
+            stash: None,
+        };
+        let (_queue, brake, mut reporter) = worker();
+        let outcome = record.apply(&brake, &mut reporter);
+        assert!(!outcome.ok, "a row that cannot be found is a failure");
+        assert!(
+            outcome.message.contains("not in the trash"),
+            "the banner names the row and says what is wrong: {}",
+            outcome.message
+        );
+        assert!(
+            outcome.changed.is_empty(),
+            "nothing changed, so nothing costs a re-read"
+        );
+    }
+
+    #[test]
+    fn a_replaced_row_goes_back_once_the_row_that_replaced_it_has_left() {
+        let root = tempfile::tempdir().expect("two folders and a stash");
+        let src = root.path().join("src");
+        let dir = root.path().join("dir");
+        let stash = root.path().join("undone");
+        fs::create_dir_all(&src).expect("a source folder");
+        fs::create_dir_all(&dir).expect("a destination folder");
+        fs::create_dir_all(&stash).expect("a stash folder");
+        // A cut of `src/note.txt` into `dir`, answering the collision by
+        // replacing: the pasted row stands where an older one used to, and the
+        // older bytes are in the stash.
+        fs::write(dir.join("note.txt"), b"new").expect("the row that replaced");
+        fs::write(stash.join("note.txt"), b"old").expect("the row that was replaced");
+        let record = Record {
+            effect: Effect::Moved(vec![(
+                Location::file(src.join("note.txt")),
+                Location::file(dir.join("note.txt")),
+            )]),
+            replaced: vec![(
+                Location::file(dir.join("note.txt")),
+                Location::file(stash.join("note.txt")),
+            )],
+            stash: Some(stash.clone()),
+        };
+        let (_queue, brake, mut reporter) = worker();
+        let outcome = record.apply(&brake, &mut reporter);
+        assert!(outcome.ok, "{}", outcome.message);
+        assert_eq!(
+            outcome.message, "Moved back 2 items",
+            "the moved row and the replaced one both count"
+        );
+        assert_eq!(
+            fs::read(src.join("note.txt")).expect("the row is back where it started"),
+            b"new"
+        );
+        assert_eq!(
+            fs::read(dir.join("note.txt")).expect("the older bytes won the name back"),
+            b"old",
+            "the effect is reversed before the displaced row is restored"
+        );
+        assert!(!stash.exists(), "a spent record sweeps what it was keeping");
+    }
+
+    #[test]
+    fn a_displaced_file_is_set_aside_and_can_be_handed_back() {
+        let _guard = env();
+        let root = tempfile::tempdir().expect("a folder to replace inside");
+        let stash = root.path().join("undone");
+        set_env(
+            "UFLINUX_FILES_UNDONE_DIR",
+            stash.to_str().expect("a temp path is text"),
+        );
+        let dir = root.path().join("dir");
+        fs::create_dir_all(&dir).expect("a folder to paste into");
+        fs::write(dir.join("note.txt"), b"old").expect("a row in the way");
+        let mut step = Step::new(
+            Location::file(root.path().join("src").join("note.txt")),
+            Location::file(dir.join("note.txt")),
+        );
+        step.replace = true;
+        let (_queue, brake, _reporter) = worker();
+        let mut store = Stash::default();
+        assert_eq!(
+            store.keep(&step, &brake),
+            Displaced::File,
+            "a plain file was in the way"
+        );
+        assert!(
+            !dir.join("note.txt").exists(),
+            "the name is free for the step that replaces it"
+        );
+        assert!(
+            stash.join("note.txt").exists(),
+            "the old bytes are held until the record is spent"
+        );
+        // The step fails, so the row it moved out of the way comes back.
+        store.return_it(&step.to, &brake);
+        assert!(
+            dir.join("note.txt").exists(),
+            "a step that failed must not leave the folder short"
+        );
+        let (kept, lost, held) = store.into_parts();
+        assert!(kept.is_empty(), "handing a row back spends it");
+        assert!(lost.is_empty(), "nothing was given up on");
+        assert_eq!(held, Some(stash));
+        unset_env("UFLINUX_FILES_UNDONE_DIR");
+    }
+
+    #[test]
+    fn a_displaced_folder_is_given_up_on_rather_than_moved() {
+        let _guard = env();
+        let root = tempfile::tempdir().expect("a folder to merge into");
+        let stash = root.path().join("undone");
+        set_env(
+            "UFLINUX_FILES_UNDONE_DIR",
+            stash.to_str().expect("a temp path is text"),
+        );
+        let dir = root.path().join("dir");
+        fs::create_dir_all(dir.join("box")).expect("a folder in the way");
+        fs::write(dir.join("box").join("keep.txt"), b"keep").expect("a row inside it");
+        let mut step = Step::new(
+            Location::file(root.path().join("src").join("box")),
+            Location::file(dir.join("box")),
+        );
+        step.replace = true;
+        let (_queue, brake, _reporter) = worker();
+        let mut store = Stash::default();
+        assert_eq!(
+            store.keep(&step, &brake),
+            Displaced::Folder,
+            "a folder was in the way"
+        );
+        assert!(
+            dir.join("box").join("keep.txt").exists(),
+            "merging writes into the folder, so it cannot be moved aside"
+        );
+        let (kept, lost, held) = store.into_parts();
+        assert!(kept.is_empty(), "a folder is never kept");
+        assert_eq!(lost.len(), 1, "and its loss has to be said out loud");
+        assert!(
+            lost[0].contains("whose old contents are gone"),
+            "{}",
+            lost[0]
+        );
+        assert!(
+            held.is_none(),
+            "nothing was set aside, so no folder was made"
+        );
+        unset_env("UFLINUX_FILES_UNDONE_DIR");
+    }
+
+    #[test]
+    fn a_step_with_nothing_in_its_way_displaces_nothing() {
+        let root = tempfile::tempdir().expect("an empty folder");
+        let step = Step::new(
+            Location::file(root.path().join("src.txt")),
+            Location::file(root.path().join("note.txt")),
+        );
+        let (_queue, brake, _reporter) = worker();
+        let mut store = Stash::default();
+        assert_eq!(store.keep(&step, &brake), Displaced::Nothing);
+        store.return_it(&step.to, &brake);
+        let (kept, lost, held) = store.into_parts();
+        assert!(kept.is_empty() && lost.is_empty() && held.is_none());
+    }
 }

@@ -965,7 +965,6 @@ pub fn discard(handle: &Handle, jobs: &Jobs, entries: &[Entry], permanent: bool)
             outcome.undo = (!homes.is_empty()).then(|| Record {
                 effect: Effect::Trashed(where_trashed(&homes)),
                 replaced: Vec::new(),
-                lost: Vec::new(),
                 stash: None,
             });
             outcome
@@ -1093,8 +1092,11 @@ fn paste_all(
     let mut failures: Vec<String> = Vec::new();
     let mut stopped = false;
     let mut stash = Stash::default();
-    // Where each row that landed came from and went to, read backwards by undo.
+    // Where each row that landed belongs and stands, for a move; the rows a copy
+    // made, which undo takes away rather than moving. One paste is one transfer,
+    // so only one of these ever fills.
     let mut landed: Vec<(Location, Location)> = Vec::new();
+    let mut made: Vec<Location> = Vec::new();
     for step in steps {
         if brake.pulled() {
             stopped = true;
@@ -1141,10 +1143,13 @@ fn paste_all(
         // it that this paste never wrote belong to whoever put them there.
         let keepable = transfer == Transfer::Move || displaced != Displaced::Folder;
         if keepable {
-            landed.push(match transfer {
-                Transfer::Move => (step.to.clone(), step.from.clone()),
-                Transfer::Copy => (step.from.clone(), step.to.clone()),
-            });
+            match transfer {
+                // The row stands at `to` now and belongs at `from` again.
+                Transfer::Move => landed.push((step.from.clone(), step.to.clone())),
+                // A copy left the source where it was, so there is nothing to
+                // move back — only the copy itself, which undo removes.
+                Transfer::Copy => made.push(step.to.clone()),
+            }
         }
         if let Some(parent) = step.to.parent() {
             outcome.note(&parent);
@@ -1172,13 +1177,24 @@ fn paste_all(
     outcome.ok = failures.is_empty();
     outcome.message = report(&parts, &failures);
     let (replaced, lost, store) = stash.into_parts();
-    outcome.undo = (!landed.is_empty() || !replaced.is_empty()).then_some(Record {
-        effect: Effect::Moved(landed),
+    let effect = match transfer {
+        Transfer::Move => Effect::Moved(landed),
+        Transfer::Copy => Effect::Created(made),
+    };
+    let undoable = !replaced.is_empty()
+        || matches!(&effect, Effect::Moved(pairs) if !pairs.is_empty())
+        || matches!(&effect, Effect::Created(rows) if !rows.is_empty());
+    outcome.undo = undoable.then_some(Record {
+        effect,
         replaced,
-        lost,
         stash: store,
     });
-    outcome.with_skipped(skipped)
+    // What a replacement gave up on belongs to this banner rather than to a later
+    // undo: the operation is the moment the bytes were destroyed, and a record
+    // that never gets spent would take the news with it.
+    let mut notes = skipped.to_vec();
+    notes.extend(lost);
+    outcome.with_skipped(&notes)
 }
 
 /// Work out what renaming `entry` to `name` means, without touching the disk
@@ -1479,6 +1495,7 @@ mod tests {
     use std::sync::mpsc;
 
     use super::super::job::Queue;
+    use super::super::undo::Effect;
     use ufm_core::entry::{EntryFlags, EntryKind};
 
     /// Names a test pretends are already used.
@@ -2162,6 +2179,15 @@ mod tests {
         );
         assert!(root.path().join("dest").join("notes (2).txt").exists());
         assert!(root.path().join("dest").join("todo (2).txt").exists());
+        // A copy leaves the sources alone, so its record names the copies rather
+        // than pairs to move: undo takes the new rows away, it does not move the
+        // old ones back beside themselves.
+        let record = outcome.undo.expect("a paste that wrote rows is undoable");
+        assert!(
+            matches!(&record.effect, Effect::Created(rows) if rows.len() == 2),
+            "{:?}",
+            record.effect
+        );
     }
 
     #[test]
@@ -2188,7 +2214,6 @@ mod tests {
         let queue = Queue::without_source().expect("a pipe can be made");
         paste(&queue.handle(), &Jobs::new(), answered, Transfer::Copy);
         let outcome = operated(&queue);
-        assert!(outcome.ok, "{}", outcome.message);
         let box_path = into.join("box");
         assert_eq!(
             fs::read(box_path.join("notes.txt")).expect("the replaced file"),
@@ -2203,6 +2228,24 @@ mod tests {
         assert_eq!(
             fs::read(box_path.join("deep").join("inner.txt")).expect("the nested file"),
             b"nested"
+        );
+        // The merge wrote what was asked and destroyed a folder's old contents on
+        // the way, which is a partial success: the banner has to say what went,
+        // and the record is empty because nothing can be put back — the folder it
+        // merged into was there before, and its old tree was never kept.
+        assert!(
+            !outcome.ok,
+            "a paste that gave rows up is not a clean success: {}",
+            outcome.message
+        );
+        assert!(
+            outcome.message.contains("replaced box"),
+            "the banner names what was lost: {}",
+            outcome.message
+        );
+        assert!(
+            outcome.undo.is_none(),
+            "a merge with nothing kept has nothing to undo"
         );
     }
 

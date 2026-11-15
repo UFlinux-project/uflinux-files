@@ -121,6 +121,7 @@ pub fn open(app: &gtk::Application, urls: &[String]) {
         readers,
         missed: Cell::new(false),
         reading: Cell::new(false),
+        spoken: RefCell::new(None),
     });
 
     // The presentations that are not the grid/list stack.
@@ -370,6 +371,19 @@ struct Shared {
     /// While one is, a change reported by the watcher is only recorded rather than
     /// acted on, for the reason above. Cleared by the event that answers the read.
     reading: Cell<bool>,
+    /// A message an operation asked the strip to say, waiting out the re-read
+    /// that the operation itself caused.
+    ///
+    /// An operation that touched the folder on screen re-reads it, and a clean
+    /// read normally hides the strip — which would hide the message a fraction of
+    /// a second after it appeared, leaving a user who moved, renamed or threw
+    /// away a row with no answer at all. So the message is kept here and put back
+    /// by the event answering the read. Only an operation's own report is kept:
+    /// a read failure describes a broken folder and must not outlive the next
+    /// clean read of it, while "Moved back 1 item" stays true however often the
+    /// folder is walked. Navigation clears it — a message about the folder being
+    /// left should not follow the window to the next one.
+    spoken: RefCell<Option<String>>,
 }
 
 impl Shared {
@@ -550,6 +564,9 @@ fn navigate(ctx: &Ctx, location: Location, record: bool) {
         // A change noted against the folder being left says nothing about the one
         // arriving, whose listing is being read right now.
         ctx.shared.missed.set(false);
+        // The same for a message about the folder being left: it is about a
+        // listing that is on its way out.
+        *ctx.shared.spoken.borrow_mut() = None;
         // A listing read through a mount counts as using it, so auto-unmount
         // does not cut a share the user is still looking at.
         let used = state
@@ -789,7 +806,13 @@ fn apply(ctx: &Ctx, event: Event) {
             };
             let filtered = filter(&entries, &query);
             ctx.shared.state.borrow_mut().shown = entries;
-            ctx.banner.set_visible(false);
+            // A clean read hides the strip, unless an operation asked for a
+            // message to stay: the read answering that operation would otherwise
+            // eat its own report. See [`Shared::spoken`].
+            match ctx.shared.spoken.borrow().as_deref() {
+                Some(message) => show_banner(ctx, message),
+                None => ctx.banner.set_visible(false),
+            }
             let _ = hints;
             if let Some(panel) = ctx.panel.upgrade() {
                 panel.set_usage(usages(&ctx.shared));
@@ -811,6 +834,9 @@ fn apply(ctx: &Ctx, event: Event) {
                 return;
             }
             settled(ctx);
+            // The failure replaces any operation message: it is the newer fact
+            // about this folder, and a strip holding both would have to choose.
+            *ctx.shared.spoken.borrow_mut() = None;
             show_banner(ctx, &format!("{}: {message}", location.display()));
         }
         Event::Mounted { report } => mounted(ctx, report),
@@ -925,15 +951,12 @@ fn changed(shared: &Rc<Shared>, ctx: &Ctx, paths: &[PathBuf], overflowed: bool) 
 /// deepest, so this is the same pair the reload button runs, and the two never
 /// read one folder twice.
 fn operated(ctx: &Ctx, outcome: ops::Outcome) {
-    // The record goes to the table before the banner is shown, so that the Undo
+    // The record goes to the table before anything else, so that the Undo
     // button is sensitive by the time the message that offers it has been read.
     // An operation that changed nothing carries no record, which is what stops a
     // refused paste from lighting a button that would undo the operation before it.
     if let Some(record) = outcome.undo {
         ctx.jobs.record(record);
-    }
-    if !outcome.message.is_empty() {
-        show_banner(ctx, &outcome.message);
     }
     let current = ctx.shared.state.borrow().current.clone();
     let here = current.as_ref();
@@ -962,6 +985,15 @@ fn operated(ctx: &Ctx, outcome: ops::Outcome) {
     }
     if changed_here && let Some(location) = current {
         navigate(ctx, location, false);
+    }
+    // The message goes up last, after any re-read this operation caused has
+    // been set in motion: `navigate` clears what the strip is holding, and the
+    // read answering that navigation would otherwise hide the report again a
+    // moment later. Kept in `spoken` so that the read repainting the folder
+    // puts the message back rather than eating it. See [`Shared::spoken`].
+    if !outcome.message.is_empty() {
+        *ctx.shared.spoken.borrow_mut() = Some(outcome.message.clone());
+        show_banner(ctx, &outcome.message);
     }
     // Free space moved, and the sidebar shows free space.
     if let Some(panel) = ctx.panel.upgrade() {

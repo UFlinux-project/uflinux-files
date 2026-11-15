@@ -36,6 +36,13 @@ the model over D-Bus and never opens a window.
   name the folder already has asks rather than guessing, showing both rows and
   offering replace, rename or skip for the whole batch; replacing a folder merges
   into the one already there.
+- **One undo, and an honest one**: `<Ctrl>Z` puts the last operation back — a row
+  out of the trash and back where it came from, a rename back to the name it had, a
+  new folder taken away again. The trash is read from the freedesktop layout rather
+  than through `GVfs`, so it works on a minimal install; a file a paste replaced is
+  kept in a stash until the window forgets it, and a folder a paste merged into is
+  named in the banner rather than quietly lost. One operation deep rather than a
+  stack, because a record that no longer matches the disk is worse than none.
 - **Desktop icons**: this program owns the model — what is on the desktop, where
   each icon sits, what happens when one is double-clicked — and
   `uflinux-desktop` draws it, so there is no second full-screen GTK process.
