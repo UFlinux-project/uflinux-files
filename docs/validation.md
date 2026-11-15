@@ -44,6 +44,7 @@ rows a bookmark offers are exactly Rename, Move Up, Move Down and Remove, each
 aimed at that bookmark's own URI rather than at a position, and a row for a place
 that cannot answer for itself — Home, Trash, a plain folder — is offered
 no rows at all, which opens no popover. |
+| `uflinux-files` (two windows) | the tests register two windows' state against one temporary config directory, so the file both windows share is the thing under test rather than a fixture's environment: a star put on in one window survives a star put on in the other, which is the check the whole-file save fails; a star taken away stays away rather than arriving back from a window that never saw its removal, which is the check a merge of the two copies fails; two windows adding a bookmark each keep theirs, and a bookmark one window removed is not put back by another writing; an edit with nothing to change writes no file at all, so a command that acted on a row that has gone cannot rewrite what the other window just saved; and a preference written by one window keeps a preference another wrote a moment earlier, which is the read-modify-write half without the broadcast. |
 | `uflinux-files` (mount rows) | the rows a share's row offers follow the state the row was built from and nothing else: a connected share gets Disconnect, a share whose kernel entry died gets Disconnect and Forget, a share that is listed without being mounted gets Reconnect and Forget; Reconnect is left off a share that would have to be asked for a password, and a `Stale` share is never offered it because mounting over a dead endpoint cannot work; every state also carries the login row, whose label is the opposite of the flag the record holds and which is a different row than the same share unmarked; every row carries the record's id rather than a position, so a menu left open across a rebuild cannot act on a different share. |
 | `uflinux-files` (job table) | a report never reaches the strip more than once per throttle window, and the first one always does; a job with no total shows a bar with no fraction rather than a fake one; a tally reads `512 KiB of 1.0 MiB` for bytes and `4 of 9` for rows; finishing the only job empties the table and says so exactly once; pulling the brakes reaches every job on the table, including a second one registered after the first; a report naming a job that already finished is dropped rather than resurrected; the strip's text is read back from the widgets rather than from a parallel copy of it, so it cannot disagree with what is drawn. |
 | `uflinux-files` (My Computer) | Home and the system drive are always cards and a desktop folder becomes one only when it exists; a connected share says `Connected`, carries its protocol's icon and renders its capacity as `256 KiB free of 1.0 MiB`; a share the kernel has lost is still listed but says `Disconnected`, shows its mount point where the capacity would go and cannot be opened; a filesystem that reports no size gets no bar; a share's label beats the last component of its URI; activating a card reaches the open hook exactly once with the card's own id, and a Disconnect button reaches the unmount hook with the record id rather than the label. |
@@ -204,11 +205,36 @@ in it says so in a banner rather than showing an empty pane; `bookmark` writes t
 folder the window is standing on into
 `$XDG_CONFIG_HOME/uflinux/filemanager/bookmarks.json`, gives the sidebar a row named for
 that folder, and leaves the sidebar saying `Folders` exactly once, the same action on the
-same folder takes the bookmark out of the file and the row out of the sidebar; a
-second invocation opens a `Computer` window in the running instance; `--new-window` opens
+same folder takes the bookmark out of the file and the row out of the sidebar; a second
+window in the same instance, opened on a folder the first is not looking at, adds a star
+of its own without losing the one the first window wrote and removes it again without the
+first window's copy putting it back; a window answers `close` over the bus and disappears;
+a second invocation opens a `Computer` window in the running instance; `--new-window` opens
 a window rather than focusing an open one; and the indexer answers `Status` on the bus.
 The prompt is driven through the accessibility tree, by the `probe`'s `press` command,
 which activates a node by name — the same controller path a mouse click takes.
+
+The cross-window pair is the reason the second window is opened on the archive's folder
+rather than on the folder already on screen: it holds a row, `bundle.tar`, that no other
+window on the desktop has, so the probe's `select` — which finds a node by name across
+every window — still names one node rather than a coin toss, and the star being added and
+taken away is one the first window has never seen. That is the whole of the fixture. Each
+window used to hold the copy of the list it loaded when it opened and save that copy whole,
+which makes the last window to write the authority over the file: the checks are written so
+that the naive version fails the first of them, by finding only `bundle.tar` in a file the
+other window had already put a row into, and fails the second one the other way round, by
+resurrecting `bundle.tar` from a merge of two copies when the point of the command was to
+remove it. The window is then closed over the bus rather than left open, because what
+follows counts the rows a collection window holds and an extra frame in a tree that finds
+frames by name is an extra chance to be read by the wrong check.
+
+Closing it is a check in its own right, and was a hole in the program before it was a test.
+`GTK` exports a window's actions on the bus and its own built-ins are not among them —
+`window.close` is installed on the widget class, not added to the window's group — so a
+window another process can be told about was a window it could not dismiss, and the
+archive section's own attempt to close its window had been silently doing nothing since it
+was written. Finding that out required a check that fails, which is why the close is
+asserted rather than assumed.
 
 The star checks are the reason the harness names `$XDG_CONFIG_HOME` in its fixture: the
 path of the star file is then a fact of the fixture rather than a guess about the user
@@ -221,7 +247,8 @@ question being asked, namely whether a list read from disk becomes rows. That se
 process is also why the collection is closed before the un-star is checked. A process
 started with `--new-window` never owns the bus name, so its actions cannot be activated
 from the shell at all, and the probe's `select` finds a node by name across every window
-— with two windows holding `note.txt` that is a coin toss. What the harness cannot see is
+— with two windows holding `note.txt` that is a coin toss, which is why the window opened
+for the cross-window checks is opened somewhere else. What the harness cannot see is
 the menu's label: a menu row exposes its accelerator to an AT client and not its text, so
 the flip from `Star` to `Unstar` is covered only by the popup module's own tests, and the
 harness asserts the chord is present instead. The chord set the menu check compares is

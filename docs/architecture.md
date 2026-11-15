@@ -350,7 +350,28 @@ card and the row it was given until something makes it rebuild, which is how an 
 already behaved and is unchanged here; the harness leaves the Computer window open across
 a Forget on purpose, so the boundary is at least written down somewhere a person can read
 it. Closing it from the harness would have asserted the current behaviour without making
-it better, and cross-window invalidation is a separate decision with a bus in its way.
+it better.
+
+That boundary is drawn per kind of state rather than across the window, because the kinds
+do not fail the same way. The two collections the user builds a row at a time — stars and
+bookmarks — are broadcast: a command that changes one of them applies the change to what
+the file says at that moment and then hands the file's contents to every open window, so
+no window goes on drawing a row the user just removed somewhere else. A mount row is not
+like those two. What a share's row reports is a fact about the kernel that the window never
+had in the first place, and a stale answer there is a row that says `Mounted` about a
+server that stopped answering — which is a state the view already knows how to render, and
+one the next repaint of that window corrects. Preferences are the third case, and are
+read-modified-written without a broadcast; see *Where state lives*.
+
+The reason all three are read-modified-written at all is the same, and it is a bug story.
+Each window used to hold the copy it loaded when it opened and save that copy whole on
+every change, which makes the last window to write the authority over the whole file: star
+a row in one window, star a different row in another, and the first star is gone with no
+error anywhere to say so. Reading before writing makes the losing window lose the one row
+it was writing rather than every row the other window had already saved. The alternative —
+merging the two windows' copies — was rejected because a merge cannot tell a row the other
+window added from a row the other window removed, and resurrecting the second is the same
+loss wearing a different name.
 
 ## Stars
 
@@ -359,8 +380,11 @@ the fact lives in `starred.json` and the flag on an `Entry` is a rendering of it
 set on the way into the widget tree. `ufm_core::starred` owns the file — load,
 save, `star`/`unstar`/`toggle`, and the two sweeps that keep the list honest when
 rows are deleted (`forget`) or a folder is removed underneath them (`prune`) — and
-knows nothing about GTK. The window holds one `Starred`, loaded once at startup,
-so a listing is stamped against memory rather than against a file read per folder.
+knows nothing about GTK. The window holds one `Starred`, loaded when it opens, so a
+listing is stamped against memory rather than against a file read per folder. That copy is
+kept current rather than trusted: a change goes through `edit_stars`, which re-reads the
+file, applies the change to it, writes it back, and puts the result into every open
+window's copy.
 
 Stamping is the reason the flag is a bit and not a lookup in the row: a factory
 that asked the store per row would run a linear scan per row per repaint, and
@@ -421,8 +445,11 @@ body said it should. `ufm_core::config::Bookmarks` owns the file — load, save,
 GTK. `add` dedupes by location and appends, so the order in the file is the order the
 user asked for and re-bookmarking a folder cannot produce the same row twice.
 
-The window holds one `Bookmarks`, loaded once, for the same reason as the stars: the
-sidebar is built from memory rather than from a file read per navigation. The store is
+The window holds one `Bookmarks`, loaded when it opens, for the same reason as the stars:
+the sidebar is built from memory rather than from a file read per navigation. It is kept
+current the same way, by `edit_bookmarks`, and the repaint it triggers is a sidebar rebuild
+rather than a restamp — a row appearing, going, or moving is the whole of what a window
+that was not asked has to notice. The store is
 in the window rather than in the panel because a bookmark is drawn *and* written, and
 the panel that draws it has no opinion about where the list came from — `set_places`
 takes a `Vec<Place>` in the order it was handed and draws a heading wherever the group
@@ -893,6 +920,28 @@ focus back on whatever listing is on screen before opening, when the window hold
 none — the state a real user is always in, and the reason the fix belongs to the
 action rather than to the popover.
 
+## Windows on the bus
+
+`GTK` exports each `ApplicationWindow` on the session bus, at
+`/org/uflinux/FileManager/window/N`, with an `org.gtk.Actions` interface — which is what
+makes the whole UI drivable from another process, and what the `UI` harness drives. The
+set of actions a window answers to there is exactly the set added to its `win` group, and
+that is worth knowing when writing a test or another program that talks to a window:
+`GTK`'s own built-ins are installed on the widget class rather than added to the group, so
+`window.close`, `window.minimize` and `window.toggle-maximized` are *not* reachable over
+the bus, however reachable the window is. The program therefore registers a `close` action
+of its own, bound to `<Ctrl>W`, which asks the window to close rather than destroying it —
+so the handler that drops it from `OPEN` runs either way, and a handler that refused the
+close would be respected rather than bypassed by the bus.
+
+There is deliberately no `<Ctrl>Q`. The program has no quit command: the session's file
+management ends when its last window does, and a chord that looked like it would close
+every window would be a claim about unsaved work that nothing here keeps.
+
+Window numbers are `GTK`'s business and are not reused, so a client that opens a window
+cannot predict its path and has to probe for one. A closed window stops answering
+`Describe`, which is what makes a probe conclusive rather than a guess.
+
 ## Concurrency
 
 No tokio. A GLib main context plus a bounded worker pool, the same shape
@@ -938,3 +987,11 @@ All writes are atomic: a temporary file in the same directory, `fsync`, rename.
 A crash leaves the previous file intact rather than a truncated one, which
 matters most for the mount table, where a half-written file would mean a share
 the user cannot unmount from the UI.
+
+Three of these files are read by every open window and written by whichever one changes
+something: the star list, the bookmarks, and the preferences. None of them is owned by the
+window that happens to be focused, so none of them is written from a copy a window loaded
+when it opened — each change re-reads the file first, and the two collections then hand
+what the file says back to every window open. The reason is in *What a mount row offers*;
+the mechanism is the `Store` trait in `ui/window.rs`, whose only job is to make the
+forget-about-the-read shape hard to write by accident.

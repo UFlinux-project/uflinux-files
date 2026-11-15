@@ -327,6 +327,16 @@ describe_on() {
     gdbus call --session --dest org.uflinux.FileManager --object-path "$1" \
         --method org.gtk.Actions.Describe "$2" 2>/dev/null || true
 }
+# Whether a path is a window that is still there, rather than one that has been
+# closed. GTK exports one object path per window and does not reuse a number, so a
+# test that opens a window of its own has to find out which one it got. `Describe`
+# answers for a live window and fails for a closed one, which is what makes a path
+# safe to act on later: an action activated on a window that is gone is answered
+# with a D-Bus error that `act_on` swallows, and the test would go on asserting
+# about a change that was never made.
+alive() {
+    [ -n "$(describe_on "$1" star)" ]
+}
 if describe paste | grep -qF '(false'; then
     ok "Paste is disabled while the clipboard is empty"
 else
@@ -1116,6 +1126,38 @@ fi
 #
 # The row starred is the plain file the Open With checks created, which is also
 # the only row the search filter left on screen.
+#
+# A second window in this same instance, opened on the archive's folder before
+# anything is starred. Its copy of the star list is therefore the empty one, which
+# is the state the two checks below are about: a window holding a copy from before
+# another window wrote has to apply its change to what the file says now, rather
+# than saving its own copy over the top of it. The archive's folder is the place to
+# open, because it holds a row the first window does not have.
+"$BIN" "file://$PACK" >/dev/null 2>&1 || :
+# Which path the new window answers to is GTK's business rather than the test's, so
+# the paths are probed rather than assumed. The archive window from the extract
+# check was `window/2` and is closed by now; taking the highest path that still
+# answers is what finds the new window rather than a number that happens to be
+# free.
+SECOND=
+i=0
+while [ "$i" -lt 50 ] && [ -z "$SECOND" ]; do
+    probe=11
+    while [ "$probe" -gt 1 ]; do
+        if alive "/org/uflinux/FileManager/window/$probe"; then
+            SECOND=/org/uflinux/FileManager/window/$probe
+            break
+        fi
+        probe=$((probe - 1))
+    done
+    i=$((i + 1))
+    sleep 0.2
+done
+if [ -n "$SECOND" ]; then
+    ok "a second invocation opens a window the bus can reach"
+else
+    fail "a second invocation opens a window the bus can reach"
+fi
 python3 "$A11Y" select note.txt >/dev/null 2>&1 || :
 act star "[]" "[]"
 STAR_FILE=$XDG_CONFIG_HOME/uflinux/filemanager/starred.json
@@ -1128,6 +1170,49 @@ if [ -f "$STAR_FILE" ] && grep -qF "$TARGET/note.txt" "$STAR_FILE"; then
     ok "starring a row writes it to the star list"
 else
     fail "starring a row writes it to the star list (no '$TARGET/note.txt' in $STAR_FILE)"
+fi
+# The star put on by the window whose copy of the list predates it. Saving that
+# copy whole — which is what this code used to do — leaves the file holding
+# `bundle.tar` and nothing else, so the row the first window starred is gone: a
+# silent loss, one window over, of something the user made a moment ago.
+if ! python3 "$A11Y" select bundle.tar >/dev/null 2>&1; then
+    fail "the second window's own row can be selected"
+else
+    act_on "$SECOND" star "[]" "[]"
+    i=0
+    while [ "$i" -lt 50 ] && ! grep -qF "$PACK/bundle.tar" "$STAR_FILE"; do
+        i=$((i + 1))
+        sleep 0.2
+    done
+    if grep -qF "$TARGET/note.txt" "$STAR_FILE" &&
+        grep -qF "$PACK/bundle.tar" "$STAR_FILE"; then
+        ok "a star put on in a second window keeps the one the first window wrote"
+    else
+        fail "a star put on in a second window keeps the one the first window wrote"
+    fi
+    # The same command again, which is the half a merge of the two windows' copies
+    # would get wrong: a merge puts this star back, because the window that never
+    # saw its removal still has it. Applying the change to the file is what lets
+    # taking a star off stick.
+    act_on "$SECOND" star "[]" "[]"
+    i=0
+    while [ "$i" -lt 50 ] && grep -qF "$PACK/bundle.tar" "$STAR_FILE"; do
+        i=$((i + 1))
+        sleep 0.2
+    done
+    if grep -qF "$TARGET/note.txt" "$STAR_FILE" &&
+        ! grep -qF "$PACK/bundle.tar" "$STAR_FILE"; then
+        ok "taking a star off in one window leaves the other window's star alone"
+    else
+        fail "taking a star off in one window leaves the other window's star alone"
+    fi
+fi
+# The second window goes here rather than being left open: what follows counts the
+# rows a collection window holds, and a window still holding a listing of its own
+# is one more frame in a tree that finds frames by name.
+act_on "$SECOND" close "[]" "[]"
+if ! wait_no_frame "$PACK"; then
+    fail "the second window would not close ($SECOND)"
 fi
 # The collection, in a process of its own rather than in this one. A window in the
 # primary instance would hold the copy of the list that instance loaded, which is

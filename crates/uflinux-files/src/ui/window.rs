@@ -62,9 +62,152 @@ use super::watch::Live;
 use crate::runner::{Layout, Report, Runner};
 
 // The windows this process has open. A window leaves the list when it is
-// closed, which is what frees its widgets and the listing they hold.
+// closed, which is what frees its widgets and the listing they hold. The list is
+// also how a change to a file two windows share reaches both of them: see
+// [`living`].
 thread_local! {
     static OPEN: RefCell<Vec<Window>> = const { RefCell::new(Vec::new()) };
+}
+
+/// The state of every window this process has open.
+///
+/// Cloned out rather than visited in place: the callers repaint widgets, and a
+/// repaint can end with a window closing, which would want to take that window
+/// out of the list while it is still being held.
+fn living() -> Vec<Ctx> {
+    OPEN.with(|open| {
+        open.borrow()
+            .iter()
+            .map(|window| window.ctx.clone())
+            .collect()
+    })
+}
+
+/// A small JSON file that every open window reads and any of them may write.
+///
+/// The trait exists to make one rule impossible to forget: a change to one of
+/// these files is applied to what the file says *now*, never to the copy a window
+/// loaded when it opened. Writing the copy back whole is what falls out of holding
+/// a list in memory and saving it on every change, and it is what loses a row —
+/// the window that saves last overwrites whatever the other one saved first,
+/// including the row the user was looking at in the first window.
+///
+/// Implemented here rather than in `ufm_core` because the reason is two windows on
+/// one screen and not the file format. The crate's own `load`/`save` stay what
+/// they always were: the plain read and write of one copy.
+trait Store: Sized {
+    /// The file's contents right now. A file that cannot be read — absent, or
+    /// truncated by a crash mid-write — reads as empty, which is what a window
+    /// opening on one has always done.
+    fn read() -> Self;
+    fn write(&self);
+}
+
+impl Store for Starred {
+    fn read() -> Self {
+        Self::load(&Self::path()).unwrap_or_default()
+    }
+
+    fn write(&self) {
+        let _ = self.save(&Self::path());
+    }
+}
+
+impl Store for Bookmarks {
+    fn read() -> Self {
+        Self::load(&Self::path()).unwrap_or_default()
+    }
+
+    fn write(&self) {
+        let _ = self.save(&Self::path());
+    }
+}
+
+impl Store for Preferences {
+    fn read() -> Self {
+        Self::load(&Self::path()).unwrap_or_default()
+    }
+
+    fn write(&self) {
+        let _ = self.save(&Self::path());
+    }
+}
+
+/// Change the star list, write it, and bring every open window to the file.
+///
+/// `edit` runs against the file's own contents and answers `None` when there was
+/// nothing to change, which leaves the file alone — the answer a command needs
+/// when the row it was asked about has already gone away.
+///
+/// The read happens inside this call, so an edit lands on top of whatever another
+/// window, another program, or an earlier run wrote, rather than on top of this
+/// window's copy. What that cannot fix is two windows editing the file inside the
+/// moment between this read and the rename that closes the write; at these sizes
+/// the moment is microseconds, and the loser of that race loses the one row it was
+/// writing rather than every row the winner did not touch.
+///
+/// Every window in [`OPEN`] is then told, including the one whose command got
+/// here. A badge is not something the filesystem stores, so a window that is not
+/// told goes on drawing the star the user just took off somewhere else — and
+/// re-reading the folder would not settle it either, for the same reason.
+///
+/// The window that asked is passed in as `shared` rather than looked for in that
+/// list, so that its own copy is brought current whatever point in its life the
+/// call is made at. The list is for the *other* windows, and every caller here is
+/// an action handler or a worker's answer, which has a window on screen to reach.
+fn edit_stars<R>(shared: &Rc<Shared>, edit: impl FnOnce(&mut Starred) -> Option<R>) -> Option<R> {
+    let mut current = Starred::read();
+    let answer = edit(&mut current)?;
+    current.write();
+    *shared.starred.borrow_mut() = current.clone();
+    for other in living() {
+        *other.shared.starred.borrow_mut() = current.clone();
+        refresh_badges(&other);
+    }
+    Some(answer)
+}
+
+/// Change the bookmark list, write it, and bring every open window to the file.
+///
+/// [`edit_stars`] in every respect but the repaint: the sidebar is a rendering of
+/// this list, so what a window that was not asked has to notice is a row
+/// appearing, going, or moving. `shared` is the asking window's, for the reason
+/// given there.
+fn edit_bookmarks<R>(
+    shared: &Rc<Shared>,
+    edit: impl FnOnce(&mut Bookmarks) -> Option<R>,
+) -> Option<R> {
+    let mut current = Bookmarks::read();
+    let answer = edit(&mut current)?;
+    current.write();
+    *shared.bookmarks.borrow_mut() = current.clone();
+    for other in living() {
+        *other.shared.bookmarks.borrow_mut() = current.clone();
+        repaint_places(&other);
+    }
+    Some(answer)
+}
+
+/// Change one preference, writing it onto the file's own contents.
+///
+/// The same read-modify-write [`edit_stars`] does, minus the broadcast, because the
+/// two are not the same problem. The star list and the bookmark list are
+/// collections the user built a row at a time, and losing one of those rows is
+/// losing something the user made. What is in here is a window's answer about how
+/// to draw — a mode for one folder, a switch — and re-applying a switch to a window
+/// that did not ask for it means re-reading its folder and re-binding its rows on
+/// account of a change made somewhere else. So a second window can keep a checkmark
+/// the file no longer agrees with until it is reopened. The file is right, which is
+/// what the next window reads.
+///
+/// Takes the window's own state rather than a [`Ctx`] because the only thing to
+/// update here is that window's copy — which is also what makes this testable with
+/// no display and no window registered.
+fn edit_prefs(shared: &Shared, edit: impl FnOnce(&mut Preferences)) {
+    let mut current = Preferences::read();
+    edit(&mut current);
+    current.write();
+    *shared.prefs.borrow_mut() = current;
 }
 
 /// How often to look for a mount that has gone idle. The threshold itself belongs
@@ -72,17 +215,21 @@ thread_local! {
 /// how long a share is allowed to sit unused.
 const SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 
-/// The window's state, with the two lists a window keeps on disk read once.
+/// The window's state, with the two lists it shares with every other window read
+/// once and kept in memory.
 ///
-/// Both are read here rather than per listing: each is small, each changes only
-/// through the window that holds it, and every change writes the file back. A
-/// window opened later picks up what an earlier one saved, because this runs per
-/// window and the file is the only thing between them.
+/// Both are read here rather than per listing: each is small, and every listing is
+/// stamped against them, which is what keeps a badge off a disk read. Neither is
+/// the file: [`edit_stars`] and [`edit_bookmarks`] apply a change to the file's own
+/// contents rather than to this copy, and both then put the file's contents back
+/// into this copy, for every window open. A window opened later picks up what an
+/// earlier one saved because this runs per window; two windows that are both open
+/// agree because of those two functions, not because of this one.
 fn shared_state(prefs: Preferences, readers: Arc<Readers>, start: &Location) -> Rc<Shared> {
     Rc::new(Shared {
         prefs: RefCell::new(prefs),
-        starred: RefCell::new(Starred::load(&Starred::path()).unwrap_or_default()),
-        bookmarks: RefCell::new(Bookmarks::load(&Bookmarks::path()).unwrap_or_default()),
+        starred: RefCell::new(Starred::read()),
+        bookmarks: RefCell::new(Bookmarks::read()),
         state: RefCell::new(State::new(start)),
         readers,
         missed: Cell::new(false),
@@ -96,7 +243,7 @@ fn shared_state(prefs: Preferences, readers: Arc<Readers>, start: &Location) -> 
 /// Preferences are read here rather than passed in: a second window opened from
 /// the first should start in the mode the first one just saved.
 pub fn open(app: &gtk::Application, urls: &[String]) {
-    let prefs = Preferences::load(&Preferences::path()).unwrap_or_default();
+    let prefs = Preferences::read();
     let readers = Arc::new(Readers::with_archive(Box::new(
         ufm_archive::ArchiveReader::new(),
     )));
@@ -200,7 +347,7 @@ pub fn open(app: &gtk::Application, urls: &[String]) {
 
     wire_actions(app, &window, &ctx);
     wire_jobs(&ctx);
-    wire_close(&window, &shared);
+    wire_close(&window);
 
     app.add_window(&window);
     window.present();
@@ -209,6 +356,7 @@ pub fn open(app: &gtk::Application, urls: &[String]) {
     OPEN.with(|open| {
         open.borrow_mut().push(Window {
             top: window,
+            ctx,
             _panel: panel,
             _view: view,
             _columns: columns,
@@ -248,17 +396,18 @@ fn mode_stack(
     modes
 }
 
-/// Save preferences and drop the window from the list that keeps its widgets
-/// alive. The handler holds a weak reference and a cloned `Rc` rather than the
-/// window itself: it is owned by the window, and a strong reference back would be
-/// the cycle this file's second ownership rule is about.
-fn wire_close(window: &gtk::ApplicationWindow, shared: &Rc<Shared>) {
-    let shared = Rc::clone(shared);
+/// Drop the window from the list that keeps its widgets alive.
+///
+/// Nothing is saved here. Every preference this window can change is written by the
+/// command that changes it, onto the file's own contents (see [`edit_prefs`]), and
+/// writing this window's whole copy of the set on the way out is the same mistake
+/// the star list had, in a file with less in it: it loses a folder's mode rather
+/// than a bookmark. The handler holds a weak reference rather than the window
+/// itself: it is owned by the window, and a strong reference back would be the
+/// cycle this file's second ownership rule is about.
+fn wire_close(window: &gtk::ApplicationWindow) {
     let weak = window.downgrade();
     window.connect_close_request(move |_window| {
-        // Saving before the widgets go away keeps a crash after closing from
-        // losing the mode the user last chose.
-        save(&shared);
         if let Some(window) = weak.upgrade() {
             OPEN.with(|open| {
                 let mut open = open.borrow_mut();
@@ -560,6 +709,12 @@ struct Window {
     /// Called `top` rather than `window`: a field named after its own struct
     /// reads as a typo, and clippy says so too.
     top: gtk::ApplicationWindow,
+    /// Enough to repaint this window from the outside, which is what a change made
+    /// in another window needs. Held rather than reached through `_shared` because
+    /// the helpers that repaint take a [`Ctx`]: they enable buttons on the window
+    /// and rebuild the sidebar, and neither is something `Shared` knows about.
+    /// Cheap to keep — the widgets inside it are weak or `Rc`.
+    ctx: Ctx,
     _panel: Rc<Panel>,
     _view: Rc<View>,
     _columns: Rc<Columns>,
@@ -1140,18 +1295,16 @@ fn operated(ctx: &Ctx, outcome: ops::Outcome) {
     // that happens to take the name, so the rows an operation destroyed are
     // dropped here. Trashed rows are not: Undo can bring them back, and with
     // them the star.
+    //
+    // Through `edit_stars` rather than this window's own copy: an operation that
+    // deleted six names has no business rewriting a star another window put down a
+    // second ago, and the broadcast is what takes the badges off in every window
+    // rather than only in the one that ran the delete.
     if !outcome.removed.is_empty() {
-        let forgotten = {
-            let mut starred = ctx.shared.starred.borrow_mut();
-            let forgotten = starred.forget(&outcome.removed);
-            if forgotten > 0 {
-                let _ = starred.save(&Starred::path());
-            }
-            forgotten
-        };
-        if forgotten > 0 {
-            refresh_badges(ctx);
-        }
+        let removed = &outcome.removed;
+        let _ = edit_stars(&ctx.shared, |starred| {
+            (starred.forget(removed) > 0).then_some(())
+        });
     }
     let current = ctx.shared.state.borrow().current.clone();
     let here = current.as_ref();
@@ -1399,8 +1552,7 @@ fn resort(ctx: &Ctx, key: SortKey) {
     ctx.columns.resort(key);
     let current = ctx.shared.state.borrow().current.clone();
     if let Some(location) = current {
-        ctx.shared.prefs.borrow_mut().set_sort_for(&location, key);
-        save(&ctx.shared);
+        edit_prefs(&ctx.shared, |prefs| prefs.set_sort_for(&location, key));
     }
 }
 
@@ -1552,11 +1704,6 @@ fn place_for(bookmarks: &[Bookmark], mounts: &[Place], location: &Location) -> O
     Place::standard()
         .into_iter()
         .find(|place| place.location() == *location)
-}
-
-fn save(shared: &Rc<Shared>) {
-    let prefs = shared.prefs.borrow();
-    let _ = prefs.save(&Preferences::path());
 }
 
 fn show_banner(ctx: &Ctx, message: &str) {
@@ -2164,11 +2311,34 @@ fn nav_actions(ctx: &Ctx) -> Vec<Rc<gio::SimpleAction>> {
         }
     });
 
+    // Close. GTK has one already, `window.close`, installed on the widget class
+    // and wired to the title bar's button, and it does the same thing this does.
+    // It is not enough: the set of actions a window exports over D-Bus is the set
+    // added to its `win` group, and GTK's built-ins are not in that group, so a
+    // window this program can be told about over the bus cannot be told to go away
+    // over the bus. That is a hole in the interface rather than in the test that
+    // found it — an automation client, or another program on the session, is
+    // offered a window it cannot close.
+    //
+    // `close` rather than a request: this asks the window to close, which runs the
+    // close handler that drops it from `OPEN`, and a handler that came back
+    // `Propagation::Stop` would leave the window on screen with no way to say so.
+    let close = gio::SimpleAction::new("close", None);
+    close.connect_activate({
+        let window = ctx.window.clone();
+        move |_action, _parameter| {
+            if let Some(window) = window.upgrade() {
+                window.close();
+            }
+        }
+    });
+
     vec![
         Rc::new(back),
         Rc::new(forward),
         Rc::new(up),
         Rc::new(refresh),
+        Rc::new(close),
     ]
 }
 
@@ -2187,7 +2357,7 @@ fn view_actions(app: &gtk::Application, ctx: &Ctx) -> Vec<Rc<gio::SimpleAction>>
         let ctx = ctx.clone();
         move |action, value| {
             let show = value.and_then(glib::Variant::get::<bool>).unwrap_or(false);
-            ctx.shared.prefs.borrow_mut().show_hidden = show;
+            edit_prefs(&ctx.shared, |prefs| prefs.show_hidden = show);
             action.set_state(&show.to_variant());
             // Cached panes were read under the other rule.
             ctx.columns.set_show_hidden(show);
@@ -2215,7 +2385,7 @@ fn view_actions(app: &gtk::Application, ctx: &Ctx) -> Vec<Rc<gio::SimpleAction>>
         let ctx = ctx.clone();
         move |action, value| {
             let on = value.and_then(glib::Variant::get::<bool>).unwrap_or(false);
-            ctx.shared.prefs.borrow_mut().thumbnails = on;
+            edit_prefs(&ctx.shared, |prefs| prefs.thumbnails = on);
             action.set_state(&on.to_variant());
             ctx.thumbs.set_enabled(on);
             if let Some(view) = ctx.view.upgrade() {
@@ -2318,11 +2488,9 @@ fn mode_action(ctx: &Ctx) -> Rc<gio::SimpleAction> {
             action.set_state(&name.to_variant());
             let current = ctx.shared.state.borrow().current.clone();
             if let Some(location) = current {
-                ctx.shared
-                    .prefs
-                    .borrow_mut()
-                    .set_view_mode_for(&location, mode);
-                save(&ctx.shared);
+                edit_prefs(&ctx.shared, |prefs| {
+                    prefs.set_view_mode_for(&location, mode);
+                });
             }
         }
     });
@@ -2472,8 +2640,10 @@ fn op_actions(ctx: &Ctx) -> Vec<Rc<gio::SimpleAction>> {
 /// destroys a star the user put somewhere else. The label the menu shows comes
 /// from [`popup::Scope::starred`], which says whether every row is starred.
 ///
-/// Nothing is read from disk here. The store is in memory, the listings are
-/// re-stamped rather than re-read, and the only cost is writing one small file.
+/// The listings are re-stamped rather than re-read — a star is not something the
+/// filesystem stores — and the file is read once, inside [`edit_stars`], so that a
+/// star this window put on lands on top of whatever another window saved rather
+/// than on top of the list this window loaded when it opened.
 fn star_action(ctx: &Ctx) -> Rc<gio::SimpleAction> {
     let star = gio::SimpleAction::new("star", None);
     star.connect_activate({
@@ -2484,9 +2654,11 @@ fn star_action(ctx: &Ctx) -> Rc<gio::SimpleAction> {
                 return;
             }
             let now = SystemTime::now();
-            let changed = {
-                let mut starred = ctx.shared.starred.borrow_mut();
-                picked
+            // `None` when nothing moved, which leaves the file alone: a selection
+            // of three rows that were all already starred is not a change worth a
+            // write, and writing would move another window's star for no reason.
+            let _ = edit_stars(&ctx.shared, |starred| {
+                let changed = picked
                     .iter()
                     // `toggle` reports the state a row is in afterwards rather
                     // than whether it moved, so counting its answer would count
@@ -2496,13 +2668,9 @@ fn star_action(ctx: &Ctx) -> Rc<gio::SimpleAction> {
                         let before = starred.contains(&entry.location);
                         starred.toggle(entry.location.clone(), now) != before
                     })
-                    .count()
-            };
-            if changed == 0 {
-                return;
-            }
-            let _ = ctx.shared.starred.borrow().save(&Starred::path());
-            refresh_badges(&ctx);
+                    .count();
+                (changed > 0).then_some(())
+            });
         }
     });
     Rc::new(star)
@@ -2693,9 +2861,10 @@ fn current_bookmarked(ctx: &Ctx) -> bool {
 /// apart because it is built after the folder is known.
 ///
 /// The folder in the title bar and not the selected row, because a bookmark names
-/// a place to return to and a row inside a folder is not that folder. Nothing is
-/// read from disk: the store is in memory, the sidebar is rebuilt from it, and the
-/// only cost is writing one small file.
+/// a place to return to and a row inside a folder is not that folder. The sidebar
+/// is rebuilt from the list rather than patched, and the list is read once, inside
+/// [`edit_bookmarks`], so a row this window adds lands on top of whatever another
+/// window saved rather than replacing it.
 fn bookmark_action(ctx: &Ctx) -> Rc<gio::SimpleAction> {
     let action = gio::SimpleAction::new("bookmark", None);
     action.connect_activate({
@@ -2707,9 +2876,8 @@ fn bookmark_action(ctx: &Ctx) -> Rc<gio::SimpleAction> {
             let name = folder
                 .file_name()
                 .map_or_else(|| folder.display(), ToString::to_string);
-            let message = {
-                let mut bookmarks = ctx.shared.bookmarks.borrow_mut();
-                if bookmarks.find(&folder).is_some() {
+            let Some(message) = edit_bookmarks(&ctx.shared, |bookmarks| {
+                let message = if bookmarks.find(&folder).is_some() {
                     bookmarks.remove(&folder);
                     format!("Bookmark removed for {name}")
                 } else {
@@ -2720,21 +2888,15 @@ fn bookmark_action(ctx: &Ctx) -> Rc<gio::SimpleAction> {
                     // not.
                     bookmarks.add(folder.clone(), None);
                     format!("Bookmarked {name}")
-                }
+                };
+                Some(message)
+            }) else {
+                return;
             };
-            let _ = ctx.shared.bookmarks.borrow().save(&Bookmarks::path());
-            bookmarks_changed(&ctx, &message);
+            show_banner(&ctx, &message);
         }
     });
     Rc::new(action)
-}
-
-/// Save the bookmark store and repaint the sidebar from it. The two halves of
-/// every bookmark command, split out because all four of them do exactly this and
-/// a command that forgot one of the two leaves the file and the screen disagreeing.
-fn bookmarks_updated(ctx: &Ctx, message: &str) {
-    let _ = ctx.shared.bookmarks.borrow().save(&Bookmarks::path());
-    bookmarks_changed(ctx, message);
 }
 
 /// The bookmark a sidebar menu row named.
@@ -2792,19 +2954,19 @@ fn rename_bookmark_action(ctx: &Ctx) -> Rc<gio::SimpleAction> {
             let current = bookmark.display();
             let worker = ctx.clone();
             ops::ask_bookmark_label(&window, &current, move |typed| {
-                let message = if worker
-                    .shared
-                    .bookmarks
-                    .borrow_mut()
-                    .rename(&location, Some(typed))
-                {
-                    "Bookmark renamed"
-                } else {
-                    // The prompt outlived the bookmark — removed in another window,
-                    // or by the same keystroke twice. Nothing was written.
-                    "That bookmark is no longer in the sidebar"
-                };
-                bookmarks_updated(&worker, message);
+                // Nothing is written when the rename finds no such row: the prompt
+                // outlived the bookmark, removed in another window or by the same
+                // keystroke twice, and the message says so rather than claiming a
+                // rename that did not happen.
+                let renamed = edit_bookmarks(&worker.shared, |bookmarks| {
+                    bookmarks
+                        .rename(&location, Some(typed))
+                        .then_some("Bookmark renamed")
+                });
+                show_banner(
+                    &worker,
+                    renamed.unwrap_or("That bookmark is no longer in the sidebar"),
+                );
             });
         }
     });
@@ -2826,11 +2988,8 @@ fn shift_bookmark_action(name: &'static str, up: bool, ctx: &Ctx) -> Rc<gio::Sim
             let Some(location) = bookmark_named(parameter) else {
                 return;
             };
-            let message = {
-                let mut bookmarks = ctx.shared.bookmarks.borrow_mut();
-                let Some(at) = bookmarks.find(&location) else {
-                    return;
-                };
+            let Some(message) = edit_bookmarks(&ctx.shared, |bookmarks| {
+                let at = bookmarks.find(&location)?;
                 let name = bookmarks.items[at].display();
                 let to = if up {
                     at.saturating_sub(1)
@@ -2839,9 +2998,11 @@ fn shift_bookmark_action(name: &'static str, up: bool, ctx: &Ctx) -> Rc<gio::Sim
                 };
                 bookmarks.move_item(at, to);
                 let word = if up { "up" } else { "down" };
-                format!("Moved {name} {word}")
+                Some(format!("Moved {name} {word}"))
+            }) else {
+                return;
             };
-            bookmarks_updated(&ctx, &message);
+            show_banner(&ctx, &message);
         }
     });
     Rc::new(action)
@@ -2861,32 +3022,36 @@ fn remove_bookmark_action(ctx: &Ctx) -> Rc<gio::SimpleAction> {
             let Some(location) = bookmark_named(parameter) else {
                 return;
             };
-            let name = {
-                let bookmarks = ctx.shared.bookmarks.borrow();
+            let Some(message) = edit_bookmarks(&ctx.shared, |bookmarks| {
                 // Already gone — removed in another window while this menu was open.
                 // Nothing to write, and no message claiming a row was taken out.
-                let Some(at) = bookmarks.find(&location) else {
-                    return;
-                };
-                bookmarks.items[at].display()
+                let at = bookmarks.find(&location)?;
+                let name = bookmarks.items[at].display();
+                bookmarks.remove(&location);
+                Some(format!("Bookmark removed for {name}"))
+            }) else {
+                return;
             };
-            ctx.shared.bookmarks.borrow_mut().remove(&location);
-            bookmarks_updated(&ctx, &format!("Bookmark removed for {name}"));
+            show_banner(&ctx, &message);
         }
     });
     Rc::new(action)
 }
 
-/// Tell the sidebar its bookmarks changed, and keep the row that matches the
-/// folder on screen lit.
+/// Repaint the sidebar from the store, and keep the row that matches the folder on
+/// screen lit.
 ///
-/// The whole list is rebuilt rather than one row inserted. A sidebar is a few
-/// dozen rows and the rebuild is what [`Panel`] already does for mounts, so a diff
-/// would be a second way to get the headings wrong. Rebuilding drops the
-/// selection, which is why the current place is re-highlighted afterwards —
-/// without it, bookmarking the folder you are standing in would leave the sidebar
-/// agreeing with nothing.
-fn bookmarks_changed(ctx: &Ctx, message: &str) {
+/// The whole list is rebuilt rather than one row inserted. A sidebar is a few dozen
+/// rows and the rebuild is what [`Panel`] already does for mounts, so a diff would
+/// be a second way to get the headings wrong. Rebuilding drops the selection, which
+/// is why the current place is re-highlighted afterwards — without it, bookmarking
+/// the folder you are standing in would leave the sidebar agreeing with nothing.
+///
+/// Kept apart from the message a command prints because a window that did not ask
+/// for this change has nothing to say about it: [`edit_bookmarks`] calls this for
+/// every window open, and telling a window its sidebar grew when nobody touched it
+/// is a message that reads as a glitch.
+fn repaint_places(ctx: &Ctx) {
     if let Some(panel) = ctx.panel.upgrade() {
         panel.set_places(places(&ctx.shared));
         panel.set_usage(usages(&ctx.shared));
@@ -2895,7 +3060,6 @@ fn bookmarks_changed(ctx: &Ctx, message: &str) {
     if let Some(location) = current {
         select_place(ctx, &location);
     }
-    show_banner(ctx, message);
     sync_bookmark(ctx);
 }
 
@@ -3134,6 +3298,11 @@ fn install_accels(app: &gtk::Application) {
     app.set_accels_for_action("win.forward", &["<Alt>Right"]);
     app.set_accels_for_action("win.up", &["<Alt>Up"]);
     app.set_accels_for_action("win.refresh", &["F5"]);
+    // `<Ctrl>W`, the chord people reach for to get rid of the window in front of
+    // them. Deliberately no `<Ctrl>Q`: this program has no quit command, and it
+    // ends when its last window does — a chord that looked like it would close
+    // every window would be a claim about the others that nothing here keeps.
+    app.set_accels_for_action("win.close", &["<Ctrl>W"]);
     app.set_accels_for_action("win.hidden", &["<Ctrl>H"]);
     app.set_accels_for_action("win.search", &["<Ctrl>F"]);
     // The star. `<Ctrl>T` rather than a letter with a tradition elsewhere: `T` is
@@ -3468,6 +3637,261 @@ mod tests {
             found.map(|place| place.label()),
             Some("filmy".to_string()),
             "a mount point is its share's row, not an unlisted folder"
+        );
+    }
+
+    // The shared stores. These run with no display and with nothing registered in
+    // `OPEN`, which is what makes them possible at all — `shared_state` reads two
+    // files and builds no widget — and also what bounds what they can say. What is
+    // checked here is that a change is applied to what the file says now, and that
+    // the window which made it ends up looking at that. That the *other* window's
+    // badges and sidebar follow is the broadcast's job, and needs a sidebar to look
+    // at, which is what the UI harness does.
+    use ufm_core::sort::SortField;
+
+    /// Tests that change the process environment have to hold this, because
+    /// `set_var` is unsafe in edition 2024 precisely because another thread may be
+    /// reading the environment at the same time.
+    fn env() -> std::sync::MutexGuard<'static, ()> {
+        super::super::test_env()
+    }
+
+    #[allow(unsafe_code)]
+    fn set_env(key: &str, value: &str) {
+        // SAFETY: the guard means no other test in this binary is reading the
+        // environment while this happens.
+        unsafe { std::env::set_var(key, value) };
+    }
+
+    #[allow(unsafe_code)]
+    fn unset_env(key: &str) {
+        // SAFETY: as above.
+        unsafe { std::env::remove_var(key) };
+    }
+
+    /// Two windows, both opened while the file was still empty.
+    ///
+    /// Each holds what the file said when it opened, which is exactly the state in
+    /// which saving a whole copy back destroys the other window's work.
+    fn two_windows() -> (Rc<Shared>, Rc<Shared>) {
+        let window = |name: &str| {
+            shared_state(
+                Preferences::default(),
+                Arc::new(Readers::local_only()),
+                &location(name),
+            )
+        };
+        (window("first"), window("second"))
+    }
+
+    /// Point the configuration directory at a throwaway for the length of a test.
+    ///
+    /// The stores name their own paths, so a test cannot hand them a file; it moves
+    /// the directory underneath them instead, which is the hook `paths` provides
+    /// for exactly this. Unsetting on the way out matters as much as setting: the
+    /// other tests in this binary read the real paths, and a leaked variable would
+    /// send their writes somewhere no one is looking.
+    /// Holds the directory for its `Drop` alone: the value is never read, and
+    /// naming the field is what keeps the name out of the `dead_code` list the
+    /// module-level allowance is there to cover.
+    struct ConfigDir {
+        _dir: tempfile::TempDir,
+    }
+
+    impl ConfigDir {
+        fn new() -> Self {
+            let dir = tempfile::tempdir().expect("a throwaway configuration dir");
+            set_env(
+                "UFLINUX_FILES_CONFIG_DIR",
+                &dir.path().display().to_string(),
+            );
+            Self { _dir: dir }
+        }
+    }
+
+    impl Drop for ConfigDir {
+        fn drop(&mut self) {
+            unset_env("UFLINUX_FILES_CONFIG_DIR");
+        }
+    }
+
+    fn stars_on_disk() -> Vec<String> {
+        Starred::load(&Starred::path())
+            .expect("the file a window wrote")
+            .stars()
+            .iter()
+            .map(|star| star.location.to_string())
+            .collect()
+    }
+
+    fn bookmarks_on_disk() -> Vec<String> {
+        Bookmarks::load(&Bookmarks::path())
+            .expect("the file a window wrote")
+            .items
+            .iter()
+            .map(|bookmark| bookmark.location.to_string())
+            .collect()
+    }
+
+    #[test]
+    fn a_star_put_on_in_one_window_survives_a_star_put_on_in_another() {
+        let _guard = env();
+        let _dir = ConfigDir::new();
+        let (first, second) = two_windows();
+        let now = SystemTime::now();
+        let _ = edit_stars(&first, |starred| {
+            starred.star(location("one"), now).then_some(())
+        });
+        let _ = edit_stars(&second, |starred| {
+            starred.star(location("two"), now).then_some(())
+        });
+        assert_eq!(
+            stars_on_disk().len(),
+            2,
+            "the second star lands on top of the first rather than replacing it"
+        );
+        // The discriminating half. The second window's own copy was loaded before
+        // the first window had written anything; holding the file's contents now
+        // means the write was applied to the file and not to that copy. Saving the
+        // copy whole — what this code used to do — leaves one row in the window and
+        // one row in the file.
+        assert_eq!(
+            second.starred.borrow().len(),
+            2,
+            "and the window that wrote is looking at what the other one had written"
+        );
+    }
+
+    #[test]
+    fn a_star_taken_away_does_not_come_back_from_a_window_that_missed_it() {
+        // The reason the fix is a re-read rather than a merge of the two copies: a
+        // merge would put this star back, because the window that never saw its
+        // removal still has it. Re-reading the file is what lets a removal stick.
+        let _guard = env();
+        let _dir = ConfigDir::new();
+        let (first, second) = two_windows();
+        let now = SystemTime::now();
+        let _ = edit_stars(&first, |starred| {
+            starred.star(location("one"), now).then_some(())
+        });
+        let _ = edit_stars(&second, |starred| {
+            starred.star(location("two"), now).then_some(())
+        });
+        let _ = edit_stars(&first, |starred| {
+            starred.unstar(&location("one")).then_some(())
+        });
+        assert_eq!(
+            stars_on_disk(),
+            vec![location("two").to_string()],
+            "the star that was taken away stays taken away, and the other survives"
+        );
+    }
+
+    #[test]
+    fn two_windows_adding_a_bookmark_each_keep_theirs() {
+        let _guard = env();
+        let _dir = ConfigDir::new();
+        let (first, second) = two_windows();
+        let _ = edit_bookmarks(&first, |bookmarks| {
+            bookmarks.add(location("docs"), None);
+            Some(())
+        });
+        let _ = edit_bookmarks(&second, |bookmarks| {
+            bookmarks.add(location("photos"), None);
+            Some(())
+        });
+        assert_eq!(
+            bookmarks_on_disk(),
+            vec![location("docs").to_string(), location("photos").to_string()],
+            "both rows are in the file, in the order they were asked for"
+        );
+        assert_eq!(
+            second.bookmarks.borrow().items.len(),
+            2,
+            "and the sidebar the second window rebuilds holds both rows"
+        );
+    }
+
+    #[test]
+    fn a_bookmark_removed_stays_removed_after_another_window_writes() {
+        let _guard = env();
+        let _dir = ConfigDir::new();
+        let (first, second) = two_windows();
+        let _ = edit_bookmarks(&first, |bookmarks| {
+            bookmarks.add(location("docs"), None);
+            Some(())
+        });
+        let _ = edit_bookmarks(&second, |bookmarks| {
+            bookmarks.add(location("photos"), None);
+            Some(())
+        });
+        // The shape `remove_bookmark_action` makes: find the row, then take it out,
+        // answering nothing when it is already gone.
+        let _ = edit_bookmarks(&first, |bookmarks| {
+            bookmarks.find(&location("docs"))?;
+            bookmarks.remove(&location("docs"));
+            Some(())
+        });
+        assert_eq!(
+            bookmarks_on_disk(),
+            vec![location("photos").to_string()],
+            "the removed row is not resurrected, and the row added elsewhere survives"
+        );
+    }
+
+    #[test]
+    fn an_edit_that_finds_nothing_to_change_writes_no_file() {
+        // The `None` answer, which the bookmark commands lean on: the row they were
+        // asked about is already gone. Writing anyway would create a file
+        // describing an empty list out of a command that changed nothing.
+        let _guard = env();
+        let _dir = ConfigDir::new();
+        let (first, _second) = two_windows();
+        let answered = edit_bookmarks(&first, |bookmarks| {
+            bookmarks
+                .find(&location("nowhere"))
+                .map(|at| bookmarks.items[at].display())
+        });
+        assert_eq!(answered, None, "a missing row answers nothing");
+        assert!(
+            !Bookmarks::path().exists(),
+            "and leaves the file it never needed unwritten"
+        );
+    }
+
+    #[test]
+    fn a_preference_written_by_one_window_keeps_one_another_wrote() {
+        // The same mistake in a smaller file: the second window's copy predates the
+        // first's sort key, and saving that copy whole drops the key while adding
+        // the mode. Losing a folder's sort order is a smaller loss than losing a
+        // bookmark, which is why this half gets no broadcast — but it is still a
+        // loss, and still fixed the same way.
+        let _guard = env();
+        let _dir = ConfigDir::new();
+        let (first, second) = two_windows();
+        edit_prefs(&first, |prefs| {
+            prefs.set_sort_for(
+                &location("docs"),
+                SortKey {
+                    field: SortField::Size,
+                    descending: false,
+                    folders_first: true,
+                },
+            );
+        });
+        edit_prefs(&second, |prefs| {
+            prefs.set_view_mode_for(&location("photos"), ViewMode::Columns);
+        });
+        let on_disk = Preferences::load(&Preferences::path()).expect("the file");
+        assert_eq!(
+            on_disk.sort_for(&location("docs")).field,
+            SortField::Size,
+            "the sort key the first window chose is still there"
+        );
+        assert_eq!(
+            on_disk.view_mode_for(&location("photos")),
+            ViewMode::Columns,
+            "alongside the mode the second window chose"
         );
     }
 }

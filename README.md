@@ -26,6 +26,12 @@ the model over D-Bus and never opens a window.
   and whether the share is still there, with a Disconnect button on the ones that
   can be. It is a fourth presentation rather than a fourth reader — there is no
   directory behind it to read.
+- **More than one window**: a second invocation opens a window in the instance
+  already running rather than a second copy of the program, and `<Ctrl>W` closes
+  the one you are looking at. Each window keeps its own folder, view mode and
+  history; the star list, the bookmarks and the preferences are shared, and a
+  change made in one window is applied to what those files say at that moment
+  rather than to the copy another window loaded when it opened.
 - **Stars**: `<Ctrl>T` puts a star on the selected rows and takes it off the ones
   that already have one. The list is a file, not an extended attribute — nothing
   on disk says a row was starred — so the badge on an icon is drawn from it and
