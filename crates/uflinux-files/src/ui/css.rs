@@ -81,6 +81,16 @@ box.ufm-find {
     border-bottom: 1px solid alpha(currentColor, 0.12);
     background-color: alpha(currentColor, 0.03);
 }
+/* The job strip. Drawn like the search bar because it is the same kind of thing:
+   a strip of chrome that appears above the listing for as long as it has
+   something to say. The bar is given a width of its own rather than left to
+   expand, so a window that is very wide still shows a bar that reads as one bar
+   rather than as a rule across the page. */
+box.ufm-jobs {
+    padding: 6px 10px;
+    border-bottom: 1px solid alpha(currentColor, 0.12);
+    background-color: alpha(currentColor, 0.03);
+}
 label.ufm-mono {
     font-family: monospace;
 }
@@ -146,6 +156,7 @@ mod tests {
             "ufm-pane",
             "ufm-columns",
             "ufm-find",
+            "ufm-jobs",
             "ufm-mono",
             "ufm-open-with",
             "ufm-preview",

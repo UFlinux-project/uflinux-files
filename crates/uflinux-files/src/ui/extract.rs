@@ -16,15 +16,17 @@
 //! Like the other operations, the work runs on a worker and reports through the
 //! window's listing queue (see [`super::job`]). Extraction streams one member at
 //! a time, so it costs a buffer rather than a copy of the container, but an
-//! archive with ten thousand members still blocks for as long as it takes.
+//! archive with ten thousand members still blocks for as long as it takes — long
+//! enough that it registers a job, which is what lets the window say so and let
+//! the user stop it.
 
 use std::path::{Path, PathBuf};
 
 use ufm_archive::Format;
 use ufm_core::{Error, Location};
-use ufm_vfs::Cancel;
 
 use super::job::{Event, Handle};
+use super::jobs::{Jobs, Kind, Unit};
 use super::ops::{self, Outcome};
 
 /// Unpack the container at `location` into a folder beside it, on a worker.
@@ -32,14 +34,16 @@ use super::ops::{self, Outcome};
 /// Reports through the queue whatever happens, including the two cases where no
 /// worker is started: a location that is not a file the kernel can see, and a
 /// container with no folder to unpack into. A command that produces no answer at
-/// all is indistinguishable from one that is still running.
+/// all is indistinguishable from one that is still running. Those two refusals
+/// report as plain operations rather than as jobs, because a command that never
+/// started has nothing to show a bar for.
 ///
 /// The whole container is unpacked whichever shape `location` had. That is what
 /// makes the two entry points agree: the row the user selected is a plain path and
 /// the folder on screen inside an archive is a position in one, and the reader only
 /// speaks the second — so the path is turned into the root of its own archive
 /// rather than passed through.
-pub fn extract(handle: &Handle, location: Location) {
+pub fn extract(handle: &Handle, jobs: &Jobs, location: Location) {
     let Some(container) = container_of(&location) else {
         handle.send(Event::Operation {
             outcome: refused(&format!(
@@ -74,16 +78,47 @@ pub fn extract(handle: &Handle, location: Location) {
         archive: container.clone(),
         inner: String::new(),
     };
-    ops::spawn(handle, move || {
-        match ufm_archive::extract(&whole, &into, &Cancel::new()) {
-            Ok(report) => arrived(report, changed),
-            Err(error) => Outcome {
-                ok: false,
-                message: complaint(&container, &error),
-                changed: Vec::new(),
-            },
-        }
-    });
+    let name = container.file_name().map_or_else(
+        || "archive".to_string(),
+        |name| name.to_string_lossy().into_owned(),
+    );
+    let label = name.clone();
+    // No total to begin with: the number of members is not known until the
+    // container's index has been read, which happens on the worker. The first
+    // report brings it, and a container unpacked by a helper process never brings
+    // one at all — the strip says "Extracting" without a tally for that, which is
+    // honest where a bar stuck at zero would look like a stall.
+    ops::spawn_job(
+        handle,
+        jobs,
+        Kind::Extract,
+        &name,
+        None,
+        Unit::Rows,
+        move |brake, reporter| {
+            let mut told = |written: usize, total: usize, _bytes: u64| {
+                let done = u64::try_from(written).unwrap_or(u64::MAX);
+                let whole = u64::try_from(total).unwrap_or(u64::MAX);
+                reporter.update(&label, done, Some(whole), Unit::Rows);
+            };
+            match ufm_archive::extract(&whole, &into, brake.vfs(), Some(&mut told)) {
+                Ok(report) => arrived(report, changed),
+                // A stopped extraction is not a failed one: the members that had
+                // been written are removed by the extractor itself, so what the
+                // user did was decline work rather than have it go wrong.
+                Err(error) if error.is_cancelled() => Outcome {
+                    ok: true,
+                    message: format!("Extracting {label} stopped."),
+                    changed: changed.into_iter().collect(),
+                },
+                Err(error) => Outcome {
+                    ok: false,
+                    message: complaint(&container, &error),
+                    changed: Vec::new(),
+                },
+            }
+        },
+    );
 }
 
 /// The folder to unpack `container` into: a sibling named after the container

@@ -32,6 +32,7 @@ use ufm_core::config::format_modified;
 use ufm_core::entry::human_size;
 
 use super::job::Handle;
+use super::jobs::Jobs;
 use super::ops::{self, Choose, Conflict, Plan, Side, Transfer};
 use super::row::format_items;
 
@@ -42,14 +43,25 @@ use super::row::format_items;
 /// matters more than it looks: a prompt that exists but is never shown still costs
 /// a widget tree, and a paste of a thousand files would pay for it a thousand
 /// times over.
-pub fn paste(parent: &gtk::ApplicationWindow, handle: &Handle, plan: Plan, transfer: Transfer) {
+///
+/// `jobs` is the window's table, which the paste registers itself in once the
+/// questions are answered. Answering a prompt can take a minute and the strip
+/// stays quiet through it — a job that has not been agreed to yet is not a job
+/// the user is waiting on.
+pub fn paste(
+    parent: &gtk::ApplicationWindow,
+    handle: &Handle,
+    jobs: &Jobs,
+    plan: Plan,
+    transfer: Transfer,
+) {
     if plan.conflicts.is_empty() {
-        ops::paste(handle, plan, transfer);
+        ops::paste(handle, jobs, plan, transfer);
         return;
     }
     let prompt = Prompt::default();
     let answered = ops::resolve(plan, |conflict| prompt.ask(parent, conflict));
-    ops::paste(handle, answered, transfer);
+    ops::paste(handle, jobs, answered, transfer);
 }
 
 /// One prompt's worth of state: the answer, shared with the window that carries it.

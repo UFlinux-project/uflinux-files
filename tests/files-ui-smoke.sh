@@ -292,6 +292,15 @@ if describe paste | grep -qF '(false'; then
 else
     fail "Paste is disabled while the clipboard is empty ($(describe paste))"
 fi
+# Cancel belongs to the job strip, and the strip is hidden when nothing runs. An
+# action that is registered but disabled and one that was never registered are
+# told apart here by `Describe` answering at all; what the enabled state is
+# supposed to become is the job's own test, which can start a transfer and watch.
+if describe cancel | grep -qF '(false'; then
+    ok "Cancel is disabled while nothing runs"
+else
+    fail "Cancel is disabled while nothing runs ($(describe cancel))"
+fi
 
 # The prompt is a window of its own, so it shows up as a frame. Its entry arrives with
 # a suggested name already in it, which the check on the created folder confirms.

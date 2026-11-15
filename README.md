@@ -78,6 +78,12 @@ the model over D-Bus and never opens a window.
   the rows use, decoded at the largest size the cache's `large` band holds; and a text
   file shows its opening bytes, read on a worker that stops at 64 KiB so a 2 MiB
   document costs no more than a 2 KiB one. The same key closes it.
+- **Progress you can watch and stop**: a copy, move, delete or extract puts a strip
+  above the listing naming the item it is on and how far along it is — bytes when every
+  source reported a size, rows when one did not — and reports at most ten times a
+  second however many files are moving. One `Cancel` stops everything running, in the
+  middle of a `GIO` call and in the middle of an archive alike, and a cancelled extract
+  leaves no half-built folder behind.
 
 ## Layout
 

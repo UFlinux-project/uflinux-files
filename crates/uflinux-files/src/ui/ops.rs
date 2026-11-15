@@ -29,10 +29,11 @@ use ufm_core::Location;
 use ufm_core::entry::Entry;
 
 use super::job::{Event, Handle};
+use super::jobs::{Brake, Jobs, Kind, Reporter, Unit};
 
-/// No cancellation flag. An operation that has started is not going to be
-/// interrupted — there is no cancel button for one yet — and naming this keeps
-/// the call sites from repeating `None::<&gio::Cancellable>`.
+/// No cancellation flag, for the calls that finish in one system call and would
+/// only grow an argument list by taking one. The operations that can take a
+/// while pass a [`Brake`] instead, which is what the Cancel button pulls.
 const NO_CANCEL: Option<&gio::Cancellable> = None;
 
 /// Copy without following symlinks, so a link arrives as a link rather than as
@@ -143,6 +144,13 @@ pub struct Step {
     /// by an answer to a collision, which is the only way this program comes to
     /// destroy a file it did not put there.
     pub replace: bool,
+    /// How big the row is, when the listing already knew. `None` for a folder,
+    /// whose size is not in a listing and is not worth a walk before a paste has
+    /// decided it will touch the row at all. A plan whose every step has one is a
+    /// plan that can report a percentage; one with a `None` anywhere can report
+    /// only rows finished, which is the difference between a bar that measures
+    /// and a bar that merely moves.
+    pub bytes: Option<u64>,
 }
 
 impl Step {
@@ -153,6 +161,7 @@ impl Step {
             from,
             to,
             replace: false,
+            bytes: None,
         }
     }
 }
@@ -433,6 +442,10 @@ pub fn plan(sources: &[Entry], folder: &Location, transfer: Transfer) -> Plan {
                 base.clone()
             },
             replace: false,
+            // The listing already carried a size for a file, and a folder's
+            // child count is not a size. Whether the whole plan can be measured
+            // is decided from these, in [`paste`].
+            bytes: (!source.kind.is_dir()).then_some(source.size),
         });
     }
     // Filled in at the end rather than per row: a collision can only say how
@@ -663,7 +676,16 @@ fn file(location: &Location) -> Option<gio::File> {
 /// existing name, and both are atomic where the filesystem supports them. A step
 /// that did not come from a collision never passes the flag, so nothing this
 /// program plans on its own can overwrite anything.
-fn run(step: &Step, transfer: Transfer) -> Result<(), String> {
+/// Run one step, watching `brake` and reporting into `progress` while a single
+/// row is being written. The callback is what makes one large file a moving bar
+/// rather than a bar that waits four seconds and jumps; a step with no known
+/// size has nothing to measure against and passes `None`.
+fn run(
+    step: &Step,
+    transfer: Transfer,
+    brake: &Brake,
+    progress: Option<&mut dyn FnMut(i64, i64)>,
+) -> Result<(), String> {
     let from = file(&step.from).ok_or("not a file on disk")?;
     let to = file(&step.to).ok_or("not a file on disk")?;
     let flags = if step.replace {
@@ -674,18 +696,20 @@ fn run(step: &Step, transfer: Transfer) -> Result<(), String> {
     let result = if transfer == Transfer::Move {
         // `g_file_move` renames where it can and falls back to copy-then-delete
         // where it cannot, across filesystems and for directories included.
-        from.move_(&to, flags, NO_CANCEL, None)
-    } else if is_directory(&from) {
-        copy_tree(&from, &to, step.replace)
+        from.move_(&to, flags, Some(brake.gio()), progress)
+    } else if is_directory(&from, brake) {
+        copy_tree(&from, &to, step.replace, brake)
     } else {
-        copy_file(&from, &to, flags)
+        copy_file(&from, &to, flags, brake, progress)
     };
     result.map_err(|error| error.to_string())
 }
 
-fn is_directory(file: &gio::File) -> bool {
-    file.query_file_type(gio::FileQueryInfoFlags::NOFOLLOW_SYMLINKS, NO_CANCEL)
-        == gio::FileType::Directory
+fn is_directory(file: &gio::File, brake: &Brake) -> bool {
+    file.query_file_type(
+        gio::FileQueryInfoFlags::NOFOLLOW_SYMLINKS,
+        Some(brake.gio()),
+    ) == gio::FileType::Directory
 }
 
 /// Copy one file and then its metadata.
@@ -697,9 +721,11 @@ fn copy_file(
     from: &gio::File,
     to: &gio::File,
     flags: gio::FileCopyFlags,
+    brake: &Brake,
+    progress: Option<&mut dyn FnMut(i64, i64)>,
 ) -> Result<(), glib::Error> {
-    from.copy(to, flags, NO_CANCEL, None)?;
-    from.copy_attributes(to, META_FLAGS, NO_CANCEL).ok();
+    from.copy(to, flags, Some(brake.gio()), progress)?;
+    from.copy_attributes(to, META_FLAGS, Some(brake.gio())).ok();
     Ok(())
 }
 
@@ -715,27 +741,32 @@ fn copy_file(
 /// existing directory is walked into rather than complained about, and the files
 /// inside it are overwritten one at a time. Without that, replacing a folder would
 /// fail on its own name and leave the old contents mixed with the new.
-fn copy_tree(from: &gio::File, to: &gio::File, merge: bool) -> Result<(), glib::Error> {
-    match to.make_directory(NO_CANCEL) {
+fn copy_tree(
+    from: &gio::File,
+    to: &gio::File,
+    merge: bool,
+    brake: &Brake,
+) -> Result<(), glib::Error> {
+    match to.make_directory(Some(brake.gio())) {
         Ok(()) => {}
         // Replacing a folder means merging into what is there, so the only error
         // worth passing on is one that is not "it already exists".
         Err(error) if merge && error.matches(gio::IOErrorEnum::Exists) => {}
         Err(error) => return Err(error),
     }
-    from.copy_attributes(to, META_FLAGS, NO_CANCEL).ok();
+    from.copy_attributes(to, META_FLAGS, Some(brake.gio())).ok();
     let flags = if merge {
         COPY_FLAGS | gio::FileCopyFlags::OVERWRITE
     } else {
         COPY_FLAGS
     };
-    for name in child_names(from)? {
+    for name in child_names(from, brake)? {
         let child = from.child(&name);
         let target = to.child(&name);
-        if is_directory(&child) {
-            copy_tree(&child, &target, merge)?;
+        if is_directory(&child, brake) {
+            copy_tree(&child, &target, merge, brake)?;
         } else {
-            copy_file(&child, &target, flags)?;
+            copy_file(&child, &target, flags, brake, None)?;
         }
     }
     Ok(())
@@ -746,27 +777,27 @@ fn copy_tree(from: &gio::File, to: &gio::File, merge: bool) -> Result<(), glib::
 /// Collected up front rather than while recursing: the enumerator holds the
 /// directory open, and removing a folder whose read handle is still on it is the
 /// kind of thing that works on one filesystem and not on another.
-fn child_names(dir: &gio::File) -> Result<Vec<PathBuf>, glib::Error> {
+fn child_names(dir: &gio::File, brake: &Brake) -> Result<Vec<PathBuf>, glib::Error> {
     let mut out = Vec::new();
     let enumerator = dir.enumerate_children(
         ENUMERATE,
         gio::FileQueryInfoFlags::NOFOLLOW_SYMLINKS,
-        NO_CANCEL,
+        Some(brake.gio()),
     )?;
-    while let Some(info) = enumerator.next_file(NO_CANCEL)? {
+    while let Some(info) = enumerator.next_file(Some(brake.gio()))? {
         out.push(info.name());
     }
     Ok(out)
 }
 
 /// Remove a row and, when it is a folder, everything inside it.
-fn remove_all(file: &gio::File) -> Result<(), glib::Error> {
-    if is_directory(file) {
-        for name in child_names(file)? {
-            remove_all(&file.child(&name))?;
+fn remove_all(file: &gio::File, brake: &Brake) -> Result<(), glib::Error> {
+    if is_directory(file, brake) {
+        for name in child_names(file, brake)? {
+            remove_all(&file.child(&name), brake)?;
         }
     }
-    file.delete(NO_CANCEL)
+    file.delete(Some(brake.gio()))
 }
 
 /// Throw one row away, preferring the trash.
@@ -775,10 +806,10 @@ fn remove_all(file: &gio::File) -> Result<(), glib::Error> {
 /// `NotSupported`. That is not a failure to report — the row is gone either way —
 /// so it is deleted instead and the difference shows up in the count the banner
 /// reports.
-fn discard_one(file: &gio::File) -> Result<Gone, String> {
-    match file.trash(NO_CANCEL) {
+fn discard_one(file: &gio::File, brake: &Brake) -> Result<Gone, String> {
+    match file.trash(Some(brake.gio())) {
         Ok(()) => Ok(Gone::Trashed),
-        Err(trash_error) => remove_all(file)
+        Err(trash_error) => remove_all(file, brake)
             .map(|()| Gone::Deleted)
             .map_err(|error| format!("{trash_error}: {error}")),
     }
@@ -801,64 +832,133 @@ pub(crate) fn spawn(handle: &Handle, work: impl FnOnce() -> Outcome + Send + 'st
     }
 }
 
+/// Hand a job to a worker: put it on the table first, then let the worker report
+/// into it and strike it off. The registration happens here rather than at the
+/// call sites so that no operation can start without a row in the strip, which
+/// is the difference between a copy the user can watch and one they can only
+/// hope about.
+///
+/// The [`Brake`] is handed to the worker and kept by the table, so the Cancel
+/// button reaches a worker that is halfway through a directory and watching
+/// nothing else. The [`Reporter`] is the worker's only way to speak about
+/// progress, which is what puts the pause between reports somewhere a caller
+/// cannot forget it.
+pub(crate) fn spawn_job(
+    handle: &Handle,
+    jobs: &Jobs,
+    kind: Kind,
+    detail: &str,
+    total: Option<u64>,
+    unit: Unit,
+    work: impl FnOnce(&Brake, &mut Reporter) -> Outcome + Send + 'static,
+) {
+    let (id, brake) = jobs.begin(kind, detail, total, unit);
+    jobs.add_brake(id, &brake);
+    let worker = handle.clone();
+    let mut reporter = Reporter::new(handle, id);
+    let spawned = thread::Builder::new()
+        .stack_size(256 * 1024)
+        .spawn(move || {
+            let outcome = work(&brake, &mut reporter);
+            worker.send(Event::JobFinished { id, outcome });
+        });
+    if spawned.is_err() {
+        handle.send(Event::JobFinished {
+            id,
+            outcome: Outcome::failed("cannot start a worker for this operation."),
+        });
+    }
+}
+
 /// Move `entries` to the trash, or remove them for good when `permanent`.
-pub fn discard(handle: &Handle, entries: &[Entry], permanent: bool) {
+///
+/// A job rather than a plain worker: throwing forty rows at the trash is a
+/// second or two of disk work on a slow filesystem, and the rows go away one at
+/// a time, so the strip can count them out and the Cancel button can leave the
+/// rest where they are.
+pub fn discard(handle: &Handle, jobs: &Jobs, entries: &[Entry], permanent: bool) {
     let picked = entries.to_vec();
-    spawn(handle, move || {
-        let mut trashed = 0_usize;
-        let mut deleted = 0_usize;
-        let mut failures: Vec<String> = Vec::new();
-        let mut changed: Vec<Location> = Vec::new();
-        for entry in &picked {
-            let Some(target) = file(&entry.location) else {
-                failures.push(format!("{}: not a file on disk.", entry.name));
-                continue;
-            };
-            let removed = if permanent {
-                remove_all(&target)
-                    .map(|()| Gone::Deleted)
-                    .map_err(|error| error.to_string())
-            } else {
-                discard_one(&target)
-            };
-            match removed {
-                Ok(Gone::Trashed) => trashed += 1,
-                Ok(Gone::Deleted) => deleted += 1,
-                Err(message) => {
-                    failures.push(format!("{}: {message}", entry.name));
-                    continue;
+    let kind = if permanent { Kind::Delete } else { Kind::Trash };
+    let total = u64::try_from(picked.len()).ok();
+    spawn_job(
+        handle,
+        jobs,
+        kind,
+        &count(picked.len()),
+        total,
+        Unit::Rows,
+        move |brake, reporter| {
+            let mut trashed = 0_usize;
+            let mut deleted = 0_usize;
+            let mut failures: Vec<String> = Vec::new();
+            let mut changed: Vec<Location> = Vec::new();
+            let mut stopped = false;
+            for (index, entry) in picked.iter().enumerate() {
+                if brake.pulled() {
+                    stopped = true;
+                    break;
                 }
+                let Some(target) = file(&entry.location) else {
+                    failures.push(format!("{}: not a file on disk.", entry.name));
+                    continue;
+                };
+                let removed = if permanent {
+                    remove_all(&target, brake)
+                        .map(|()| Gone::Deleted)
+                        .map_err(|error| error.to_string())
+                } else {
+                    discard_one(&target, brake)
+                };
+                match removed {
+                    Ok(Gone::Trashed) => trashed += 1,
+                    Ok(Gone::Deleted) => deleted += 1,
+                    Err(message) => {
+                        failures.push(format!("{}: {message}", entry.name));
+                        continue;
+                    }
+                }
+                // Only a row that actually left counts as a change. A refusal costs
+                // nothing, and re-reading a folder to discover it is unchanged is a
+                // directory walk spent on confirming that nothing happened.
+                if let Some(parent) = entry.location.parent()
+                    && !changed.contains(&parent)
+                {
+                    changed.push(parent);
+                }
+                let done = u64::try_from(index + 1).unwrap_or(u64::MAX);
+                reporter.update(&entry.name, done, total, Unit::Rows);
             }
-            // Only a row that actually left counts as a change. A refusal costs
-            // nothing, and re-reading a folder to discover it is unchanged is a
-            // directory walk spent on confirming that nothing happened.
-            if let Some(parent) = entry.location.parent()
-                && !changed.contains(&parent)
-            {
-                changed.push(parent);
+            let mut parts = Vec::new();
+            if stopped {
+                parts.push(format!("{} stopped", kind.gerund()));
             }
-        }
-        let mut parts = Vec::new();
-        if trashed > 0 {
-            parts.push(format!("{} moved to trash", count(trashed)));
-        }
-        if deleted > 0 {
-            parts.push(format!("{} deleted", count(deleted)));
-        }
-        let mut outcome = if parts.is_empty() {
-            Outcome::failed(String::new())
-        } else {
-            Outcome::done(String::new())
-        };
-        outcome.ok = failures.is_empty();
-        outcome.message = report(&parts, &failures);
-        outcome.changed = changed;
-        outcome
-    });
+            if trashed > 0 {
+                parts.push(format!("{} moved to trash", count(trashed)));
+            }
+            if deleted > 0 {
+                parts.push(format!("{} deleted", count(deleted)));
+            }
+            let mut outcome = if parts.is_empty() {
+                Outcome::failed(String::new())
+            } else {
+                Outcome::done(String::new())
+            };
+            outcome.ok = failures.is_empty();
+            outcome.message = report(&parts, &failures);
+            outcome.changed = changed;
+            outcome
+        },
+    );
 }
 
 /// Run a planned paste. `transfer` comes from the clipboard the plan came from.
-pub fn paste(handle: &Handle, plan: Plan, transfer: Transfer) {
+///
+/// The paste is a job, and what it counts depends on what the listing already
+/// knew. A plan of plain files has a size for every row, so the whole is a byte
+/// total and the bar measures; one row that is a folder makes the total
+/// unknowable without walking it first, and walking a tree to promise a
+/// percentage the user may cancel is a worse trade than a bar that counts rows.
+pub fn paste(handle: &Handle, jobs: &Jobs, plan: Plan, transfer: Transfer) {
     // Resolving here rather than running an unanswered plan is what keeps the
     // two callers of this function honest: a window that asked has nothing left
     // to resolve and passes straight through, and a caller with no way to ask
@@ -879,36 +979,121 @@ pub fn paste(handle: &Handle, plan: Plan, transfer: Transfer) {
         });
         return;
     }
-    spawn(handle, move || {
-        let mut outcome = Outcome::done(String::new());
-        let mut done = 0_usize;
-        let mut failures: Vec<String> = Vec::new();
-        for step in &steps {
-            if let Err(message) = run(step, transfer) {
-                failures.push(format!("{}: {message}", step.label()));
-                continue;
-            }
-            done += 1;
-            if let Some(parent) = step.to.parent() {
-                outcome.note(&parent);
-            }
-            // A move empties the folder the row came from as well as filling the
-            // one it went to, and a column showing the source has to know.
-            if transfer == Transfer::Move
-                && let Some(parent) = step.from.parent()
-            {
-                outcome.note(&parent);
-            }
+    // Every step measured, or none of them. A plan that mixes the two cannot
+    // report a percentage for the whole, and reporting a partial one would show
+    // a bar that stops short for no reason the user could see.
+    let bytes: Option<u64> = steps.iter().map(|step| step.bytes).sum();
+    let rows = u64::try_from(steps.len()).ok();
+    let tally = match bytes {
+        Some(sum) if sum > 0 => Tally {
+            total: Some(sum),
+            unit: Unit::Bytes,
+        },
+        _ => Tally {
+            total: rows,
+            unit: Unit::Rows,
+        },
+    };
+    let unit = tally.unit;
+    let kind = match transfer {
+        Transfer::Copy => Kind::Copy,
+        Transfer::Move => Kind::Move,
+    };
+    spawn_job(
+        handle,
+        jobs,
+        kind,
+        &count(steps.len()),
+        tally.total,
+        unit,
+        move |brake, reporter| paste_all(&steps, transfer, kind, &skipped, tally, brake, reporter),
+    );
+}
+
+/// What the strip was promised about a job's size: the whole it measures against,
+/// and what its rows count. Two values that always travel together — a total
+/// without a unit is a number nothing can be read against — so they are passed as
+/// one argument rather than two.
+#[derive(Clone, Copy)]
+struct Tally {
+    total: Option<u64>,
+    unit: Unit,
+}
+
+/// Walk a resolved plan, reporting each row as it lands. Split out of [`paste`]
+/// so the worker's bookkeeping can be read on its own.
+fn paste_all(
+    steps: &[Step],
+    transfer: Transfer,
+    kind: Kind,
+    skipped: &[String],
+    tally: Tally,
+    brake: &Brake,
+    reporter: &mut Reporter,
+) -> Outcome {
+    let Tally { total, unit } = tally;
+    let mut outcome = Outcome::done(String::new());
+    let mut done = 0_usize;
+    // Bytes written by the rows already finished, which is where the current
+    // row's own count gets added. Only meaningful for a byte job.
+    let mut written = 0_u64;
+    let mut failures: Vec<String> = Vec::new();
+    let mut stopped = false;
+    for step in steps {
+        if brake.pulled() {
+            stopped = true;
+            break;
         }
-        let parts = if done == 0 {
-            Vec::new()
-        } else {
-            vec![format!("{} {}", transfer.past(), count(done))]
+        let base = written;
+        let mut told = |copied: i64, _of: i64| {
+            let on = u64::try_from(copied).unwrap_or(0);
+            reporter.update(&step.label(), base + on, total, unit);
         };
-        outcome.ok = failures.is_empty();
-        outcome.message = report(&parts, &failures);
-        outcome.with_skipped(&skipped)
-    });
+        // Only a byte job can use the row's own count: a row job's total is a
+        // number of rows, and a byte count read against it would say a folder of
+        // four files was 90 % done because the first file was large.
+        let inside: Option<&mut dyn FnMut(i64, i64)> = match unit {
+            Unit::Bytes => Some(&mut told),
+            Unit::Rows => None,
+        };
+        if let Err(message) = run(step, transfer, brake, inside) {
+            // A step the user stopped is not a step that failed; saying so per
+            // row would report one error for every row that was never attempted.
+            if brake.pulled() {
+                stopped = true;
+                break;
+            }
+            failures.push(format!("{}: {message}", step.label()));
+            continue;
+        }
+        done += 1;
+        written += step.bytes.unwrap_or(0);
+        if let Some(parent) = step.to.parent() {
+            outcome.note(&parent);
+        }
+        // A move empties the folder the row came from as well as filling the
+        // one it went to, and a column showing the source has to know.
+        if transfer == Transfer::Move
+            && let Some(parent) = step.from.parent()
+        {
+            outcome.note(&parent);
+        }
+        let tally = match unit {
+            Unit::Bytes => written,
+            Unit::Rows => u64::try_from(done).unwrap_or(u64::MAX),
+        };
+        reporter.update(&step.label(), tally, total, unit);
+    }
+    let mut parts = Vec::new();
+    if stopped {
+        parts.push(format!("{} stopped", kind.gerund()));
+    }
+    if done > 0 {
+        parts.push(format!("{} {}", transfer.past(), count(done)));
+    }
+    outcome.ok = failures.is_empty();
+    outcome.message = report(&parts, &failures);
+    outcome.with_skipped(skipped)
 }
 
 /// Work out what renaming `entry` to `name` means, without touching the disk
@@ -1480,6 +1665,7 @@ mod tests {
             &gio::File::for_path(from.path()),
             &gio::File::for_path(&target),
             false,
+            &Brake::new(),
         )
         .expect("a folder should copy");
         assert_eq!(
@@ -1493,7 +1679,8 @@ mod tests {
     fn removing_a_folder_takes_what_is_inside_it() {
         let root = tempfile::tempdir().expect("a folder to lose");
         tree(root.path());
-        remove_all(&gio::File::for_path(root.path())).expect("a tree should be removable");
+        remove_all(&gio::File::for_path(root.path()), &Brake::new())
+            .expect("a tree should be removable");
         assert!(!root.path().exists(), "the folder itself should go too");
     }
 
@@ -1505,10 +1692,10 @@ mod tests {
         // Whether this filesystem has a trash directory depends on where the
         // temporary folder is; either answer is a success, and the row must be
         // gone for both.
-        discard_one(&dir).expect("a folder should be discardable");
+        discard_one(&dir, &Brake::new()).expect("a folder should be discardable");
         assert!(!root.path().join("deep").exists());
         let plain = gio::File::for_path(root.path().join("notes.txt"));
-        discard_one(&plain).expect("a file should be discardable");
+        discard_one(&plain, &Brake::new()).expect("a file should be discardable");
         assert!(!root.path().join("notes.txt").exists());
     }
 
@@ -1536,7 +1723,7 @@ mod tests {
             )],
             ..Plan::default()
         };
-        paste(&queue.handle(), plan, Transfer::Move);
+        paste(&queue.handle(), &Jobs::new(), plan, Transfer::Move);
         let outcome = operated(&queue);
         assert!(outcome.ok, "{}", outcome.message);
         assert!(root.path().join("copied.txt").exists());
@@ -1561,7 +1748,7 @@ mod tests {
             )],
             ..Plan::default()
         };
-        paste(&queue.handle(), plan, Transfer::Copy);
+        paste(&queue.handle(), &Jobs::new(), plan, Transfer::Copy);
         let outcome = operated(&queue);
         assert!(outcome.ok, "{}", outcome.message);
         assert_eq!(
@@ -1585,7 +1772,7 @@ mod tests {
             file(root.path(), "gone.txt"),
         ];
         let queue = Queue::without_source().expect("a pipe can be made");
-        discard(&queue.handle(), &rows, true);
+        discard(&queue.handle(), &Jobs::new(), &rows, true);
         let outcome = operated(&queue);
         // The third row was never on disk, which is a failure worth reporting —
         // but the two that were must still be counted and the folder still named.
@@ -1604,7 +1791,12 @@ mod tests {
     #[test]
     fn an_empty_paste_answers_without_a_worker() {
         let queue = Queue::without_source().expect("a pipe can be made");
-        paste(&queue.handle(), Plan::default(), Transfer::Copy);
+        paste(
+            &queue.handle(),
+            &Jobs::new(),
+            Plan::default(),
+            Transfer::Copy,
+        );
         let outcome = operated(&queue);
         assert!(!outcome.ok);
         assert_eq!(outcome.message, "Nothing to paste.");
@@ -1738,7 +1930,7 @@ mod tests {
         );
         assert!(answered.steps[0].replace);
         let queue = Queue::without_source().expect("a pipe can be made");
-        paste(&queue.handle(), answered, Transfer::Copy);
+        paste(&queue.handle(), &Jobs::new(), answered, Transfer::Copy);
         let outcome = operated(&queue);
         assert!(outcome.ok, "{}", outcome.message);
         assert_eq!(
@@ -1765,7 +1957,7 @@ mod tests {
             Location::file(root.path().join("dest").join("notes (2).txt"))
         );
         let queue = Queue::without_source().expect("a pipe can be made");
-        paste(&queue.handle(), answered, Transfer::Copy);
+        paste(&queue.handle(), &Jobs::new(), answered, Transfer::Copy);
         let outcome = operated(&queue);
         assert!(outcome.ok, "{}", outcome.message);
         assert_eq!(
@@ -1866,6 +2058,7 @@ mod tests {
         // The plan goes in straight from `plan`, conflicts and all.
         paste(
             &queue.handle(),
+            &Jobs::new(),
             plan(&sources, &into, Transfer::Copy),
             Transfer::Copy,
         );
@@ -1902,7 +2095,7 @@ mod tests {
         );
         assert!(answered.steps[0].replace);
         let queue = Queue::without_source().expect("a pipe can be made");
-        paste(&queue.handle(), answered, Transfer::Copy);
+        paste(&queue.handle(), &Jobs::new(), answered, Transfer::Copy);
         let outcome = operated(&queue);
         assert!(outcome.ok, "{}", outcome.message);
         let box_path = into.join("box");
@@ -1929,8 +2122,11 @@ mod tests {
     fn operated(queue: &Queue) -> Outcome {
         for _ in 0..2000 {
             for event in queue.take() {
-                if let Event::Operation { outcome } = event {
-                    return outcome;
+                match event {
+                    Event::Operation { outcome } | Event::JobFinished { outcome, .. } => {
+                        return outcome;
+                    }
+                    _ => {}
                 }
             }
             std::thread::sleep(std::time::Duration::from_millis(5));

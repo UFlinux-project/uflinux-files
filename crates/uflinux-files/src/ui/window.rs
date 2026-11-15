@@ -41,6 +41,7 @@ use super::conflict;
 use super::connect;
 use super::extract;
 use super::job::{Event, Handle, Queue};
+use super::jobs::Jobs;
 use super::openwith;
 use super::ops;
 use super::panel::{Panel, Place, Usage};
@@ -121,17 +122,8 @@ pub fn open(app: &gtk::Application, urls: &[String]) {
         reading: Cell::new(false),
     });
 
-    // The presentations that are not the grid/list stack. Columns is a sibling
-    // of the view rather than a child of it, because it keeps one model per
-    // folder instead of one model for the window.
-    let modes = gtk::Stack::new();
-    modes.add_named(view.widget(), Some("view"));
-    modes.add_named(columns.widget(), Some("columns"));
-    modes.set_hexpand(true);
-    modes.set_vexpand(true);
-    if mode == ViewMode::Columns {
-        modes.set_visible_child_name("columns");
-    }
+    // The presentations that are not the grid/list stack.
+    let modes = mode_stack(&view, &columns, mode);
 
     let ctx = Ctx {
         window: window.downgrade(),
@@ -148,6 +140,7 @@ pub fn open(app: &gtk::Application, urls: &[String]) {
         handle: Rc::new(RefCell::new(None)),
         popup: Rc::clone(&popup),
         preview: Rc::clone(&preview),
+        jobs: Rc::new(Jobs::new()),
         thumbs: thumbs.clone(),
         // Filled in right after the queue, because the answer to a change is a
         // re-read and a re-read needs somewhere to report to.
@@ -183,6 +176,7 @@ pub fn open(app: &gtk::Application, urls: &[String]) {
     wire_handlers(&panel, &view, &columns, &ctx);
 
     wire_actions(app, &window, &ctx);
+    wire_jobs(&ctx);
     wire_close(&window, &shared);
 
     app.add_window(&window);
@@ -203,6 +197,23 @@ pub fn open(app: &gtk::Application, urls: &[String]) {
             _preview: preview,
         });
     });
+}
+
+/// The two presentations, in a stack that shows whichever one the preferences
+/// say this folder should use.
+///
+/// Columns is a sibling of the view rather than a child of it, because it keeps
+/// one model per folder instead of one model for the window.
+fn mode_stack(view: &View, columns: &Columns, mode: ViewMode) -> gtk::Stack {
+    let modes = gtk::Stack::new();
+    modes.add_named(view.widget(), Some("view"));
+    modes.add_named(columns.widget(), Some("columns"));
+    modes.set_hexpand(true);
+    modes.set_vexpand(true);
+    if mode == ViewMode::Columns {
+        modes.set_visible_child_name("columns");
+    }
+    modes
 }
 
 /// Save preferences and drop the window from the list that keeps its widgets
@@ -244,11 +255,33 @@ fn wire_find(ctx: &Ctx) {
     });
 }
 
+/// Tie the job strip to the action that stops the jobs it reports.
+///
+/// The strip's Cancel button carries `win.cancel`, and the action is registered
+/// disabled. What is left is the rule connecting the two: the button is sensitive
+/// exactly while something runs, which the table reports rather than the window,
+/// because a job can finish on a worker at any moment and the window has no other
+/// way to notice.
+fn wire_jobs(ctx: &Ctx) {
+    let window = ctx.window.clone();
+    ctx.jobs.on_change(move |running| {
+        if let Some(window) = window.upgrade() {
+            enable(&window, "cancel", running);
+        }
+    });
+}
+
 /// The window's body: the error strip, the search bar, the sidebar beside the
 /// presentations, and the status line.
 fn build_content(ctx: &Ctx, panel: &Panel, view: &View) -> gtk::Box {
     let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
     content.append(&ctx.banner);
+    // Directly under the error strip, above everything that moves: a job that
+    // takes long enough to need reporting takes long enough that the user is
+    // looking at the folder it is working on, and a strip that pushed the
+    // listing around as it appeared would be a worse interruption than the one it
+    // reports. It is invisible until a job is registered, so it costs nothing.
+    ctx.jobs.install(&content);
     // Under the header rather than in it: the bar carries a scope selector and a
     // status line, which is too wide for a header bar and too tall for a
     // toolbar. It is hidden until asked for, so it costs nothing otherwise.
@@ -295,6 +328,12 @@ struct Ctx {
     popup: Rc<Popup>,
     /// The spacebar preview, for the same reason and by the same argument.
     preview: Rc<Preview>,
+    /// The operations this window has running, and the strip that says so.
+    ///
+    /// `Rc` because the handlers that start a job and the strip's own widgets
+    /// both need it, and `Jobs` is not `Clone` — the table inside is one per
+    /// window, which is also the unit a Cancel button speaks for.
+    jobs: Rc<Jobs>,
     /// The folders this window has on screen, watched. `None` when the kernel
     /// refused an inotify instance, which leaves the window refreshing on
     /// navigation alone exactly as it did before there were watches.
@@ -704,6 +743,19 @@ fn apply(ctx: &Ctx, event: Event) {
     // than against the window's current folder: a parent column's listing is not
     // for the folder in the title bar, and the check below would drop it.
     ctx.columns.apply(&event);
+    // The two job events are answered before the view is looked for. Neither is
+    // about a listing, and a window whose grid had gone away still has to hear
+    // that a copy it started has finished — otherwise the strip would report a
+    // job that had already stopped, with no way left to clear it.
+    if let Event::Progress { report } = event {
+        ctx.jobs.apply(&report);
+        return;
+    }
+    if let Event::JobFinished { id, outcome } = event {
+        ctx.jobs.finish(id);
+        operated(ctx, outcome);
+        return;
+    }
     let Some(view) = ctx.view.upgrade() else {
         return;
     };
@@ -759,6 +811,10 @@ fn apply(ctx: &Ctx, event: Event) {
         }
         Event::Mounted { report } => mounted(ctx, report),
         Event::Operation { outcome } => operated(ctx, outcome),
+        // Already answered above, before the view was looked for. The arm exists
+        // because the match has to say something about every event, and a wildcard
+        // here would swallow a future variant instead of asking about it.
+        Event::Progress { .. } | Event::JobFinished { .. } => {}
         // Not about a folder, so no location to match against the window: the
         // token says which widget asked, and the pipeline knows whether that
         // widget is still showing the file it asked about.
@@ -1726,7 +1782,7 @@ fn op_actions(ctx: &Ctx) -> Vec<Rc<gio::SimpleAction>> {
             // Not `ops::paste`: a plan that ran into a name the folder already
             // has has to ask before it writes anything, and the window is the
             // only thing here that can show the question.
-            conflict::paste(&window, &handle, plan, transfer);
+            conflict::paste(&window, &handle, &ctx.jobs, plan, transfer);
         }
     });
 
@@ -1740,9 +1796,15 @@ fn op_actions(ctx: &Ctx) -> Vec<Rc<gio::SimpleAction>> {
             let Some(container) = extract_target(&ctx) else {
                 return;
             };
-            extract::extract(&handle, container);
+            extract::extract(&handle, &ctx.jobs, container);
         }
     });
+
+    // Registered disabled, and enabled by the table's own change callback rather
+    // than by a sync function: unlike the other actions here, the answer to "is
+    // there a job to stop?" changes while the window sits still, because a worker
+    // finishes whenever it finishes. See [`cancel_action`].
+    let cancel = cancel_action(ctx);
 
     let facts = gio::SimpleAction::new("properties", None);
     facts.connect_activate({
@@ -1790,9 +1852,26 @@ fn op_actions(ctx: &Ctx) -> Vec<Rc<gio::SimpleAction>> {
         pickup_action("cut", ops::Transfer::Move, ctx),
         Rc::new(paste),
         Rc::new(unpack),
+        cancel,
         Rc::new(chooser),
         Rc::new(facts),
     ]
+}
+
+/// `cancel`: stop everything this window has running.
+///
+/// Built disabled. The window does not enable it from a sync function the way the
+/// other file commands are synced, because a job ends on a worker at a moment the
+/// window is not involved in; [`wire_jobs`] connects the action to the job table
+/// itself, which is the only thing that always knows.
+fn cancel_action(ctx: &Ctx) -> Rc<gio::SimpleAction> {
+    let cancel = gio::SimpleAction::new("cancel", None);
+    cancel.set_enabled(false);
+    cancel.connect_activate({
+        let jobs = Rc::clone(&ctx.jobs);
+        move |_action, _parameter| jobs.pull_all()
+    });
+    Rc::new(cancel)
 }
 
 /// Which row the "Open With" chooser would be opened for, mirroring the
@@ -1892,7 +1971,7 @@ fn discard_action(name: &'static str, permanent: bool, ctx: &Ctx) -> Rc<gio::Sim
             if picked.is_empty() {
                 return;
             }
-            ops::discard(&handle, &picked, permanent);
+            ops::discard(&handle, &ctx.jobs, &picked, permanent);
         }
     });
     Rc::new(action)

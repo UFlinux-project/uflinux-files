@@ -87,6 +87,23 @@ pub enum Event {
     /// already decoded and already cut down, because a worker that read a whole
     /// 2 MiB document into a popover would cost more than the popover is worth.
     Preview { token: u64, text: Option<String> },
+    /// Where a file operation has got. The seventh variant that is not about a
+    /// folder, and the only one that arrives more than once per job: a worker
+    /// that is copying reports every so often (see [`super::jobs::Reporter`],
+    /// which is what enforces the pause between reports), and the window folds
+    /// each one into the strip it already showed. `report.id` names the job, so
+    /// a report that arrives after its job finished is dropped rather than
+    /// reopening a strip nobody is waiting for.
+    Progress { report: super::jobs::Progress },
+    /// A file operation is over, and here is what it did. The same shape as
+    /// [`Event::Operation`] — the outcome is worded for the banner and names the
+    /// folders it left behind — with a job id attached so the strip can be
+    /// struck off by the same event that paints the answer. `Operation` stays for
+    /// the refusals and one-shot reports that never had a job to show.
+    JobFinished {
+        id: super::jobs::JobId,
+        outcome: Outcome,
+    },
 }
 
 /// Closes a file descriptor when the last owner drops it, so a worker that

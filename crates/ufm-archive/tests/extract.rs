@@ -162,7 +162,7 @@ fn inside(path: &Path, inner: &[&str]) -> Location {
 
 /// Extract and insist, because a failure here is always worth reading about.
 fn unpack(location: &Location, into: &Path) -> Report {
-    extract(location, into, &Cancel::new())
+    extract(location, into, &Cancel::new(), None)
         .unwrap_or_else(|error| panic!("{location} -> {}: {error}", into.display()))
 }
 
@@ -786,7 +786,8 @@ fn a_cancelled_extract_reports_cancelled_and_leaves_the_folder_it_made() {
 
     let cancel = Cancel::new();
     cancel.cancel();
-    let error = extract(&root(&container), &into, &cancel).expect_err("a cancelled job fails");
+    let error =
+        extract(&root(&container), &into, &cancel, None).expect_err("a cancelled job fails");
     assert!(error.is_cancelled(), "{error}");
     assert!(
         !into.exists(),
@@ -805,7 +806,7 @@ fn a_cancelled_extract_keeps_a_destination_the_caller_already_had() {
 
     let cancel = Cancel::new();
     cancel.cancel();
-    extract(&root(&container), &into, &cancel).expect_err("a cancelled job fails");
+    extract(&root(&container), &into, &cancel, None).expect_err("a cancelled job fails");
     assert!(
         into.join("mine.txt").is_file(),
         "a folder the caller pointed at is not this call's to remove"
@@ -834,7 +835,8 @@ fn a_member_that_fails_leaves_nothing_under_its_own_name() {
     std::fs::create_dir(&into).expect("destination made first");
     let _path = OnlyPath::new(&[]);
 
-    let error = extract(&root(&container), &into, &Cancel::new()).expect_err("a bad member fails");
+    let error =
+        extract(&root(&container), &into, &Cancel::new(), None).expect_err("a bad member fails");
     let message = error.to_string();
     assert!(message.contains("z-bad.txt"), "{message}: names the member");
     assert!(
@@ -860,7 +862,7 @@ fn a_member_that_fails_leaves_nothing_under_its_own_name() {
 fn a_location_that_is_not_inside_a_container_is_refused() {
     let dir = tempfile::TempDir::new().expect("temp dir");
     let into = dir.path().join("out");
-    let error = extract(&Location::file(dir.path()), &into, &Cancel::new())
+    let error = extract(&Location::file(dir.path()), &into, &Cancel::new(), None)
         .expect_err("a plain folder is not a container");
     assert!(matches!(error, Error::InvalidLocation(_)), "{error}");
     assert!(!into.exists(), "a refusal does not create the destination");
@@ -875,6 +877,7 @@ fn a_member_the_container_does_not_hold_is_named() {
         &inside(&container, &["nowhere.txt"]),
         &dir.path().join("out"),
         &Cancel::new(),
+        None,
     )
     .expect_err("no such member");
     let message = error.to_string();

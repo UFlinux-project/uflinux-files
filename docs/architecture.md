@@ -197,6 +197,14 @@ inside an archive deliberately has no extract command; unpacking `docs/` and
 unpacking the card that holds it are different questions, and guessing wrong about
 which one was asked is worse than not offering it.
 
+Unpacking registers a job, so a large container reports members as they land
+rather than once at the end, and can be stopped. The library's progress callback
+counts members, which is the only unit an archive can count in before it is
+walked; the count of a subtree is known before the walk starts, so the fraction is
+real from the first member. A cancelled extract is reported as stopped rather than
+as failed, and the folder it was building is removed, which is the same promise the
+helper path makes.
+
 ## Mounts
 
 Nothing here speaks SMB, NFS or FTP. It plans a mount and runs it. See
@@ -261,10 +269,56 @@ a string and parsed, which leaves exactly two answers: a number, or nothing at
 all. A row that could not be read at all is shown as a folder with no size rather
 than as an empty one.
 
-What is deliberately not there yet: there is no progress reporting, so a large
-copy reports once at the end; and there is no undo. Both want a job record that a
-single operation does not need. Extracting an archive shares both gaps, and shares
-the reason: the command reports once, when it is over.
+## Progress and cancellation
+
+A copy that takes twenty seconds and says nothing for nineteen of them reads as a
+freeze, and a transfer the user cannot stop is one the user cannot trust. Both are
+the same problem — an operation that outlived the event that started it — so both
+are solved by one piece of state: a table of running jobs, held on the main thread,
+in `ui/jobs.rs`.
+
+A job is registered before its worker is spawned, so a job exists even if the
+thread never starts, and it is identified by a number rather than by a name. The
+worker reports through a `Reporter` that sends `Progress` events down the same
+self-pipe a directory listing uses, and the reporter drops a report unless a
+hundred milliseconds have passed since the last one. That throttle is the reason
+the main loop stays responsive during a transfer: a copy of ten thousand small
+files would otherwise send ten thousand wake-ups to redraw a bar that can show a
+change about ten times a second. The first report always goes through, so a job
+appears immediately, and totals travel with each report rather than being asked
+for, because a worker that knows its total already knows it at the first member.
+
+Progress is counted in one of two units, and the difference is not cosmetic. A
+delete of nine rows counts rows. A copy counts bytes when every source reported a
+size, and falls back to rows when any of them did not — a share that will not say
+how large a file is can still say that it copied one. Mixing the two would produce
+a bar that moves and a tally that does not add up, so a job picks one unit and
+reports in it, and the label reads `512 KiB of 1.0 MiB` or `4 of 9` accordingly. A
+job whose total is unknown shows an idle bar and a label with no fraction, which is
+honest in a way a fake percentage is not.
+
+Cancellation is a pair, because the two halves of the codebase read cancellation
+differently. GIO calls take a `GCancellable`; `ufm-archive` and the listings take
+`ufm_vfs::Cancel`. A `Brake` holds both and is pulled by pulling both, so no call
+site has to know which kind it is given. Each running job holds the brakes handed
+to it, and one hidden action, `cancel`, pulls every brake on the table. It is
+disabled while the table is empty, which is what makes the strip's visibility and
+the action's sensitivity the same fact reported twice rather than two facts that
+can disagree.
+
+What the user sees is one strip above the listing, showing the oldest job: what it
+is doing, which item it is on, how far along it is, and a cancel button. The strip
+is hidden when the table is empty, and the table is the only reason it is shown —
+there is no timer, no fade, and no state to expire. Showing the oldest job rather
+than the newest is a deliberate loss of information: a user watching a queue wants
+to know when the wait ends, and the count of what is behind it is in the label.
+
+What is deliberately not there yet is undo. The record a job keeps is the record
+undo needs — what moved where, and what was displaced — and it is kept while a job
+runs and then reported once, so the step from this to undo is to keep it. What is
+not there is the inverse: a trash operation knows what it trashed, but a move that
+overwrote a file did not keep the bytes it replaced, and an undo that cannot
+restore the displaced file is a redo of the mistake rather than its reversal.
 
 ## Search
 

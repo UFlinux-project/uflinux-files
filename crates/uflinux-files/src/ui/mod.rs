@@ -25,6 +25,7 @@ mod connect;
 mod css;
 mod extract;
 mod job;
+mod jobs;
 mod openwith;
 mod ops;
 mod panel;

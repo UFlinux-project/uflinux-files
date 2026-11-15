@@ -348,14 +348,19 @@ impl Columns {
             // again — it belongs to a dialog, not to a pane. So does a member
             // written out of an archive, which belongs to the chooser that asked.
             // So does a text head, which belongs to the preview popover and is
-            // looked up there by its token.
+            // looked up there by its token. So does a progress report and a
+            // job's ending, both of which belong to the strip rather than to a
+            // pane — and a pane that re-read itself on every report would spend
+            // a copy re-reading the folder it is copying into.
             Event::Batch { .. }
             | Event::Mounted { .. }
             | Event::Operation { .. }
             | Event::Thumb { .. }
             | Event::Sized { .. }
             | Event::Materialised { .. }
-            | Event::Preview { .. } => {}
+            | Event::Preview { .. }
+            | Event::Progress { .. }
+            | Event::JobFinished { .. } => {}
             Event::Finished {
                 location, entries, ..
             } => {

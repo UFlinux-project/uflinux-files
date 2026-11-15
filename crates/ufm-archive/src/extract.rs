@@ -84,6 +84,16 @@ impl Report {
     }
 }
 
+/// One word from an extraction about a member it has just written: how many are
+/// down, how many the walk intends to write, and how many bytes have landed.
+///
+/// The count is a count of members rather than of bytes because that is what an
+/// extraction can know before it starts: a container's table of contents lists every
+/// member it holds, so the whole is a number of rows, and the bytes only add up as
+/// they are decompressed. A caller wanting a byte total would have to decompress the
+/// container to find one.
+pub type Progress<'a> = &'a mut dyn FnMut(usize, usize, u64);
+
 /// Extract what `location` names into a new folder `into`.
 ///
 /// The caller picks the name, which is its job: only the view knows what is
@@ -96,7 +106,18 @@ impl Report {
 /// share and there is no way back to its type. The cost is one table-of-contents
 /// scan: a pass over the index with nothing decompressed, which is noise beside the
 /// write it is about to make.
-pub fn extract(location: &Location, into: &Path, cancel: &Cancel) -> Result<Report> {
+///
+/// `progress`, when given, is called once per member written. It goes un-called on
+/// the fast path: handing the container to `unzip` or `tar` is what makes extracting
+/// a 4 GiB file cheap, and a child process that reports nothing is the price of
+/// that. A caller showing a bar therefore has to be able to say "Extracting" without
+/// a percentage, which is why the callback is offered rather than required.
+pub fn extract(
+    location: &Location,
+    into: &Path,
+    cancel: &Cancel,
+    progress: Option<Progress<'_>>,
+) -> Result<Report> {
     let container = location
         .archive_path()
         .ok_or_else(not_an_archive(location))?;
@@ -125,6 +146,8 @@ pub fn extract(location: &Location, into: &Path, cancel: &Cancel) -> Result<Repo
         bytes: 0,
         skipped: Vec::new(),
         dirs: Vec::new(),
+        whole: 0,
+        progress,
     };
     match job.run() {
         Ok(()) => Ok(job.report(into)),
@@ -146,7 +169,12 @@ fn not_an_archive(location: &Location) -> impl FnOnce() -> Error {
 
 /// One extraction in progress: what is being read, where it is going, and what has
 /// been written so far.
-struct Job<'a> {
+///
+/// Two lifetimes rather than one, because the two borrows have different lengths
+/// and neither can be stretched to match the other: the container belongs to this
+/// module's own local, while the callback belongs to the caller and outlives the
+/// call. A single lifetime would demand that the shorter one be the longer.
+struct Job<'a, 'p> {
     opened: &'a Opened,
     toc: &'a Toc,
     /// The member being extracted: the root for a whole container.
@@ -160,9 +188,13 @@ struct Job<'a> {
     /// after their contents, because a folder written down at `0500` cannot have
     /// anything created inside it.
     dirs: Vec<(PathBuf, Option<u32>, Option<SystemTime>)>,
+    /// How many members the walk ahead intends to write, so a report can say how
+    /// far along it is. Zero until the walk is known.
+    whole: usize,
+    progress: Option<Progress<'p>>,
 }
 
-impl Job<'_> {
+impl Job<'_, '_> {
     fn run(&mut self) -> Result<()> {
         if self.at == Toc::ROOT && self.whole_archive()? {
             self.written = self.toc.len().saturating_sub(1);
@@ -170,8 +202,12 @@ impl Job<'_> {
             return Ok(());
         }
         // Parents before children, which is what lets a file be written into a
-        // folder that appears earlier in the same walk.
-        for index in self.toc.subtree(self.at) {
+        // folder that appears earlier in the same walk. Collected up front rather
+        // than iterated lazily, which is also what makes the total a caller can be
+        // told: the walk's length is knowable before the first member is written.
+        let walk = self.toc.subtree(self.at);
+        self.whole = walk.iter().filter(|index| **index != Toc::ROOT).count();
+        for index in walk {
             if index == Toc::ROOT {
                 continue;
             }
@@ -244,6 +280,14 @@ impl Job<'_> {
             NodeKind::Special => self
                 .skipped
                 .push(format!("{name}: not a file or a folder.")),
+        }
+        // Said after the member landed rather than before, so a caller counting
+        // reports never counts one for a member that is not there. A skipped member
+        // reports too: it is a member the walk is finished with either way, and a
+        // bar that never reaches its own total looks like an extract that stalled.
+        let tally = (self.written, self.whole, self.bytes);
+        if let Some(progress) = self.progress.as_mut() {
+            progress(tally.0, tally.1, tally.2);
         }
         Ok(())
     }
