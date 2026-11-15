@@ -272,6 +272,72 @@ the boring case: `recently-used.xbel` is parsed into a list of paths, each one i
 ordinary listing. Recent files *are* files, so only the source of the list is
 unusual. `starred://` has the same shape and its own section below.
 
+## What a mount row offers
+
+A mount row is the second row in the sidebar that answers for itself, and its menu is
+built differently because the row is answering for something the file manager does not
+control. A bookmark's four rows are a function of the record: the record exists, so
+Rename, Move Up, Move Down and Remove are all always true of it. A share's rows are a
+function of what the kernel says about its mount point *right now*, and the three states
+give three different answers — `Mounted` offers Disconnect, `Stale` offers Disconnect and
+Forget, `Absent` offers Reconnect and Forget. `panel::menu_for` takes all of that from the
+`Place` itself: `Place::Mount` carries the record's id, its label, the state the row was
+built from and whether a password is on disk, which is why the function stays a lookup
+rather than a call back into the window. `MountState` derives `Hash` for exactly this
+reason — a state that a row is allowed to remember has to be a state a row is allowed to
+carry.
+
+Two of those pairings are worth stating, because both look like omissions. A `Stale` row
+has no Reconnect: the mount point still has a kernel entry over a dead endpoint, so
+mounting again cannot succeed until that entry is gone, and the row that clears it is
+Disconnect — offering both would offer a command known to fail. An `Absent` row has no
+Disconnect for the opposite reason: there is nothing to detach, and a row that reports
+success for work there was no need to do teaches the user nothing.
+
+Reconnect is offered only when it can be answered without asking anyone anything, which
+is `Runner::can_reconnect`: the two protocols that authenticate without a password (NFS
+with the client's identity, SFTP with a key) always qualify, the three that take one
+(SMB, WebDAV, FTP) only when a password was saved. The alternative — always offer the row
+and prompt when the password turns out to be missing — was rejected because Reconnect
+exists to be the row that costs one click, and a row that opens a dialog is a different
+command wearing its name. It also means the row can be wrong in exactly one direction: if
+the password was dropped from another window while the menu sat open, the mount fails and
+the backend's own reason lands in the banner, which is the same path a wrong answer takes
+everywhere else.
+
+Every row targets the record's id rather than its position, for the reason a bookmark row
+targets its URI: a position is a fact about a rendering, and a menu can sit open across a
+rebuild that changes it. The id outlives the rebuild or names nothing, and the three
+actions are STRING-targeted and never disabled — the menu is the gate, so the honest
+answer to a request about a share that has gone is a banner saying so rather than a
+greyed row that never explains itself.
+
+Disconnect reuses the card's path: a worker, `Event::Unmounted`, and a repaint from the
+event that also fixes the cards. Reconnect runs on a worker too and reports through
+`Event::Mounted`, which is what keeps a row that just started working from claiming
+otherwise. Forget runs inline, because dropping a line from a JSON file the window already
+holds needs no thread — and because it is the one row of the three that has to be careful.
+`Runner::forget_share` re-reads mountinfo before acting and refuses a share the kernel
+still reports `Mounted`: the record is the only handle on a live mount, and deleting it
+would leave a mount point no window can eject any more. A `Stale` share is allowed
+through without a detach, which is the useful case — the entry is dead, the user wants the
+row gone, and the sweep at next session start detaches what is left.
+
+One builder, `mount_place`, produces a mount `Place` for the sidebar, for the selection
+and for the usage map, and that is a correctness rule rather than tidiness. `Place` is
+compared by value in two places: `Panel::select` matches a place against the rows it was
+handed, and the usage map is keyed by it. A second builder that assembled the same share
+with one field differing — a state read a moment later, say — would silently produce a row
+that cannot be selected and a capacity line that never appears, with nothing failing to
+say so.
+
+A command repaints the window that ran it, and only that window. A second window keeps the
+card and the row it was given until something makes it rebuild, which is how an unmount
+already behaved and is unchanged here; the harness leaves the Computer window open across
+a Forget on purpose, so the boundary is at least written down somewhere a person can read
+it. Closing it from the harness would have asserted the current behaviour without making
+it better, and cross-window invalidation is a separate decision with a bus in its way.
+
 ## Stars
 
 A star is not a file attribute. Nothing on disk says that a row was starred, so
@@ -374,11 +440,11 @@ mounts, and re-highlights the current place afterwards because a rebuild drops t
 selection. Nothing is re-read from disk: unlike a star, which changes what a listing
 says about itself, a bookmark changes only the sidebar.
 
-A bookmark row is also the only row in the sidebar that can answer for itself. A
-right-click on one offers Rename, Move Up, Move Down and Remove; nothing else gets a
-menu, because the standard places are derived — renaming `Home` would be a name with
-nothing attached to it — and a mount has a dialog of its own with a Disconnect button
-already in it. `panel::menu_for` says which rows a place gets, and `popup::MenuRow` is
+A bookmark row is one of the two rows in the sidebar that can answer for itself; a
+mount row is the other, covered above beside the My Computer view. A right-click on a
+bookmark offers Rename, Move Up, Move Down and Remove; the standard places get no menu,
+because they are derived — renaming `Home` would be a name with nothing attached to it.
+`panel::menu_for` says which rows a place gets, and `popup::MenuRow` is
 what a row looks like. The type lives with the menu builder rather than with the
 sidebar for the same reason `Command` does: the popup builds a model from rows, reads a
 built model back apart, and owns the one popover a window has, and none of that needs to

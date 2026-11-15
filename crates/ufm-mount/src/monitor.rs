@@ -46,7 +46,11 @@ impl MountPoint {
 }
 
 /// The answer about one mount point.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// `Hash` so a sidebar row can carry the answer it was built from: the rows are
+/// kept in a set and compared by value, and a mount row's menu depends on this
+/// answer, so it is part of the row's identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum MountState {
     /// The kernel has it and, for FUSE, the daemon answers.
     Mounted,

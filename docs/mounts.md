@@ -188,6 +188,24 @@ nothing answers there — a FUSE daemon that died leaves exactly this) and
 `fusermount -u` for FUSE and the helper for the two kernel filesystems, and the
 UI says so rather than retrying a mount that would fail the same way.
 
+The state is also what a share's sidebar row is allowed to offer, so the three
+cases are a menu rather than only a label: `Mounted` offers Disconnect, `Stale`
+offers Disconnect and Forget, `Absent` offers Reconnect — when its password is
+already on disk — and Forget. See *What a mount row offers* in
+`docs/architecture.md`.
+
+Reconnect reuses the stored record and the stored password and takes no new
+input, which is why the row is only offered when the answer is already known;
+`Runner::can_reconnect` is that question. A failure is recorded in the record's
+`last_error` and shown in the window that asked, so a share that cannot come
+back says why beside its own row instead of looking like a card that ignores
+being clicked.
+
+Forget drops the record without detaching, and refuses a share the kernel still
+reports `Mounted` — the record is the only handle on a live mount, and losing it
+strands a mount point no window can eject. A `Stale` share is dropped without a
+detach and left to the next sweep.
+
 ## Cleaning up: `--sweep-mounts`
 
 Run at session start, before the window appears. It reads the table, reads
@@ -195,6 +213,9 @@ mountinfo, and looks at the mount root and the credential directory. For each
 discrepancy it records an action and the evidence for it:
 
 - a mount in the table that the kernel does not agree with → detach it
+  (`Absent` records are left alone: reconnecting is a user action, not a
+  cleanup, and a share listed but not yet connected is a row rather than a
+  leftover)
 - a directory under the mount root with no entry in the table → remove it if empty
 - a `.conf` file with no matching mount → remove it, since it may be a password
 - a mount idle past `--idle-after` → detach it

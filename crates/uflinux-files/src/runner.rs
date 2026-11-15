@@ -153,11 +153,6 @@ impl Runner {
     }
 
     #[must_use]
-    pub fn layout(&self) -> &Layout {
-        &self.layout
-    }
-
-    #[must_use]
     pub fn table(&self) -> &MountTable {
         &self.table
     }
@@ -316,6 +311,26 @@ impl Runner {
         self.store.get(share).is_some()
     }
 
+    /// Whether [`Self::reconnect`] could finish without asking anyone anything,
+    /// which is what decides whether a Reconnect row is worth offering.
+    ///
+    /// Reconnect deliberately has no password argument: it exists to be the row
+    /// that costs a click, so a share whose password was never saved can only
+    /// fail, and a row that is known in advance to fail should not be on screen.
+    /// The two protocols that authenticate without one — NFS with the client's
+    /// identity, SFTP with a key — are therefore always reconnectable, and the
+    /// three that take one only when something was stored. An empty stored
+    /// password counts as nothing stored, which matches [`Self::mount`]: it
+    /// would refuse the same share for the same reason.
+    ///
+    /// This settles the credential half only. Whether the share is still listed,
+    /// and whether its mount point is already alive, are the caller's questions,
+    /// because the caller is the thing holding the kernel's answer.
+    #[must_use]
+    pub fn can_reconnect(&self, share: &Share) -> bool {
+        !share.protocol.uses_password() || self.has_password(share)
+    }
+
     /// Clean up after mounts that are no longer mounts: detach what the scan says
     /// should go, remove what needs no command, and account for both.
     ///
@@ -393,14 +408,33 @@ impl Runner {
         self.table.add(share)
     }
 
-    /// Stop listing a share, detaching nothing. Used when a card is removed and
-    /// the share turns out not to be connected.
-    pub fn forget_share(&mut self, id: &str) -> bool {
-        let had = self.table.get(id).is_some();
-        if had {
-            self.retire(id);
+    /// Stop listing a share, detaching nothing that is in use.
+    ///
+    /// The refusal matters. A share the kernel says is mounted keeps its record,
+    /// for the reason [`Self::unmount`] gives for keeping a record when a detach
+    /// fails: a mount point with no card and no row is one nobody can let go of
+    /// again from this window, which is worse than a row that will not go away.
+    /// A stale mount point is a different answer — there is nothing mounted to
+    /// strand, and the directory is the leftover the sweep exists for — so a
+    /// dead share is dropped without argument.
+    ///
+    /// The state is asked of a fresh read rather than of whatever the last
+    /// listing saw, because the question is being asked of a menu that may have
+    /// been open while the share was connecting somewhere else.
+    #[must_use]
+    pub fn forget_share(&mut self, id: &str) -> Report {
+        let Some(record) = self.table.get(id).cloned() else {
+            return Report::done(id, "that share is no longer listed");
+        };
+        self.observer.reload();
+        if self.observer.state(&record.mountpoint) == MountState::Mounted {
+            return Report::failed(
+                id,
+                format!("{} is still connected; disconnect it first", record.label()),
+            );
         }
-        had
+        self.retire(id);
+        Report::done(id, format!("{} is no longer listed", record.label()))
     }
 
     /// Build the plan for `share`, run it, then ask the kernel whether it worked.
@@ -1018,6 +1052,120 @@ mod tests {
         );
         let saved = fs::read_to_string(MountTable::path_at(&fixture.path("conf"))).expect("table");
         assert!(!saved.contains("hunter2"), "{saved}");
+    }
+
+    #[test]
+    fn forgetting_a_share_that_never_mounted_takes_the_row_and_the_link() {
+        let fixture = Fixture::new();
+        let share = share("smb://srv/share");
+        let mut runner = fixture.runner();
+        let id = runner.list(&share).id.clone();
+        let report = runner.forget_share(&id);
+        assert!(report.ok, "{}", report.message);
+        assert!(runner.table().get(&id).is_none(), "the record is gone");
+        let saved = fs::read_to_string(MountTable::path_at(&fixture.path("conf"))).expect("table");
+        assert!(!saved.contains(&id), "{saved}");
+    }
+
+    #[test]
+    fn forgetting_a_share_that_is_still_connected_refuses_and_keeps_the_row() {
+        let fixture = Fixture::new();
+        let share = share("sftp://host/data");
+        let target = point(&fixture, &share);
+        fixture.fuse_helper("sshfs", &target, "fuse.sshfs");
+        let mut runner = fixture.runner();
+        let id = runner.mount(&share, None).id.clone().expect("an id");
+        // The published link is the share's own, so a refusal that left it
+        // behind would leave a link to a record that is still there anyway.
+        let report = runner.forget_share(&id);
+        assert!(
+            !report.ok,
+            "a live share cannot be dropped out from under itself"
+        );
+        assert!(
+            report.message.contains("still connected"),
+            "{}",
+            report.message
+        );
+        assert!(runner.table().get(&id).is_some(), "the row stays");
+        assert!(
+            fixture.path("net").join(share.label()).is_symlink(),
+            "the share is still published, because it is still mounted"
+        );
+    }
+
+    #[test]
+    fn a_share_whose_mount_point_died_can_be_forgotten_without_detaching() {
+        let fixture = Fixture::new();
+        let share = share("sftp://host/data");
+        let target = point(&fixture, &share);
+        fixture.fuse_helper("sshfs", &target, "fuse.sshfs");
+        let mut runner = fixture.runner();
+        let id = runner.mount(&share, None).id.clone().expect("an id");
+        // The daemon died: the mount table still names the point, and the point
+        // no longer answers. Nothing is mounted to strand, so the row goes.
+        fs::remove_dir(&target).expect("the mount point goes away");
+        assert_eq!(runner.state(&id), MountState::Stale);
+        let report = runner.forget_share(&id);
+        assert!(report.ok, "{}", report.message);
+        assert!(runner.table().get(&id).is_none(), "the dead row is gone");
+        assert!(
+            !fixture.path("net").join(share.label()).exists(),
+            "the link to a share nobody can reach is taken away too"
+        );
+    }
+
+    #[test]
+    fn forgetting_a_share_that_is_not_listed_says_so_rather_than_failing() {
+        let fixture = Fixture::new();
+        let mut runner = fixture.runner();
+        let report = runner.forget_share("smb-gone-000000");
+        assert!(report.ok, "the state asked for is the state already in");
+        assert!(runner.table().is_empty());
+    }
+
+    #[test]
+    fn only_a_share_with_a_password_on_disk_is_worth_offering_to_reconnect() {
+        let fixture = Fixture::new();
+        let runner = fixture.runner();
+        // The two protocols that authenticate without a password are always
+        // reconnectable, and asking would be the wrong question for them.
+        assert!(runner.can_reconnect(&share("nfs://srv/export")));
+        assert!(runner.can_reconnect(&share("sftp://host/data")));
+        // The three that take one are reconnectable only once it is stored;
+        // without it, `mount` refuses the share before reaching the network and
+        // the row would be a promise the menu knew it could not keep.
+        let smb = share("smb://user@srv/share");
+        let webdav = share("davs://host/files");
+        let ftp = share("ftp://user@host/pub");
+        for share in [&smb, &webdav, &ftp] {
+            assert!(!runner.can_reconnect(share), "{}", share.display());
+        }
+        runner
+            .remember(&smb, Some(Secret::from("hunter2")))
+            .expect("store");
+        assert!(runner.can_reconnect(&smb), "stored, so one click is enough");
+        // An empty answer is still an answer: it is what a user who pressed
+        // Connect without typing chose to save.
+        runner
+            .remember(&webdav, Some(Secret::from("")))
+            .expect("store");
+        assert!(
+            !runner.can_reconnect(&webdav),
+            "an empty stored password is the same answer as none, which is what \
+             `mount` already decides"
+        );
+        // An anonymous share written `guest@` is a user with no password, which
+        // the cifs backend refuses for exactly that reason — so the store's empty
+        // answer is the right answer here, and the row is left out honestly rather
+        // than by luck. A truly anonymous share is written without a user at all,
+        // and that one is reconnected by the Connect dialog, which is where a
+        // share with no record of its own is mounted anyway.
+        assert!(
+            !runner.can_reconnect(&share("smb://guest@srv/share")),
+            "{}",
+            "a password is needed to mount as guest, so a one-click row would fail"
+        );
     }
 
     #[test]

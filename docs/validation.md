@@ -42,8 +42,9 @@ error type is named in the signature does not need an essay per method.
 | `uflinux-files` | the location on argv reaches the window; `--new-window` gives up being the single instance; the application id matches the desktop entry; a machine with no render node is asked for the cairo renderer, and an explicit `GSK_RENDERER` is never overridden; a paste plan drops the rows that cannot land and names the reason for each, growing `report (2).pdf` rather than replacing; copying a folder takes its contents and deleting one takes what is inside it; a prompt refuses an empty name, hands the typed name over exactly once, and pre-selects the stem of a filename but not its extension; a properties form draws a row only for a fact the entry actually has, spells one file without an `s`, says *at least* for a stopped walk, and holds the size row for a folder so the answer can be delivered into it or dropped when the dialog is gone; the Open With list is deduplicated by desktop entry, drops an entry that asked not to be shown, keeps a fallback when nothing is registered for the type, and names a file whose type nothing owns; a member of an archive is written out under its own name with its own bytes and a second one of the same name does not clobber the first, while a folder inside an archive is refused rather than written as a zero-byte file; a week-old write-out is swept; and a menu over one file offers Open With where a menu over a folder does not; a preview reads only the head of a file, refuses a binary by its `NUL` byte rather than by its extension, says `(empty file)` for an empty one and `(cannot be shown)` for an unreadable one, and takes text from a `JSON`, `XML` or shell script whose registration hides it under `application/`; arriving at columns mode paints the deepest pane from the listing the window already holds, and a read that was already running still overwrites those provisional rows when it answers; a row's star badge is built hidden and is shown only by painting, and a factory's widgets are read back apart by CSS class rather than by position, so the badge cannot be taken for the icon it sits on; restamping a row follows the store in both directions and leaves the row's name alone; a menu over one starred row is offered the row that takes the star back off, and a menu whose selection is only partly starred is offered the one that puts stars on rather than the one that would half-undo them; a bookmark row is spliced into the folder rows rather than appended after them, which is asserted by counting runs of the folder group because a heading is drawn wherever the group changes; a menu over a bookmarked folder is offered the row that takes the bookmark off, and a menu in an older column is offered neither bookmark row because it cannot say which folder it would bookmark; the
 rows a bookmark offers are exactly Rename, Move Up, Move Down and Remove, each
 aimed at that bookmark's own URI rather than at a position, and a row for a place
-that cannot answer for itself — Home, Trash, a plain folder, a mount — is offered
+that cannot answer for itself — Home, Trash, a plain folder — is offered
 no rows at all, which opens no popover. |
+| `uflinux-files` (mount rows) | the rows a share's row offers follow the state the row was built from and nothing else: a connected share gets Disconnect, a share whose kernel entry died gets Disconnect and Forget, a share that is listed without being mounted gets Reconnect and Forget; Reconnect is left off a share that would have to be asked for a password, and a `Stale` share is never offered it because mounting over a dead endpoint cannot work; every row carries the record's id rather than a position, so a menu left open across a rebuild cannot act on a different share. |
 | `uflinux-files` (job table) | a report never reaches the strip more than once per throttle window, and the first one always does; a job with no total shows a bar with no fraction rather than a fake one; a tally reads `512 KiB of 1.0 MiB` for bytes and `4 of 9` for rows; finishing the only job empties the table and says so exactly once; pulling the brakes reaches every job on the table, including a second one registered after the first; a report naming a job that already finished is dropped rather than resurrected; the strip's text is read back from the widgets rather than from a parallel copy of it, so it cannot disagree with what is drawn. |
 | `uflinux-files` (My Computer) | Home and the system drive are always cards and a desktop folder becomes one only when it exists; a connected share says `Connected`, carries its protocol's icon and renders its capacity as `256 KiB free of 1.0 MiB`; a share the kernel has lost is still listed but says `Disconnected`, shows its mount point where the capacity would go and cannot be opened; a filesystem that reports no size gets no bar; a share's label beats the last component of its URI; activating a card reaches the open hook exactly once with the card's own id, and a Disconnect button reaches the unmount hook with the record id rather than the label. |
 | `uflinux-files` (history) | an XBEL record becomes a row only for a local file that still exists; a `added` timestamp is decoded to a fixed instant, a UTC offset is subtracted rather than ignored, and `modified` stands in when `added` is absent; percent escapes are decoded; a file written twice is one row carrying the newer time; newest first, capped at the limit; a missing history file is an empty list rather than an error. |
@@ -283,6 +284,29 @@ numbers change. With the property set, the name is the drive and the capacity is
 name, so neither deleting the capacity line nor reverting to a concatenated name passes.
 The first two checks were confirmed to fail against a build with the two
 `update_property` calls stashed out, so they test the property rather than the fixture.
+
+The same fixture then carries one network share, written to `mounts.json` before the
+application starts, which is what lets a mount row be driven at all: a container with no
+mount helpers and no server cannot produce a live mount, and `Runner::open` treats an
+unreadable table as an empty one, so a fixture that failed to parse would show up as a
+missing row rather than as a broken fixture. The record's mount point is never created, so
+the kernel reports nothing mounted there and the share is `Absent` — the state a share
+falls back into whenever a server goes away or a session ends, and the one the sweep is
+deliberately told to leave alone, which is what keeps the row standing for the whole run.
+The card is checked where the Computer view is opened, and the row in the folder window's
+sidebar, under a `Network` heading, is checked before anything is asked of it, because
+everything after that point is asserted by the *absence* of it.
+The three commands behind the row are then activated over the bus. Reconnect fails, since
+this container has no NFS helper, and that failure is the assertion twice over: the reason
+appears in the window's banner, and the same reason is found in `mounts.json` beside the
+record, which is the half no unit test can reach because it only exists in a file. Forget
+then takes the record out of the file, out of the sidebar, and takes the `Network` heading
+with it — a heading is drawn wherever the group changes, so one left over an empty group
+is a section of the sidebar with nothing in it. The Computer window is left open across
+that, holding the card it was given: a command repaints the window that ran it and no
+other, which is how an unmount already behaves, and the check that the share is a card of
+its own was made above while it was still listed. Closing the window here would have
+asserted that boundary without making it better.
 
 The properties checks are the reason the probe's `press` takes an optional frame name. A
 folder window's titlebar carries a button labelled `Close`, and a depth-first walk from

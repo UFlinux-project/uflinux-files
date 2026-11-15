@@ -35,14 +35,17 @@ the model over D-Bus and never opens a window.
   sidebar, and takes it out again if it is already there. Bookmarks are spliced into
   the Folders group rather than listed below the system rows, so the sidebar says
   `Folders` once. Right-clicking a bookmark renames it, moves it up or down the
-  list, or takes it out — the only sidebar row with a menu of its own, because it is
-  the only one that is not derived from something else.
+  list, or takes it out — one of the two sidebar rows with a menu of its own, because
+  it is one of the two that is not derived from something else.
 - **Archives as folders**: zip, tar and its codecs, and 7z open like a directory
   and unpack with `<Ctrl>E` into a folder named after them. Read-only browsing
   plus extract; no write-back.
 - **Network shares as folders**: SMB, NFS, SFTP, WebDAV and FTP are *mounted*
   rather than spoken, under `$XDG_RUNTIME_DIR/ufm`, so every view, thumbnail and
-  file operation works on them without remote special-casing.
+  file operation works on them without remote special-casing. A share's sidebar row
+  right-clicks into whatever its state allows: Disconnect while it is up, Reconnect
+  once it is down and its password is already saved, Forget when the row itself should
+  go. A share that fails to come back says why, in the window and beside the record.
 - **Search** over filenames, metadata and application entries, served by a
   D-Bus-activated indexer that exits when it has been idle. The same interface
   is what a start menu will use instead of its own application catalog.

@@ -36,6 +36,7 @@ use ufm_core::entry::{Entry, EntryFlags};
 use ufm_core::location::VirtualDir;
 use ufm_core::paths;
 use ufm_core::sort::SortKey;
+use ufm_mount::table::MountRecord;
 use ufm_vfs::{Cancel, FsHints, Readers};
 
 use super::columns::Columns;
@@ -684,7 +685,8 @@ fn navigate(ctx: &Ctx, location: Location, record: bool) {
 /// Highlight the sidebar row a location belongs to, or clear the highlight.
 fn select_place(ctx: &Ctx, location: &Location) {
     if let Some(panel) = ctx.panel.upgrade() {
-        match place_for(&ctx.shared.bookmark_items(), location) {
+        let mounts = mount_rows(&ctx.shared);
+        match place_for(&ctx.shared.bookmark_items(), &mounts, location) {
             Some(place) => panel.select(&place),
             None => panel.clear_selection(),
         }
@@ -1363,10 +1365,11 @@ fn mounted(ctx: &Ctx, report: Report) {
     // table that was just re-read rather than from anything the worker kept.
     let target = report.id.as_deref().and_then(|id| {
         let state = ctx.shared.state.borrow();
-        state.runner.table().get(id).map(|record| Place::Mount {
-            id: record.id.clone(),
-            label: record.share.label(),
-        })
+        state
+            .runner
+            .table()
+            .get(id)
+            .map(|record| mount_place(&state.runner, record))
     });
     // A mount point is a folder that was there before the share was. If this
     // window had looked at it — the empty folder in the sidebar, or the parent it
@@ -1463,18 +1466,43 @@ fn filter(entries: &[Entry], query: &str) -> Vec<Entry> {
 }
 
 /// The sidebar rows: the standard places, the user's bookmarks, and whatever is
-/// mounted. The order belongs to [`Place::with_bookmarks`]; the mounts are added
-/// last because they are their own group and appear below both.
+/// in the mount table. The order belongs to [`Place::with_bookmarks`]; the mounts
+/// are added last because they are their own group and appear below both.
 fn places(shared: &Rc<Shared>) -> Vec<Place> {
     let mut places = Place::with_bookmarks(&shared.bookmark_items());
-    let state = shared.state.borrow();
-    for record in state.runner.table() {
-        places.push(Place::Mount {
-            id: record.id.clone(),
-            label: record.share.label(),
-        });
-    }
+    places.extend(mount_rows(shared));
     places
+}
+
+/// The rows for the shares in the mount table, in the table's order.
+///
+/// One function rather than a literal at each place a mount row is needed, because
+/// the panel matches a usage bar and a selection to a row by comparing [`Place`]
+/// values: two builders that disagree about one field produce two different places
+/// for one share, and the bar or the highlight for that share then goes missing
+/// with no error anywhere. The three callers — the rows, the bars, and the
+/// highlight — all go through here.
+fn mount_rows(shared: &Rc<Shared>) -> Vec<Place> {
+    let state = shared.state.borrow();
+    state
+        .runner
+        .table()
+        .iter()
+        .map(|record| mount_place(&state.runner, record))
+        .collect()
+}
+
+/// One mount row, carrying the two answers its menu is built from: the kernel's
+/// about the mount point and the store's about the password. Both come from what
+/// the runner already holds in memory plus one small file, so rebuilding the rows
+/// on every listing costs what reading a folder costs.
+fn mount_place(runner: &Runner, record: &MountRecord) -> Place {
+    Place::Mount {
+        id: record.id.clone(),
+        label: record.share.label(),
+        state: runner.state(&record.id),
+        can_reconnect: runner.can_reconnect(&record.share),
+    }
 }
 
 /// Usage bars for the places that have a filesystem behind them.
@@ -1490,10 +1518,7 @@ fn usages(shared: &Rc<Shared>) -> Vec<Usage> {
     for record in state.runner.table() {
         let hints = shared.hints(&record.mountpoint);
         usages.push(Usage {
-            place: Place::Mount {
-                id: record.id.clone(),
-                label: record.share.label(),
-            },
+            place: mount_place(&state.runner, record),
             total: hints.total,
             free: hints.free,
         });
@@ -1503,16 +1528,24 @@ fn usages(shared: &Rc<Shared>) -> Vec<Usage> {
 
 /// The sidebar row a location belongs to, so the panel can agree with the view.
 ///
-/// The bookmarks are searched as well as the standard places, and by location
-/// rather than by name: a folder the user bookmarked has two candidate rows —
-/// none, and the bookmark — and it is the bookmark that should light up, since
-/// that is the row they put there to get back to it.
-fn place_for(bookmarks: &[Bookmark], location: &Location) -> Option<Place> {
+/// The bookmarks are searched before anything else, and by location rather than by
+/// name: a folder the user bookmarked has two candidate rows — none, and the
+/// bookmark — and it is the bookmark that should light up, since that is the row
+/// they put there to get back to it. The mount rows come next, for the same
+/// reason: standing in a share's mount point is standing at that share, and a
+/// sidebar that goes blank there looks like it has lost track of the window.
+///
+/// The mount rows are passed in rather than rebuilt here, so that the comparison
+/// below is against the values the panel was handed — see [`mount_rows`].
+fn place_for(bookmarks: &[Bookmark], mounts: &[Place], location: &Location) -> Option<Place> {
     if let Some(bookmark) = bookmarks
         .iter()
         .find(|bookmark| &bookmark.location == location)
     {
         return Some(Place::Bookmark(bookmark.clone()));
+    }
+    if let Some(mount) = mounts.iter().find(|place| place.location() == *location) {
+        return Some(mount.clone());
     }
     Place::standard()
         .into_iter()
@@ -1879,12 +1912,143 @@ fn wire_actions(app: &gtk::Application, window: &gtk::ApplicationWindow, ctx: &C
     actions.extend(view_actions(app, ctx));
     actions.extend(op_actions(ctx));
     actions.extend(bookmark_actions(ctx));
+    actions.extend(mount_actions(ctx));
     actions.extend(context_actions(ctx));
     for action in &actions {
         ActionMapExt::add_action(window, action.as_ref());
     }
     install_accels(app);
     sync_buttons(ctx);
+}
+
+/// The three commands a mount row's menu offers, each about the share the row
+/// names rather than about the folder in the title bar.
+///
+/// None is ever disabled, for the reason [`bookmark_actions`] gives: the gate is
+/// the menu, which [`panel::menu_for`] builds only for a mount row and only in the
+/// rows that row's state allows. What the kernel says can change while a menu sits
+/// open — another window, the sweep on its timer, the share's own daemon dying — so
+/// each handler asks again and says what it finds.
+///
+/// Two of the three run on a worker because both block on a helper process. The
+/// third edits one small file and answers in the same turn, which is why the three
+/// do not share a shape even though they share a menu.
+fn mount_actions(ctx: &Ctx) -> Vec<Rc<gio::SimpleAction>> {
+    let disconnect = gio::SimpleAction::new("disconnect", Some(glib::VariantTy::STRING));
+    disconnect.connect_activate({
+        let ctx = ctx.clone();
+        move |_action, parameter| {
+            let Some(id) = share_named(parameter) else {
+                return;
+            };
+            unmount_card(&ctx, &id);
+        }
+    });
+
+    let reconnect = gio::SimpleAction::new("reconnect", Some(glib::VariantTy::STRING));
+    reconnect.connect_activate({
+        let ctx = ctx.clone();
+        move |_action, parameter| {
+            let Some(id) = share_named(parameter) else {
+                return;
+            };
+            reconnect_row(&ctx, &id);
+        }
+    });
+
+    let forget = gio::SimpleAction::new("forget-share", Some(glib::VariantTy::STRING));
+    forget.connect_activate({
+        let ctx = ctx.clone();
+        move |_action, parameter| {
+            let Some(id) = share_named(parameter) else {
+                return;
+            };
+            forget_share(&ctx, &id);
+        }
+    });
+
+    vec![Rc::new(disconnect), Rc::new(reconnect), Rc::new(forget)]
+}
+
+/// The record id a sidebar menu row named.
+///
+/// An id rather than a URI, where a bookmark's menu row carries a URI: a share has
+/// no location of its own until it is mounted, and the mount point is derived from
+/// the id anyway. What the two have in common is that neither is a position in the
+/// list, so a menu left open across a rebuild still names the row it opened over.
+fn share_named(parameter: Option<&glib::Variant>) -> Option<String> {
+    Some(parameter?.str()?.to_string())
+}
+
+/// Mount a listed share again, on a worker.
+///
+/// The same shape as [`unmount_card`] and for the same reason: mounting waits on a
+/// helper process and sometimes on polkit, and the window that asked stays
+/// responsive while it waits. The worker owns its own runner, so the answer arrives
+/// as [`Event::Mounted`] and is handled by [`mounted`] — which re-reads the table,
+/// repaints, and steps into the share. Stepping in is what a user who pressed
+/// Reconnect wants too: the point of the row is to be standing in the share
+/// afterwards, and the share's own contents are the success message.
+///
+/// A share whose password was never saved gets the backend's sentence about needing
+/// one, shown as a banner. Reconnect deliberately has no password argument — it is
+/// the row that costs one click — and [`panel::menu_for`] leaves the row out of the
+/// menu for exactly that share, so reaching this function with such a share means
+/// the answer was stored or forgotten while the menu was open.
+fn reconnect_row(ctx: &Ctx, id: &str) {
+    let Some(handle) = ctx.handle.borrow().clone() else {
+        return;
+    };
+    let id = id.to_string();
+    let spawned = thread::Builder::new()
+        .stack_size(256 * 1024)
+        .spawn(move || {
+            let mut runner = Runner::open(Layout::system());
+            let report = runner.reconnect(&id);
+            handle.send(Event::Mounted { report });
+        });
+    if spawned.is_err() {
+        // Out of threads. Nothing was attempted, so the message says so rather
+        // than naming a backend that never ran.
+        if let Some(handle) = ctx.handle.borrow().clone() {
+            handle.send(Event::Mounted {
+                report: Report {
+                    message: "cannot start a mount".to_string(),
+                    id: None,
+                    ok: false,
+                },
+            });
+        }
+    }
+}
+
+/// Stop listing a share, from the sidebar row that named it.
+///
+/// Inline rather than on a worker, unlike the other two rows in the same menu:
+/// [`Runner::forget_share`] runs no command — it refuses a share the kernel still
+/// reports as mounted and otherwise edits one small file — so there is nothing to
+/// wait for, and a row that had to be answered from a worker would repaint the
+/// sidebar a frame later for no reason.
+///
+/// The refusal is the answer worth designing for, and it is why this does not reuse
+/// [`unmount_card`]: letting go of a live share and taking its row away are two
+/// decisions, and a menu row that silently did both would be a Disconnect row under
+/// another name.
+fn forget_share(ctx: &Ctx, id: &str) {
+    let report = {
+        let mut state = ctx.shared.state.borrow_mut();
+        state.runner.forget_share(id)
+    };
+    // The row and the card follow the table. The filesystem cache is left alone on
+    // purpose: nothing was unmounted, so no fact about a filesystem changed — the
+    // mount point is either still a live share or still the empty directory it was
+    // before, and both are what is already cached about it.
+    if let Some(panel) = ctx.panel.upgrade() {
+        panel.set_places(places(&ctx.shared));
+        panel.set_usage(usages(&ctx.shared));
+    }
+    ctx.computer.set_cards(&card_data(&ctx.shared));
+    show_banner(ctx, &report.message);
 }
 
 /// Where the window can go: back, forward, up, and a re-read of where we are.
@@ -3044,6 +3208,7 @@ fn status_bar(view: &View) -> gtk::Box {
 mod tests {
     use super::*;
     use ufm_core::{EntryFlags, EntryKind};
+    use ufm_mount::monitor::MountState;
 
     fn location(name: &str) -> Location {
         Location::file(format!("/home/u/{name}"))
@@ -3203,8 +3368,8 @@ mod tests {
 
     #[test]
     fn a_known_folder_has_a_sidebar_row_and_an_unknown_one_does_not() {
-        assert!(place_for(&[], &Location::file(paths::home())).is_some());
-        assert!(place_for(&[], &Location::file("/definitely/not/a/place")).is_none());
+        assert!(place_for(&[], &[], &Location::file(paths::home())).is_some());
+        assert!(place_for(&[], &[], &Location::file("/definitely/not/a/place")).is_none());
     }
 
     #[test]
@@ -3215,11 +3380,31 @@ mod tests {
             label: Some("Work".to_string()),
             icon: None,
         }];
-        let found = place_for(&bookmarks, &work);
+        let found = place_for(&bookmarks, &[], &work);
         assert_eq!(
             found.map(|place| place.label()),
             Some("Work".to_string()),
             "a bookmark lights its own row rather than leaving the sidebar blank"
+        );
+    }
+
+    #[test]
+    fn standing_in_a_share_lights_the_row_for_that_share() {
+        // The row the panel was handed, built by the same helper that built the
+        // list — a mount point compared against a row assembled differently would
+        // not match, and the sidebar would go blank mid-share.
+        let mount = Place::Mount {
+            id: "smb-nas-filmy".to_string(),
+            label: "filmy".to_string(),
+            state: MountState::Mounted,
+            can_reconnect: true,
+        };
+        let point = mount.location();
+        let found = place_for(&[], &[mount], &point);
+        assert_eq!(
+            found.map(|place| place.label()),
+            Some("filmy".to_string()),
+            "a mount point is its share's row, not an unlisted folder"
         );
     }
 }

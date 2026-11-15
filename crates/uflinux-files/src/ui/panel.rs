@@ -24,6 +24,7 @@ use ufm_core::config::{Bookmark, PanelGroup};
 use ufm_core::entry::human_size;
 use ufm_core::paths;
 use ufm_core::sort::SortKey;
+use ufm_mount::monitor::MountState;
 
 use crate::ui::popup::MenuRow;
 
@@ -52,10 +53,17 @@ pub enum Place {
     /// component of where it points.
     Bookmark(Bookmark),
     /// A network share from the mount table. `label` is what to show, because
-    /// the slug is not something a person wrote.
+    /// the slug is not something a person wrote. `state` is the kernel's answer
+    /// about the mount point and `can_reconnect` the store's answer about the
+    /// password, both as of the moment the rows were built. They belong to the
+    /// row's identity rather than riding beside it: the row's menu is read off
+    /// them, so a share that went stale or lost its password has to become a
+    /// different row, not the same row offering different rows in its menu.
     Mount {
         id: String,
         label: String,
+        state: MountState,
+        can_reconnect: bool,
     },
 }
 
@@ -256,46 +264,99 @@ type Context = Rc<dyn Fn(&Place, &gtk::Widget, f64, f64)>;
 /// The menu for one sidebar row.
 ///
 /// The rows are [`MenuRow`]s rather than [`Command`]s because each one names the
-/// bookmark it acts on: the target is a URI rather than an index, since an index is
-/// a fact about a rendering that the next rebuild may have changed and a menu can
-/// stay open across a rebuild.
+/// thing it acts on: a bookmark's menu targets a URI and a mount's targets a
+/// record id, never an index, since an index is a fact about a rendering that the
+/// next rebuild may have changed and a menu can stay open across a rebuild.
 ///
-/// Only a bookmark has anything to say about itself. The standard places are
+/// Two kinds of row have anything to say about themselves. A bookmark, because
+/// the user named it and put it there and can un-name it. A mount, because the
+/// share is a record the user made and because the answer to "what could be done
+/// with this?" depends on the kernel's state — which is why [`Place::Mount`] car-
+/// ries a [`MountState`] and why the arms below read it. The standard places are
 /// derived from the filesystem, so renaming `Documents` would be a name with
-/// nothing behind it, and the mount rows belong to the mount table, which has its
-/// own dialog and its own Disconnect button on the card. A row with no rows is no
-/// menu at all rather than a popover with nothing in it.
+/// nothing behind it, and they get no menu. A row with no rows is no menu at all
+/// rather than a popover with nothing in it.
+///
+/// Each state is offered what it can actually do, and no more: a `Reconnect` on a
+/// share that is already connected, or a `Disconnect` on one that was never
+/// mounted, both fail with an honest but useless complaint, and a `Reconnect` for
+/// a share whose password was never saved would fail before reaching the network.
+/// The gate is the menu rather than the actions, which stay enabled always:
+/// between opening a menu and pressing a row the state can change underneath, and
+/// the answer to acting on a share that no longer wants that action is a banner
+/// that says so, which is the same answer the card's buttons give.
 #[must_use]
 pub fn menu_for(place: &Place) -> Vec<MenuRow> {
-    let Place::Bookmark(bookmark) = place else {
-        return Vec::new();
-    };
-    let uri = bookmark.location.to_string();
-    vec![
-        MenuRow {
-            label: "Rename\u{2026}",
-            action: "win.rename-bookmark",
-            target: Some(uri.clone()),
-        },
-        // The two directions before the destructive row, because they are the
-        // reversible ones and because a menu that files `Remove` in the middle
-        // invites the mistake it is there to allow.
-        MenuRow {
-            label: "Move Up",
-            action: "win.bookmark-up",
-            target: Some(uri.clone()),
-        },
-        MenuRow {
-            label: "Move Down",
-            action: "win.bookmark-down",
-            target: Some(uri.clone()),
-        },
-        MenuRow {
-            label: "Remove",
-            action: "win.remove-bookmark",
-            target: Some(uri),
-        },
-    ]
+    match place {
+        Place::Bookmark(bookmark) => {
+            let uri = bookmark.location.to_string();
+            vec![
+                MenuRow {
+                    label: "Rename\u{2026}",
+                    action: "win.rename-bookmark",
+                    target: Some(uri.clone()),
+                },
+                // The two directions before the destructive row, because they are
+                // the reversible ones and because a menu that files `Remove` in
+                // the middle invites the mistake it is there to allow.
+                MenuRow {
+                    label: "Move Up",
+                    action: "win.bookmark-up",
+                    target: Some(uri.clone()),
+                },
+                MenuRow {
+                    label: "Move Down",
+                    action: "win.bookmark-down",
+                    target: Some(uri.clone()),
+                },
+                MenuRow {
+                    label: "Remove",
+                    action: "win.remove-bookmark",
+                    target: Some(uri),
+                },
+            ]
+        }
+        Place::Mount {
+            id,
+            can_reconnect,
+            state,
+            ..
+        } => {
+            let row = |label, action| MenuRow {
+                label,
+                action,
+                target: Some(id.clone()),
+            };
+            let forget = || row("Forget", "win.forget-share");
+            match state {
+                // Connected: only letting go. Reconnect would be a no-op and
+                // Forget would strand a live mount, so neither is offered —
+                // disconnect first, from here or from the card.
+                MountState::Mounted => vec![row("Disconnect", "win.disconnect")],
+                // The point exists and is dead, so the useful row is the one that
+                // detaches it; `mount` over a dead endpoint cannot succeed, which
+                // is why there is no Reconnect here even though the share is
+                // anything but connected. Detaching a stale point is what
+                // Disconnect does, and what the sweep does on a timer.
+                MountState::Stale => vec![row("Disconnect", "win.disconnect"), forget()],
+                // Nothing mounted and nothing in the way: mount it again, or stop
+                // listing it. No Disconnect row, because there is nothing to
+                // detach. A share that would have to be asked for a password has
+                // no Reconnect row either — reconnecting is deliberately the row
+                // that costs one click, and a share needing an answer is a share
+                // to open the Connect dialog for, where the answer can be given.
+                MountState::Absent => {
+                    let mut rows = Vec::new();
+                    if *can_reconnect {
+                        rows.push(row("Reconnect", "win.reconnect"));
+                    }
+                    rows.push(forget());
+                    rows
+                }
+            }
+        }
+        _ => Vec::new(),
+    }
 }
 
 /// What the click handler needs. Kept behind an `Rc` because a signal handler
@@ -614,7 +675,9 @@ mod tests {
         assert_eq!(
             Place::Mount {
                 id: "smb-nas-filmy".into(),
-                label: "nas/filmy".into()
+                label: "nas/filmy".into(),
+                state: MountState::Mounted,
+                can_reconnect: true
             }
             .label(),
             "nas/filmy"
@@ -722,22 +785,70 @@ mod tests {
 
     #[test]
     fn a_row_that_cannot_answer_for_itself_gets_no_menu() {
-        // No menu at all rather than an empty popover: these rows are derived from
-        // the filesystem or owned by the mount table, which has its own dialog.
+        // No menu at all rather than an empty popover: these rows are derived
+        // from the filesystem, so there is nothing about them to change.
         for place in [
             Place::Home,
             Place::Trash,
             Place::Starred,
             Place::Folder(PathBuf::from("/srv/work")),
-            Place::Mount {
-                id: "smb-nas-filmy".into(),
-                label: "nas/filmy".into(),
-            },
         ] {
             assert!(
                 menu_for(&place).is_empty(),
                 "{} should not offer a menu",
                 place.label()
+            );
+        }
+    }
+
+    #[test]
+    fn a_mount_row_offers_only_what_its_state_allows() {
+        let mount = |state, can_reconnect| Place::Mount {
+            id: "smb-nas-filmy".into(),
+            label: "nas/filmy".into(),
+            state,
+            can_reconnect,
+        };
+        let labels = |state, can_reconnect| -> Vec<&'static str> {
+            menu_for(&mount(state, can_reconnect))
+                .iter()
+                .map(|row| row.label)
+                .collect()
+        };
+        // Connected: let go, and nothing else. Reconnect would be a no-op and
+        // Forget would strand a mount that is in use.
+        assert_eq!(labels(MountState::Mounted, true), ["Disconnect"]);
+        // Dead: detach it, or give up on it. Reconnecting over a dead endpoint
+        // cannot work, so the row that would promise that is not there.
+        assert_eq!(
+            labels(MountState::Stale, true),
+            ["Disconnect", "Forget"],
+            "a stale point has to be detached before it can be mounted again"
+        );
+        // Never mounted, password on disk: mount it again or stop listing it.
+        assert_eq!(labels(MountState::Absent, true), ["Reconnect", "Forget"]);
+        // Never mounted and the password was not saved. Reconnecting would fail
+        // before reaching the network, so the row is left out rather than shown
+        // disabled — the Connect dialog is where that answer gets given.
+        assert_eq!(
+            labels(MountState::Absent, false),
+            ["Forget"],
+            "a share that would have to be asked is not offered a one-click mount"
+        );
+        for row in menu_for(&mount(MountState::Absent, true)) {
+            assert!(
+                row.action.starts_with("win."),
+                "{} points outside this window's actions: {}",
+                row.label,
+                row.action
+            );
+            // The record id rather than a position in the list, so a menu left
+            // open across a rebuild still acts on the share it opened over.
+            assert_eq!(
+                row.target.as_deref(),
+                Some("smb-nas-filmy"),
+                "{} should say which share it means",
+                row.label
             );
         }
     }
@@ -765,6 +876,8 @@ mod tests {
             Place::Mount {
                 id: "x".into(),
                 label: "x".into(),
+                state: MountState::Absent,
+                can_reconnect: false,
             },
         ];
         for place in places {
@@ -778,6 +891,8 @@ mod tests {
         let place = Place::Mount {
             id: "smb-nas-filmy".into(),
             label: "nas/filmy".into(),
+            state: MountState::Mounted,
+            can_reconnect: true,
         };
         assert_eq!(place.group(), PanelGroup::Network);
         assert!(place.location().is_real());

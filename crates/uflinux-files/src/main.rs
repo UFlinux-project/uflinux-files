@@ -13,10 +13,13 @@
 
 mod cli;
 
-// The connect dialog calls `mount` and `forget`. `unmount` and `reconnect` are
-// still waiting for the buttons that will call them, in the sidebar's mount
-// rows; until then this keeps the two honest rather than deleting a capability
-// the mount table already models.
+// The connect dialog calls `mount` and `forget`; a card's or a sidebar row's
+// Disconnect calls `unmount`, Reconnect calls `reconnect`, Forget calls
+// `forget_share`, and `--sweep-mounts` calls `sweep`. `list` is the one method
+// still waiting for a caller: it exists so a share can be recorded before it is
+// ever mounted, which is what "connect at login" means, and nothing offers that
+// preference yet. Until then this keeps the one honest name rather than
+// deleting a capability the mount table already models.
 #[allow(dead_code)]
 mod runner;
 mod ui;

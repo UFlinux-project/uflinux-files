@@ -87,6 +87,26 @@ export HOME XDG_DATA_HOME XDG_CONFIG_HOME
 # The path the window opens on. Two entries, so the status line has a number to say.
 TARGET=$ROOT/tree/alpha
 
+# One network share the user connected to in some earlier session, written where
+# the mount table lives so the application finds a share already listed before it
+# opens a window. `nfs://nas/videos2024`: the id is the share's slug, which is its
+# host, the last part of its path, and six digits of its hash. The mount point in
+# the record is a lie on purpose — the loader replaces it with one under
+# `$UFLINUX_FILES_MOUNT_ROOT`, and that folder is never created, so the kernel
+# reports no mount there and the row is drawn for a share that is listed without
+# being connected. Naming the mount root rather than leaving it to default from
+# `$XDG_RUNTIME_DIR` keeps the fixture out of the session's real runtime directory.
+MOUNT_FILE=$XDG_CONFIG_HOME/uflinux/filemanager/mounts.json
+MOUNT_ID=nas-videos2024-a71bee
+UFLINUX_FILES_MOUNT_ROOT=$ROOT/mnt
+export UFLINUX_FILES_MOUNT_ROOT
+mkdir -p "$XDG_CONFIG_HOME/uflinux/filemanager"
+cat >"$MOUNT_FILE" <<EOF
+{"version":1,"mounts":[{"id":"$MOUNT_ID","share":{"protocol":"nfs","host":"nas",
+"port":null,"user":null,"tls":false,"resource":"/videos2024","options":[]},
+"mountpoint":"/nowhere","autostart":false}]}
+EOF
+
 # A real container to unpack, in a folder of its own. Its own folder is what keeps
 # the checks above about how many entries the window opens on honest, and a real
 # archive rather than a file named like one is what lets the extract check tell a
@@ -1403,6 +1423,21 @@ if [ "$(printf '%s\n' "$CFRAME" | grep -cF "free of")" -ge 2 ]; then
 else
     fail "a card reports how full its filesystem is"
 fi
+# The share the fixture listed before the application started is a card too, named
+# for the share rather than for the mount point it would have been attached to.
+if printf '%s\n' "$CFRAME" | grep -qF "$(printf 'table cell\tvideos2024\t')"; then
+    ok "a share the user listed is a card of its own on My Computer"
+else
+    fail "a share the user listed is a card of its own on My Computer (no card named 'videos2024')"
+fi
+# And it says which state it is in. A share the kernel has no record of is neither
+# broken nor connected, and a card that said neither would leave a user guessing
+# about a row that is sitting in the sidebar.
+if printf '%s\n' "$CFRAME" | grep -qF "$(printf '\tNot connected\t')"; then
+    ok "a share that is listed but not connected says which it is"
+else
+    fail "a share that is listed but not connected says which it is"
+fi
 # The bug by name. Handing `computer://` to the local reader used to answer
 # "not a valid location", printed as a banner in a window that then looked empty.
 if printf '%s\n' "$CFRAME" | grep -qF "not a valid location"; then
@@ -1411,8 +1446,9 @@ else
     ok "Computer shows cards rather than a reader error"
 fi
 # The count in the bar counts cards. Left to the listing path it would have said
-# "Empty folder" about a window showing two drives.
-if printf '%s\n' "$CFRAME" | grep -qF "$(printf '\t2 items\t')"; then
+# "Empty folder" about a window showing two drives. Three since the fixture started
+# with one share listed: Home, the system drive, and that share.
+if printf '%s\n' "$CFRAME" | grep -qF "$(printf '\t3 items\t')"; then
     ok "the status line counts the cards rather than entries read from disk"
 else
     fail "the status line counts the cards rather than entries read from disk"
@@ -1462,6 +1498,115 @@ if printf '%s\n' "$PFRAME" | grep -qE "$(printf '^label\t')[^\t]*free of" \
     ok "the capacity is a line of its own rather than part of a card's name"
 else
     fail "the capacity is a line of its own rather than part of a card's name"
+fi
+
+# --- a share the user listed earlier, and what its row offers -----------------------
+# The fixture wrote one record before the application started, for a share that is
+# listed without being connected: its mount point was never created, so the kernel
+# says nothing is mounted there. That is the state a share falls back into whenever
+# a server goes away or a session ends, and the one where the row has the most to
+# say for itself — so it is also the state worth driving over the bus.
+#
+# Which rows a right-click offers, and what each one carries, are the sidebar's own
+# decision and covered by `panel.rs`. What is worth asserting here is that the
+# commands behind those rows reach the file on disk and say what they did, which no
+# unit test can see.
+#
+# Both commands below go to the folder window and are read back from its own subtree.
+# The Computer window is left open holding the card it was given: a command repaints
+# the window that ran it, which is how an unmount already works, and the check that
+# the share is a card of its own was made above, while it was still listed.
+#
+# The three rows a mount row can offer. All three are registered on every window and
+# none is ever disabled: what a share can do right now decides which rows are put in
+# front of the user, not whether the command exists. An action that was never
+# registered and one that is disabled are told apart here by `Describe` answering
+# with `(true`.
+#
+# First that the folder window drew the row at all, since everything below is judged
+# by the absence of it. The card was checked on My Computer above; this is the other
+# half, and the reason the two are not the same check: a card is built once for one
+# window, a sidebar row is rebuilt from the table every time the table changes.
+WFRAME=$(python3 "$A11Y" dump-frame "$TARGET" 2>/dev/null || true)
+if printf '%s\n' "$WFRAME" | grep -qF "$(printf 'list item\tvideos2024\t')"; then
+    ok "a share the user listed is a row in the sidebar too"
+else
+    fail "a share the user listed is a row in the sidebar too"
+fi
+if printf '%s\n' "$WFRAME" | grep -qF "$(printf '\tNetwork\t')"; then
+    ok "the share sits under a heading of its own"
+else
+    fail "the share sits under a heading of its own"
+fi
+for row in disconnect reconnect forget-share; do
+    if describe "$row" | grep -qF '(true'; then
+        ok "a mount row's $row action is one the window answers"
+    else
+        fail "a mount row's $row action is one the window answers ($(describe "$row"))"
+    fi
+done
+# Reconnect, on a share whose mount helper this container does not have. The point is
+# not the failure — it is that the row did the work rather than reporting that it had
+# done something, and that the reason got both said out loud and written down beside
+# the record. That last part is what turns a card that silently does nothing into one
+# that says why, and it only exists in a file on disk.
+act reconnect "[<'$MOUNT_ID'>]" "[]"
+i=0
+WFRAME=$(python3 "$A11Y" dump-frame "$TARGET" 2>/dev/null || true)
+while [ "$i" -lt 50 ]; do
+    WFRAME=$(python3 "$A11Y" dump-frame "$TARGET" 2>/dev/null || true)
+    printf '%s\n' "$WFRAME" | grep -qE "$(printf '^label\t')mount error:" && break
+    i=$((i + 1))
+    sleep 0.2
+done
+if printf '%s\n' "$WFRAME" | grep -qE "$(printf '^label\t')mount error:"; then
+    ok "reconnecting a share reports what stopped it rather than pretending"
+else
+    fail "reconnecting a share reports what stopped it rather than pretending"
+fi
+if grep -qF "$MOUNT_ID" "$MOUNT_FILE" && grep -qF '"last_error": "mount error:' "$MOUNT_FILE"; then
+    ok "a share that failed to reconnect keeps its reason beside the record"
+else
+    fail "a share that failed to reconnect keeps its reason beside the record"
+fi
+# Forget, which is the row that has to be careful: it drops the record without
+# detaching anything, so it refuses a share the kernel still reports connected. This
+# one is not connected, so it goes — out of the file, and out of the sidebar of the
+# window that asked for it.
+act forget-share "[<'$MOUNT_ID'>]" "[]"
+i=0
+while [ "$i" -lt 50 ] && grep -qF "$MOUNT_ID" "$MOUNT_FILE"; do
+    i=$((i + 1))
+    sleep 0.2
+done
+if ! grep -qF "$MOUNT_ID" "$MOUNT_FILE"; then
+    ok "forgetting a share that is not connected takes it out of the table"
+else
+    fail "forgetting a share that is not connected takes it out of the table ($MOUNT_ID still in $MOUNT_FILE)"
+fi
+i=0
+while [ "$i" -lt 50 ]; do
+    WFRAME=$(python3 "$A11Y" dump-frame "$TARGET" 2>/dev/null || true)
+    printf '%s\n' "$WFRAME" | grep -qF "videos2024 is no longer listed" && break
+    i=$((i + 1))
+    sleep 0.2
+done
+if printf '%s\n' "$WFRAME" | grep -qF "videos2024 is no longer listed"; then
+    ok "forgetting a share says so in the window that asked"
+else
+    fail "forgetting a share says so in the window that asked"
+fi
+if printf '%s\n' "$WFRAME" | grep -qF "$(printf 'list item\tvideos2024\t')"; then
+    fail "the row goes out of the sidebar with its share"
+else
+    ok "the row goes out of the sidebar with its share"
+fi
+# The heading goes too. One is drawn wherever the group changes, so a heading left
+# behind over an empty group is a section of the sidebar with nothing in it.
+if printf '%s\n' "$WFRAME" | grep -qF "$(printf '\tNetwork\t')"; then
+    fail "the heading goes with the last share in it"
+else
+    ok "the heading goes with the last share in it"
 fi
 
 # --- --new-window really is a separate process --------------------------------------
