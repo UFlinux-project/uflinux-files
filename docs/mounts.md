@@ -246,16 +246,27 @@ mount does not maintain at all.
 The `autostart` flag on a record is the whole feature: a share's menu row flips
 it, `mounts.json` stores it, the idle sweep spares shares that carry it, and
 `--connect-at-login` acts on it. There is no second file and no second daemon —
-the table already knows which shares exist, and a session unit that reads it is
-one short-lived process rather than something to keep resident.
+the table already knows which shares exist, and whatever runs this command is one
+short-lived process rather than something to keep resident.
+
+What runs it is not this package's business, and the reason is worth recording
+here because it rules the obvious answer out. UFlinux 3 is OpenRC, greetd and
+labwc: there is no systemd in the image at all as init or userspace — the only
+package with that name is `systemd-boot`, the EFI bootloader — so there is no
+user unit to drop in and `--connect-at-login` is not a `.service` waiting to be
+enabled. The hook that does exist is `/usr/libexec/uflinux-autostart`, the shell
+script the distro's own `uflinux` package runs once a labwc session is up; it is
+the file that launches `uflinux-desktop --supervise` and the rest of the session,
+and it is the file a line calling this command would go into. That file is the
+distro's to ship, so this project ships the command and the answers, and not the
+trigger.
 
 The row is a label that says the opposite of the current answer ("Connect at
 Login" on a share that does not, "Do Not Connect at Login" on one that does)
 and an action that toggles, rather than a check button carrying a boolean. That
-keeps
-`panel::MenuRow` the same `{label, action, target}` triple it is for the other
-three rows, and the label is itself the feedback about what state the press
-found. `Runner::set_autostart` reports whether the answer *changed*, so the
+keeps `panel::MenuRow` the same `{label, action, target}` triple it is for the
+other three rows, and the label is itself the feedback about what state the
+press found. `Runner::set_autostart` reports whether the answer *changed*, so the
 banner can distinguish "now it will" from "it already did".
 
 `--connect-at-login` is a separate mode from `--sweep-mounts`, and the two
@@ -271,8 +282,8 @@ marked share gets one of four answers, and two of them are not failures:
 - `mounted` — the share was absent, nothing was needed to try, and the mount
   worked
 - `already` — the share was already connected, so nothing was run. Two windows,
-  or a unit and a late manual run, will both ask; the second should be a no-op
-  and not a "device or resource busy" to interpret
+  or a session starter and a late manual run, will both ask; the second should be
+  a no-op and not a "device or resource busy" to interpret
 - `skipped` — nothing was attempted: the mount point is `Stale` (mounting over a
   dead endpoint cannot work, and detaching it is sweep's job, which is why the
   runs are separate), or the protocol takes a password that was never remembered

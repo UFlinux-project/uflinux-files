@@ -111,20 +111,42 @@ fixture asserts:
 - a stale mountpoint is swept by `--sweep-mounts` and a live one is not, that the
   report's claims all actually happened, that the table on disk then matches what is
   mounted, that a non-empty orphan is reported but kept, and that `--idle-after` detaches
-  an idle FUSE share with no privilege escalation and takes its mount point with it.
+  an idle FUSE share with no privilege escalation and takes its mount point with it;
+- **`--connect-at-login` gives each marked share the right answer, end to end.**
+  Four records are written by hand — one NFS share that mounts, one whose mount
+  the shim refuses, one SMB share with no stored password, and one unmarked share
+  — and the run is then checked against the kernel, the table, the network
+  directory and a `pkexec` stub: the three answers `mounted`/`failed`/`skipped`
+  each appear, the unmarked share is not mentioned at all, `not_mounted` counts
+  two, the helper's own words reach the report, the mount really appears in
+  `/proc/self/mountinfo`, the share that connected is symlinked into the network
+  directory, `mounted_at` is stored and `last_error` cleared on the one that
+  worked while the failure's reason is stored beside the record that did not, and
+  the elevation carries the action id `data/org.uflinux.files.mount.policy`
+  declares plus the helper's argv in position. Running it again reports `already`
+  for the live share, retries the failure, and asks for root once more rather
+  than twice; a table with nothing marked prints `nothing marked connect at
+  login` instead of nothing.
 
 The stale mount is real: `sshfs` against a local `sshd`, then `kill -9` on the daemon,
 which leaves the kernel entry and makes the mount point answer `ENOTCONN`. That is the
 state a sweep exists to notice and the reason this file cannot be faked with a synthetic
 mount table.
 
+The `pkexec` stub is a four-line script that records its argv, drops the action
+id and execs the helper, so the login checks certify the whole chain from
+`mounts.json` to a kernel entry while standing in for polkit itself. It is
+installed only for that section and only after the sweep has run, which is why
+the sweep's own detach still goes through the helper directly: the claim being
+certified there is that an idle FUSE share needs no privilege at all.
+
 What this does **not** certify: that a real SMB server accepts the options, or that a
 real `davfs2` setuid helper works with the group and config on the target image. Those
 are open items in the plan and need the installed image, not a fixture. `sshfs` is
 tested against a real `sshd` on localhost, which proves the plumbing and not the
-server. The privileged detach path goes through the helper directly rather than through
-`pkexec`, because `pkexec` does not run in the test container; the unit tests cover the
-argv `pkexec` would be handed.
+server. No check runs the login path through real `pkexec` and a real polkit, as
+neither runs in the test container; the unit tests cover the argv `pkexec` would
+be handed, and the fixture covers the action id it would be handed under.
 
 ## The desktop-icons bus
 

@@ -2,15 +2,17 @@
 #
 # End-to-end checks for the mount path that a unit test cannot make: a real
 # `mount(8)` invocation, a real `/proc/self/mountinfo`, a real `fusermount3`, and
-# a real `uflinux-files --sweep-mounts` process.
+# real `uflinux-files --sweep-mounts` and `--connect-at-login` processes.
 #
 # The Rust tests cover the decisions — which argv a plan builds, which option is
 # refused, what a sweep proposes — against a synthetic mount table and stub
 # helpers. What they cannot show is that the helper's argv survives `exec`, that
 # the kernel agrees a mount happened, that a dead FUSE daemon really does leave a
-# mount point answering `ENOTCONN`, or that a password stays out of the process
-# list while real children are running. Those are what is asserted here, and they
-# are the four claims `docs/validation.md` makes about this file.
+# mount point answering `ENOTCONN`, that a password stays out of the process list
+# while real children are running, or that the login path's chain — table, kernel
+# state, backend, elevation, helper, network symlink — lines up. Those are what is
+# asserted here, and they are the claims `docs/validation.md` makes about this
+# file.
 #
 # Needs to be able to mount, which means one of:
 #
@@ -33,11 +35,18 @@ PASS='S3cr3t-n0t-in-argv'
 # with mode 700. The fixture plays the part of pkexec: it sets the variable and
 # hands the mount points to the uid it names.
 FIXTURE_UID=${FIXTURE_UID:-$(id -u nobody 2>/dev/null || echo 65534)}
-# `Share::slug()` of the two URIs below, so that the mount points are where the
+# `Share::slug()` of the URIs below, so that the mount points are where the
 # loader rebuilds them to be. `uri.rs` covers the slug rules themselves; here they
 # are inputs, and a wrong one shows up as a sweep that finds nothing to do.
 GONE_ID=localhost-gone-b1d14a
 LIVE_ID=localhost-live-555d5b
+# The four shares the login section stores. The first three are marked autostart,
+# one for each of the answers a marked share can get without a stale mount; the
+# fourth is left unmarked, to show that marking is what the run reads.
+TAPE_ID=backup-local-tape-116420     # nfs://backup.local/vault/tape
+DEAD_ID=backup-local-ufm-fail-347784 # nfs://backup.local/ufm-fail
+SMB_ID=backup-local-Public-ebeb82    # smb://backup.local/Public
+QUIET_ID=srv-export-2e1237           # nfs://srv/export
 CHECKS=0
 SKIPPED=
 
@@ -521,7 +530,218 @@ JSON
 fi
 
 # ---------------------------------------------------------------------------
-# 6. Nothing outside the sandbox was touched.
+# 6. Connecting at login: the answers a session starter gets, through pkexec.
+# ---------------------------------------------------------------------------
+#
+# `--connect-at-login` is the one mount path with no window in front of it, so
+# only an end-to-end run shows that its pieces agree: the table on disk, the
+# kernel's state, the backend chosen for the protocol, the elevation the protocol
+# needs, and the network directory the sidebar links into. The unit tests assemble
+# those by hand; here they have to line up on their own.
+#
+# NFS is the protocol to exercise, because it is the one that needs a password
+# least: a stored record is enough to reconnect, which is exactly what a session
+# starter needs before anyone has typed anything.
+if [ ! -w /usr/bin ]; then
+    skip "the login path needs a pkexec stub in /usr/bin, which is not writable here"
+else
+    # The stub stands in for polkit. It records the words it was asked to
+    # elevate, drops the action id, and runs the helper as itself — which is what
+    # pkexec does, minus the prompt. `PKEXEC_UID` reaches the helper because the
+    # fixture already exports it; real pkexec sets it to the asking uid instead.
+    # Replacing a system program is rude outside a container, and the mount shim
+    # above already does it to `mount`.
+    cat >/usr/bin/pkexec <<'PKEXEC'
+#!/bin/sh
+printf '%s\n' "$@" >>"$UFM_PKEXEC_LOG"
+shift
+exec "$@"
+PKEXEC
+    chmod 755 /usr/bin/pkexec
+    export UFM_PKEXEC_LOG=$WORK/pkexec.log
+    : >"$UFM_PKEXEC_LOG"
+    ok "a pkexec stub is installed where the plan looks for it"
+
+    # The mount points the run is expected to fill are made beforehand, as the
+    # other sections make them: the plan creates a missing point itself, but as
+    # whoever ran the command, and this fixture runs as root while the helper
+    # insists a point belongs to the uid it was told about. The share that fails is
+    # made for the same reason, so that its failure is the shim's refusal and not
+    # an ownership complaint; the one that is skipped is left unmade, so that its
+    # absence is a finding rather than an empty directory that was always there.
+    TAPE_POINT=$(point "$TAPE_ID")
+    DEAD_POINT=$(point "$DEAD_ID")
+
+    # Every record claims a mount point from a previous boot, because that is what
+    # a table read at login actually holds: `$XDG_RUNTIME_DIR` is per boot, and the
+    # loader is supposed to rebuild the path from the id rather than trust it.
+    cat >"$WORK/conf/mounts.json" <<JSON
+{"version":1,"mounts":[
+ {"id":"$TAPE_ID","share":{"protocol":"nfs","host":"backup.local","port":null,"user":null,"tls":false,"resource":"/vault/tape","options":[]},"mountpoint":"/run/another/boot/$TAPE_ID","autostart":true,"mounted_at":null,"last_used":null,"last_error":null},
+ {"id":"$DEAD_ID","share":{"protocol":"nfs","host":"backup.local","port":null,"user":null,"tls":false,"resource":"/ufm-fail","options":[]},"mountpoint":"/run/another/boot/$DEAD_ID","autostart":true,"mounted_at":null,"last_used":null,"last_error":null},
+ {"id":"$SMB_ID","share":{"protocol":"smb","host":"backup.local","port":null,"user":null,"tls":false,"resource":"/Public","options":[]},"mountpoint":"/run/another/boot/$SMB_ID","autostart":true,"mounted_at":null,"last_used":null,"last_error":null},
+ {"id":"$QUIET_ID","share":{"protocol":"nfs","host":"srv","port":null,"user":null,"tls":false,"resource":"/export","options":[]},"mountpoint":"/run/another/boot/$QUIET_ID","autostart":false,"mounted_at":null,"last_used":null,"last_error":null}
+]}
+JSON
+
+    # One run, four marked shares, three answers. The first mounts, the second is
+    # refused by the shim, the third needs a password that was never stored, and
+    # the fourth is not marked at all and so is not mentioned.
+    STARTED=$(date +%s)
+    out=$("$BIN" --connect-at-login --json 2>&1) && code=0 || code=$?
+    [ "$code" = 0 ] ||
+        fail "a run in which one share failed should still exit 0" "exit $code: $out"
+    printf '%s\n' "$out" >"$WORK/login.json"
+    grep -q '"result":"mounted"' "$WORK/login.json" ||
+        fail "the share that mounts is not reported as mounted" "$(cat "$WORK/login.json")"
+    grep -q '"result":"failed"' "$WORK/login.json" ||
+        fail "the share whose mount was refused is not reported as failed" "$(cat "$WORK/login.json")"
+    grep -q '"result":"skipped"' "$WORK/login.json" ||
+        fail "the share with no stored password is not reported as skipped" "$(cat "$WORK/login.json")"
+    grep -q '"not_mounted":2' "$WORK/login.json" ||
+        fail "the count of shares left unmounted is wrong" "$(cat "$WORK/login.json")"
+    # One entry per marked share. The report is a single line of JSON, so counting
+    # occurrences is what is being asked, and `grep -c` counts lines instead.
+    [ "$(grep -o '"attempted":' "$WORK/login.json" | wc -l)" = 3 ] ||
+        fail "the report is not one entry per marked share" "$(cat "$WORK/login.json")"
+    grep -q "$QUIET_ID" "$WORK/login.json" &&
+        fail "a share nobody marked connect at login was reported on" "$(cat "$WORK/login.json")"
+    ok "one run reports mounted, failed and skipped, and ignores the unmarked share"
+
+    # The child's own words have to survive into the report: a session tool shows
+    # this text, and "mount failed" would tell a user nothing about which of the
+    # three problems they have.
+    grep -q 'the fixture asked for a failure' "$WORK/login.json" ||
+        fail "the failure the helper reported did not reach the report" "$(cat "$WORK/login.json")"
+    ok "a failing share carries the reason the helper gave"
+
+    # What the report claimed, as far as the kernel and the disk are concerned.
+    grep -q ' / '"$WORK"'/mnt/'"$TAPE_ID"' ' /proc/self/mountinfo ||
+        fail "the share reported mounted is not in the kernel's table"
+    grep -q ' / '"$WORK"'/mnt/'"$DEAD_ID"' ' /proc/self/mountinfo &&
+        fail "a share whose mount was refused is listed as mounted"
+    [ -d "$DEAD_POINT" ] || fail "a failed login mount left no mount point to retry into"
+    [ -z "$(ls -A "$DEAD_POINT")" ] || fail "a failed login mount mounted something anyway"
+    [ ! -e "$WORK/mnt/$SMB_ID" ] ||
+        fail "a share with no stored password was mounted rather than skipped"
+    [ ! -e "$WORK/mnt/$QUIET_ID" ] ||
+        fail "an unmarked share was mounted, so marking it means nothing"
+    ok "the run mounts what it says and leaves the rest alone"
+
+    # The sidebar reaches a share through the network directory, and a share that
+    # connected at login has to be reachable the same way as one the user
+    # connected by hand — otherwise the morning's mounts are only visible in a
+    # location bar.
+    [ -L "$WORK/net/tape" ] ||
+        fail "a share connected at login is missing from the network directory"
+    [ "$(readlink "$WORK/net/tape")" = "$TAPE_POINT" ] ||
+        fail "the network link does not point at the mount point the run used" \
+            "$(readlink "$WORK/net/tape")"
+    [ ! -e "$WORK/net/ufm-fail" ] ||
+        fail "a share that did not mount was linked into the network directory anyway"
+    ok "a share connected at login is linked into the network directory"
+
+    # The elevation is part of the claim: NFS needs root, the plan asks for it
+    # through pkexec, and the action id has to be the one the shipped policy
+    # declares or the call is refused by polkit rather than tested here. Reading
+    # the first elevation as words is the same check section 1 makes on `mount`.
+    set --
+    while IFS= read -r word; do
+        set -- "$@" "$word"
+        [ $# -lt 11 ] || break
+    done <"$UFM_PKEXEC_LOG"
+    [ "$1" = org.uflinux.files.mount ] ||
+        fail "the plan elevated under the wrong polkit action" "$(tr '\n' ' ' <"$UFM_PKEXEC_LOG")"
+    [ "$2" = "$WORK/bin/uflinux-files-mount" ] ||
+        fail "pkexec was told to run something other than the helper off \$PATH" "$2"
+    [ "$3" = mount ] ||
+        fail "the helper was not handed its verb first" "$(tr '\n' ' ' <"$UFM_PKEXEC_LOG")"
+    [ "$4$5" = '--typenfs' ] ||
+        fail "the login path did not ask for the NFS helper" "$(tr '\n' ' ' <"$UFM_PKEXEC_LOG")"
+    [ "$7" = backup.local:/vault/tape ] ||
+        fail "the export reached the helper in the wrong position" "$(tr '\n' ' ' <"$UFM_PKEXEC_LOG")"
+    [ "$9" = "$TAPE_POINT" ] ||
+        fail "the mount point rebuilt from the id is not the one the helper was given" \
+            "$(tr '\n' ' ' <"$UFM_PKEXEC_LOG")"
+    # `${11}` rather than `$11`: a shell with no arrays reads the bare form as the
+    # first word followed by a literal digit.
+    [ "${11}" = noatime ] ||
+        fail "the NFS options the backend builds were not handed over" "$(tr '\n' ' ' <"$UFM_PKEXEC_LOG")"
+    elevations=$(grep -c '^org.uflinux.files.mount$' "$UFM_PKEXEC_LOG" || :)
+    [ "$elevations" = 2 ] ||
+        fail "the run elevated once per share it tried, and not for the skipped one" \
+            "asked for root $elevations times, expected 2"
+    ok "the privileged mounts go through pkexec under the action the policy declares"
+
+    # One field of one record, from the pretty-printed file the table writes. The
+    # report says what this run decided; the file is what the next run, the badge
+    # in the Network group, and idle-detach read, so both have to be right.
+    table_field() {
+        awk -v want="$1" -v field="\"$2\"" '
+            index($0, "\"id\": ") { split($0, a, "\""); cur = a[4] }
+            index($0, field ": ") && cur == want {
+                sub(/^[[:space:]]*"[^"]*": /, "")
+                sub(/,$/, "")
+                print
+                exit
+            }
+        ' "$WORK/conf/mounts.json"
+    }
+    case $(table_field "$TAPE_ID" mounted_at) in
+        '' | null) fail "a share mounted at login has no timestamp in the table" ;;
+        *) ;;
+    esac
+    [ "$(table_field "$TAPE_ID" mounted_at)" -ge "$STARTED" ] ||
+        fail "the login run stored a mount timestamp from before the run" \
+            "$(table_field "$TAPE_ID" mounted_at)"
+    case $(table_field "$TAPE_ID" last_error) in
+        null) ;;
+        *) fail "a successful mount left an old failure beside the record" ;;
+    esac
+    case $(table_field "$DEAD_ID" last_error) in
+        *'asked for a failure'*) ;;
+        *) fail "the reason is not stored beside the record for the group to show" \
+            "$(table_field "$DEAD_ID" last_error)" ;;
+    esac
+    case $(table_field "$DEAD_ID" mounted_at) in
+        null) ;;
+        *) fail "a share that never mounted claims a mount timestamp" ;;
+    esac
+    ok "the table on disk records the mount, the failure and nothing invented"
+
+    # The same run again, in the plain form a session starter actually uses. The
+    # share that is up is not mounted twice, the one that failed is tried again,
+    # and the shape is the sweep's: `verb<TAB>id` with the reason under it.
+    "$BIN" --connect-at-login >"$WORK/login2.txt" 2>&1 ||
+        fail "a second login run should succeed too" "$(cat "$WORK/login2.txt")"
+    grep -qF -- "$(printf 'already\t%s' "$TAPE_ID")" "$WORK/login2.txt" ||
+        fail "a share that is already up is not reported as already" "$(cat "$WORK/login2.txt")"
+    grep -q 'was already connected' "$WORK/login2.txt" ||
+        fail "the answer for a live share does not say it was already connected" \
+            "$(cat "$WORK/login2.txt")"
+    grep -qF -- "$(printf 'failed\t%s' "$DEAD_ID")" "$WORK/login2.txt" ||
+        fail "a share that failed once is never tried again" "$(cat "$WORK/login2.txt")"
+    elevations=$(grep -c '^org.uflinux.files.mount$' "$UFM_PKEXEC_LOG" || :)
+    [ "$elevations" = 3 ] ||
+        fail "the second run should retry only the share that failed" \
+            "asked for root $elevations times, expected 3"
+    grep -q ' / '"$WORK"'/mnt/'"$TAPE_ID"' ' /proc/self/mountinfo ||
+        fail "the second run detached the share it decided was already up"
+    ok "a second run says already rather than mounting twice, and retries the failure"
+
+    # The case that runs on almost every machine: a table with nothing marked.
+    # Printing nothing at all would be indistinguishable from a command that was
+    # never wired up, which is what a session starter has to be able to tell.
+    rm -f "$WORK/conf/mounts.json"
+    "$BIN" --connect-at-login >"$WORK/login3.txt" 2>&1 ||
+        fail "a table with nothing marked should be a successful no-op"
+    grep -q 'nothing marked connect at login' "$WORK/login3.txt" ||
+        fail "an empty table is not reported as empty" "$(cat "$WORK/login3.txt")"
+    ok "a table with nothing marked says so instead of printing nothing"
+fi
+
+# ---------------------------------------------------------------------------
+# 7. Nothing outside the sandbox was touched.
 # ---------------------------------------------------------------------------
 
 [ -e "$HOME/.config/uflinux/filemanager/mounts.json" ] &&

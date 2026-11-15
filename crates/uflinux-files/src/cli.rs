@@ -263,8 +263,9 @@ mod tests {
     #[test]
     fn the_two_session_modes_are_separate_runs_because_they_do_opposite_things() {
         // One detaches what the kernel has forgotten, the other mounts what the
-        // user asked for. A unit file that grew both would run one of them by
-        // accident, so it is refused rather than ordered by whichever came first.
+        // user asked for. A session starter that grew both would run one of them
+        // by accident, so it is refused rather than ordered by whichever came
+        // first.
         let error =
             parse(&args(&["--sweep-mounts", "--connect-at-login"])).expect_err("should be refused");
         assert!(

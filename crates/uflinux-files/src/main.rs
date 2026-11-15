@@ -86,8 +86,8 @@ fn sweep(options: &cli::Sweep) -> ExitCode {
 /// Like [`sweep`], the exit code is about the run rather than about each share: a
 /// server that is not up yet is an ordinary morning, and the reason is stored
 /// beside the record for the Network group to show. What makes this run worth
-/// watching is its output, not its status — a session unit that failed here would
-/// have failed to answer, not failed to mount.
+/// watching is its output, not its status — a session starter that failed here
+/// would have failed to answer, not failed to mount.
 fn connect(options: cli::Connect) -> ExitCode {
     let mut runner = Runner::open(Layout::system());
     let login = runner.connect_at_login();

@@ -122,11 +122,11 @@ impl Attempt {
 /// What a connect-at-login run did, in the order the table lists the shares.
 ///
 /// The shape [`ufm_mount::sweep::Sweep`] has, for the same reason: this runs from
-/// a session unit with no terminal attached, so the record of the run is whatever
-/// it prints. A run that tried nothing is not an error — a user who never ticked
-/// the box has nothing to connect — and a run whose server was down is not one the
-/// session can act on either, since the reason is already written beside the
-/// record and Reconnect is one click in a window.
+/// a session starter with no terminal attached, so the record of the run is
+/// whatever it prints. A run that tried nothing is not an error — a user who never
+/// ticked the box has nothing to connect — and a run whose server was down is not
+/// one the session can act on either, since the reason is already written beside
+/// the record and Reconnect is one click in a window.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Login {
     attempts: Vec<Attempt>,
@@ -456,15 +456,16 @@ impl Runner {
     /// to each of them.
     ///
     /// The point of this run is that nobody is asked anything: it happens from a
-    /// session unit, before a window exists, so a share that would need a password
-    /// or a polkit prompt is left alone rather than started and watched fail. That
+    /// session starter, before a window exists, so a share that would need a
+    /// password or a polkit prompt is left alone rather than started and watched
+    /// fail. That
     /// is the same test [`Self::can_reconnect`] makes for a Reconnect row, for the
     /// same reason — an attempt known in advance to fail costs a mount point and a
     /// confusing error, and buys nothing.
     ///
     /// A share already mounted is reported and left as it is. Two windows, or a
-    /// session unit and a late `--connect-at-login`, will both ask; the second one
-    /// should be a no-op and not a "device or resource busy" the user has to
+    /// session starter and a late `--connect-at-login`, will both ask; the second
+    /// one should be a no-op and not a "device or resource busy" the user has to
     /// interpret. A share sitting on a *dead* mount point is likewise left alone:
     /// mounting over a stale mount point does not work, and detaching it is what
     /// `--sweep-mounts` is for — the two runs are separate precisely so that this
