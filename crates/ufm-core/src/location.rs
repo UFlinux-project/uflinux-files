@@ -191,6 +191,18 @@ impl Location {
         Self::Virtual(VirtualDir::Computer)
     }
 
+    /// Which synthesized collection this location names, if it names one.
+    /// A saved search is a result set rather than a collection, so it is not
+    /// answered here; a reader deciding what to do with a location that is not
+    /// a directory needs the one and not the other.
+    #[must_use]
+    pub fn virtual_dir(&self) -> Option<VirtualDir> {
+        match self {
+            Self::Virtual(dir) => Some(*dir),
+            Self::File { .. } | Self::Archive { .. } | Self::Search(_) => None,
+        }
+    }
+
     /// The archive container, when this location is inside one.
     #[must_use]
     pub fn archive_path(&self) -> Option<&Path> {

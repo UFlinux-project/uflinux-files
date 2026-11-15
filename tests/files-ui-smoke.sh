@@ -1071,6 +1071,54 @@ fi
 "$BIN" computer:// >"$ROOT/second.log" 2>&1 || fail "a second invocation exits non-zero"
 has_frame "Computer" "a second invocation opens a Computer window in the running instance"
 
+# What is inside that window, read from its own subtree. An unscoped dump would
+# pass a check for "Home" on the strength of the other window's sidebar, which is
+# not what is being asked. The view is also the reason this invocation works at
+# all: `computer://` is not a directory, so there is nothing for a reader to read,
+# and until the view existed the location was handed to the local reader anyway.
+CFRAME=$(python3 "$A11Y" dump-frame Computer 2>/dev/null || true)
+if printf '%s\n' "$CFRAME" | grep -qF "$(printf '\tSystem\t')"; then
+    ok "the My Computer view shows the system drive"
+else
+    fail "the My Computer view shows the system drive (no card named 'System')"
+fi
+# "Home" appears twice in this window: once as the sidebar's place, once as the
+# card. Counting rather than merely matching is what makes the check about the
+# card, because the sidebar row alone would satisfy a plain match.
+if [ "$(printf '%s\n' "$CFRAME" | grep -cF "$(printf '\tHome\t')")" -ge 2 ]; then
+    ok "the My Computer view shows the home folder"
+else
+    fail "the My Computer view shows the home folder (only the sidebar says Home)"
+fi
+# The one thing a folder listing could never say, and the reason the view exists:
+# a card reports how full its filesystem is. The sidebar's Home row carries a
+# usage bar too, so the check counts: one line is the sidebar, two means a card
+# said it as well.
+if [ "$(printf '%s\n' "$CFRAME" | grep -cF "free of")" -ge 2 ]; then
+    ok "a card reports how full its filesystem is"
+else
+    fail "a card reports how full its filesystem is"
+fi
+# The bug by name. Handing `computer://` to the local reader used to answer
+# "not a valid location", printed as a banner in a window that then looked empty.
+if printf '%s\n' "$CFRAME" | grep -qF "not a valid location"; then
+    fail "Computer shows cards rather than a reader error"
+else
+    ok "Computer shows cards rather than a reader error"
+fi
+# The count in the bar counts cards. Left to the listing path it would have said
+# "Empty folder" about a window showing two drives.
+if printf '%s\n' "$CFRAME" | grep -qF "$(printf '\t2 items\t')"; then
+    ok "the status line counts the cards rather than entries read from disk"
+else
+    fail "the status line counts the cards rather than entries read from disk"
+fi
+if grep -qF "not a valid location" "$ROOT/second.log"; then
+    fail "opening Computer logs no reader error"
+else
+    ok "opening Computer logs no reader error"
+fi
+
 # --- --new-window really is a separate process --------------------------------------
 # Before: however many frames the primary has. After: one more, from a process that gave
 # up being the single instance so it would not just focus the window already open.

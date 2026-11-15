@@ -32,11 +32,13 @@ use gtk::prelude::*;
 use ufm_core::Location;
 use ufm_core::config::{Preferences, ViewMode};
 use ufm_core::entry::Entry;
+use ufm_core::location::VirtualDir;
 use ufm_core::paths;
 use ufm_core::sort::SortKey;
 use ufm_vfs::{Cancel, FsHints, Readers};
 
 use super::columns::Columns;
+use super::computer::{self, Card, CardId, ComputerView};
 use super::conflict;
 use super::connect;
 use super::extract;
@@ -48,7 +50,8 @@ use super::panel::{Panel, Place, Usage};
 use super::popup::{self, Popup};
 use super::preview::{self, Preview};
 use super::props;
-use super::row::Row;
+use super::recent;
+use super::row::{Row, format_items};
 use super::search::{Found, Outcome, Search};
 use super::thumb::Pipeline;
 use super::undo;
@@ -114,6 +117,9 @@ pub fn open(app: &gtk::Application, urls: &[String]) {
     // with the same rule about dotfiles, so that its first query cannot return a
     // dotfile the view would have hidden.
     let find = Search::new(&prefs.search_scope, prefs.search_content, prefs.show_hidden);
+    // The cards for `computer://`, built empty. The window is what fills them in,
+    // because the mount table and the capacities live in the window's state.
+    let computer = Rc::new(ComputerView::new());
 
     let shared = Rc::new(Shared {
         prefs: RefCell::new(prefs),
@@ -125,13 +131,14 @@ pub fn open(app: &gtk::Application, urls: &[String]) {
     });
 
     // The presentations that are not the grid/list stack.
-    let modes = mode_stack(&view, &columns, mode);
+    let modes = mode_stack(&view, &columns, &computer, mode);
 
     let ctx = Ctx {
         window: window.downgrade(),
         panel: Rc::downgrade(&panel),
         view: Rc::downgrade(&view),
         columns: Rc::clone(&columns),
+        computer: Rc::clone(&computer),
         modes,
         path,
         banner,
@@ -191,6 +198,7 @@ pub fn open(app: &gtk::Application, urls: &[String]) {
             _panel: panel,
             _view: view,
             _columns: columns,
+            _computer: computer,
             _shared: shared,
             _thumbs: thumbs,
             _queue: queue,
@@ -201,15 +209,23 @@ pub fn open(app: &gtk::Application, urls: &[String]) {
     });
 }
 
-/// The two presentations, in a stack that shows whichever one the preferences
-/// say this folder should use.
+/// The presentations, in a stack that shows whichever one the preferences say
+/// this folder should use.
 ///
 /// Columns is a sibling of the view rather than a child of it, because it keeps
-/// one model per folder instead of one model for the window.
-fn mode_stack(view: &View, columns: &Columns, mode: ViewMode) -> gtk::Stack {
+/// one model per folder instead of one model for the window. The cards are a
+/// sibling for the same reason: they are not a listing, and a folder's rows have
+/// nothing to do with a set of filesystems.
+fn mode_stack(
+    view: &View,
+    columns: &Columns,
+    computer: &ComputerView,
+    mode: ViewMode,
+) -> gtk::Stack {
     let modes = gtk::Stack::new();
     modes.add_named(view.widget(), Some("view"));
     modes.add_named(columns.widget(), Some("columns"));
+    modes.add_named(computer.widget(), Some("computer"));
     modes.set_hexpand(true);
     modes.set_vexpand(true);
     if mode == ViewMode::Columns {
@@ -312,7 +328,11 @@ struct Ctx {
     /// cached, and the handlers that write into it hold this same `Rc`. The
     /// cycle is broken by the window, which is what drops the last one.
     columns: Rc<Columns>,
-    /// Grid/list against columns. The view keeps its own stack inside this one.
+    /// The cards for `computer://`, for the same reason and by the same argument.
+    /// Repainted by the handlers that hear about mounts, unmounts and free space.
+    computer: Rc<ComputerView>,
+    /// Grid/list against columns against the cards. The view keeps its own stack
+    /// inside this one.
     modes: gtk::Stack,
     path: gtk::Label,
     banner: gtk::Box,
@@ -512,6 +532,10 @@ struct Window {
     _panel: Rc<Panel>,
     _view: Rc<View>,
     _columns: Rc<Columns>,
+    /// Likewise the cards. Their widget is inside `modes`, which is inside the
+    /// window, but the handlers that repaint them hold this `Rc` and must not be
+    /// the only thing keeping the flow alive.
+    _computer: Rc<ComputerView>,
     _shared: Rc<Shared>,
     /// The preview worker and its token table. Dropping this is what tells the
     /// worker to stop, so it has to outlive the widgets it paints into.
@@ -600,22 +624,94 @@ fn navigate(ctx: &Ctx, location: Location, record: bool) {
     // thing that replaces them, and reporting `Cleared` here would paint over it.
     ctx.find.reset();
     ctx.find.set_folder(location.as_path());
+    // Empty first, so a folder that is slow to read shows an empty view rather
+    // than the folder being left. For a virtual location this also clears the
+    // override the cards left in the status bar.
     view.set_entries(Vec::new());
+    // A synthesized collection has no reader, and a worker that cannot answer a
+    // location reports that as a failure — which is how `computer://` used to
+    // arrive with a banner saying it was not a local path. The two that are
+    // listings get one built here; the cards are the third presentation.
+    if let Some(dir) = location.virtual_dir() {
+        show_virtual(ctx, dir, &view);
+        select_place(ctx, &location);
+        sync_buttons(ctx);
+        sync_watches(ctx);
+        return;
+    }
     // Only while columns are on screen: building a chain reads every folder on
     // the path, and in grid mode that is work for panes nobody can see.
     if columns_on(ctx) {
         ctx.columns.show_chain(&location);
     }
-    if let Some(panel) = ctx.panel.upgrade() {
-        match place_for(&location) {
-            Some(place) => panel.select(&place),
-            None => panel.clear_selection(),
-        }
-    }
+    select_place(ctx, &location);
     sync_buttons(ctx);
 
     spawn_read(ctx, location, cancel, &view);
     sync_watches(ctx);
+}
+
+/// Highlight the sidebar row a location belongs to, or clear the highlight.
+fn select_place(ctx: &Ctx, location: &Location) {
+    if let Some(panel) = ctx.panel.upgrade() {
+        match place_for(location) {
+            Some(place) => panel.select(&place),
+            None => panel.clear_selection(),
+        }
+    }
+}
+
+/// Put a synthesized collection on screen: the cards, or a listing assembled from
+/// the history rather than read from a directory.
+///
+/// The stack is switched here rather than left to the preference for this location,
+/// because a collection is one presentation and not a choice the user makes per
+/// folder: the cards are the only way to show a set of capacities, and a list of
+/// files is a list of files.
+fn show_virtual(ctx: &Ctx, dir: VirtualDir, view: &View) {
+    match dir {
+        VirtualDir::Computer => {
+            ctx.computer.set_cards(&card_data(&ctx.shared));
+            ctx.modes.set_visible_child_name("computer");
+            // The cards are not rows, so the count in the bar would say "Empty
+            // folder" about a window showing six machines.
+            let places = u64::try_from(ctx.computer.card_count()).unwrap_or(u64::MAX);
+            view.set_status(Some(&format_items(places)));
+        }
+        VirtualDir::Recent => {
+            let readers = Arc::clone(&ctx.shared.readers);
+            let entries: Vec<Entry> = recent::load()
+                .iter()
+                .filter_map(|record| readers.metadata(&Location::file(record.path.clone())).ok())
+                .collect();
+            ctx.shared.state.borrow_mut().shown.clone_from(&entries);
+            ctx.modes.set_visible_child_name("view");
+            view.set_entries(entries);
+        }
+        // Nothing writes a star yet, so the collection is empty by definition
+        // rather than by chance — which is worth saying, because an empty view on
+        // its own reads as a folder that failed to fill.
+        VirtualDir::Starred => {
+            ctx.modes.set_visible_child_name("view");
+            show_banner(ctx, "Nothing starred yet");
+        }
+    }
+}
+
+/// The cards for the My Computer view, read from the window's own mount table and
+/// filesystem capabilities.
+///
+/// The kernel's table is re-read first: a share that died while this window was
+/// open is a card that should say so, and the alternative is a badge that says
+/// "Connected" about a mount point that is empty.
+fn card_data(shared: &Rc<Shared>) -> Vec<Card> {
+    let mut state = shared.state.borrow_mut();
+    state.runner.refresh();
+    computer::cards(
+        state.runner.table(),
+        |id| state.runner.state(id),
+        |path| shared.hints(path),
+    )
 }
 
 /// Re-read the folder on screen because the kernel said it changed.
@@ -840,6 +936,7 @@ fn apply(ctx: &Ctx, event: Event) {
             show_banner(ctx, &format!("{}: {message}", location.display()));
         }
         Event::Mounted { report } => mounted(ctx, report),
+        Event::Unmounted { report } => unmounted(ctx, report),
         Event::Operation { outcome } => operated(ctx, outcome),
         // Already answered above, before the view was looked for. The arm exists
         // because the match has to say something about every event, and a wildcard
@@ -999,6 +1096,37 @@ fn operated(ctx: &Ctx, outcome: ops::Outcome) {
     if let Some(panel) = ctx.panel.upgrade() {
         panel.set_usage(usages(&ctx.shared));
     }
+    // …and so do the cards, which say the same thing about the same filesystems.
+    ctx.computer.set_cards(&card_data(&ctx.shared));
+}
+
+/// A share a card's Disconnect asked to be let go, on a worker.
+///
+/// The shape of this handler is the difference between a mount and an unmount: a
+/// mount steps into the share, because a user who typed an address wants to be
+/// standing in it. An unmount does not move anybody — the share that just left is
+/// the one the window may be showing, and walking out of it would be the window
+/// admitting it did not know. So the table is re-read, the sidebar and the cards
+/// are repainted, and the answer is said out loud either way.
+fn unmounted(ctx: &Ctx, report: Report) {
+    {
+        let mut state = ctx.shared.state.borrow_mut();
+        state.runner.reload();
+    }
+    // The mount point is gone, and so is every fact cached about it: the listing of
+    // the folder it held, and the capacity and permissions of the filesystem that
+    // was behind it. Without this the sidebar keeps a bar for a share that is now
+    // an empty directory.
+    ctx.shared.readers.clear_fs_cache();
+    if let Some(panel) = ctx.panel.upgrade() {
+        panel.set_places(places(&ctx.shared));
+        panel.set_usage(usages(&ctx.shared));
+    }
+    ctx.computer.set_cards(&card_data(&ctx.shared));
+    // The window may be standing in the share that left, or in a folder that was
+    // under it. Its listing is now a listing of an empty directory, and the only
+    // honest answer is to say what happened and let the user look.
+    show_banner(ctx, &report.message);
 }
 
 /// The window and the queue, for the handlers that need both. Either can be gone
@@ -1076,14 +1204,28 @@ fn restored(ctx: &Ctx) {
     ctx.path.set_label(&location.display());
     let mode = ctx.shared.prefs.borrow().view_mode_for(&location);
     ctx.modes
-        .set_visible_child_name(if mode == ViewMode::Columns {
-            "columns"
-        } else {
-            "view"
-        });
-    if mode == ViewMode::Columns {
+        .set_visible_child_name(presentation(&location, mode));
+    if mode == ViewMode::Columns && !location.is_virtual() {
         ctx.columns.show_chain(&location);
     }
+}
+
+/// Which child of the mode stack a location should be shown in.
+///
+/// The cards win over the preference: a set of filesystems is one presentation, not
+/// a choice between grid and list, and a preference that moved the window off the
+/// cards would leave the window showing a folder that is not the one in the title
+/// bar. Columns are asked for only where there is a chain of folders to build.
+fn presentation(location: &Location, mode: ViewMode) -> &'static str {
+    if location.virtual_dir() == Some(VirtualDir::Computer) {
+        return "computer";
+    }
+    // The other two collections are listings, so they use the ordinary view, and
+    // only a real folder has a chain of folders to put in columns.
+    if location.is_virtual() || mode != ViewMode::Columns {
+        return "view";
+    }
+    "columns"
 }
 
 /// A share the connect dialog asked for has been attempted, on a worker.
@@ -1106,6 +1248,10 @@ fn mounted(ctx: &Ctx, report: Report) {
         panel.set_places(places(&ctx.shared));
         panel.set_usage(usages(&ctx.shared));
     }
+    // The share that just appeared is a card, and the window may be looking at the
+    // cards rather than at a folder — in which case navigating below would be the
+    // only other way to learn the mount happened.
+    ctx.computer.set_cards(&card_data(&ctx.shared));
     if !report.ok {
         show_banner(ctx, &report.message);
         return;
@@ -1514,6 +1660,73 @@ fn wire_handlers(panel: &Rc<Panel>, view: &Rc<View>, columns: &Rc<Columns>, ctx:
     };
     view.on_context(on_context.clone());
     columns.on_context(on_context);
+    // The cards answer for themselves rather than through a row: a card names a
+    // folder or a share, and the only two things worth doing with either are
+    // walking into it and letting go of it.
+    ctx.computer.on_open({
+        let ctx = ctx.clone();
+        move |id| open_card(&ctx, id)
+    });
+    ctx.computer.on_unmount({
+        let ctx = ctx.clone();
+        move |id| unmount_card(&ctx, &id)
+    });
+}
+
+/// Walk into the folder or the mount point a card names.
+fn open_card(ctx: &Ctx, id: CardId) {
+    let location = match id {
+        CardId::Local(path) => Location::file(path),
+        // The mount point comes from the table rather than from a rule about where
+        // mount points are made: the record is what the mount was made against,
+        // and a card whose share has since been re-mounted elsewhere should open
+        // where the record says it is now.
+        CardId::Mount(id) => {
+            let state = ctx.shared.state.borrow();
+            match state.runner.table().get(&id) {
+                Some(record) => Location::file(record.mountpoint.clone()),
+                // The share left between the repaint and the click. The card is
+                // already gone from the table, so the next repaint drops it too.
+                None => return,
+            }
+        }
+    };
+    navigate(ctx, location, true);
+}
+
+/// Let go of a share, on a worker.
+///
+/// [`Runner::unmount`] blocks on `umount`, on a FUSE daemon's shutdown and
+/// sometimes on polkit, and a window that froze for two seconds over a share that
+/// was busy looked broken even when it was only waiting. The worker owns its own
+/// runner, the same as the connect dialog's, because the record it retires has to
+/// be written against a table read after the dialog's answer rather than against
+/// one read when the window opened.
+fn unmount_card(ctx: &Ctx, id: &str) {
+    let Some(handle) = ctx.handle.borrow().clone() else {
+        return;
+    };
+    let id = id.to_string();
+    let spawned = thread::Builder::new()
+        .stack_size(256 * 1024)
+        .spawn(move || {
+            let mut runner = Runner::open(Layout::system());
+            let report = runner.unmount(&id);
+            handle.send(Event::Unmounted { report });
+        });
+    if spawned.is_err() {
+        // Out of threads. Nothing was attempted, so the message says so rather
+        // than naming a backend that never ran.
+        if let Some(handle) = ctx.handle.borrow().clone() {
+            handle.send(Event::Unmounted {
+                report: Report {
+                    message: "cannot start an unmount".to_string(),
+                    id: None,
+                    ok: false,
+                },
+            });
+        }
+    }
 }
 
 /// The window actions and their accelerators. Split in three because each part
@@ -1700,12 +1913,20 @@ fn mode_action(ctx: &Ctx) -> Rc<gio::SimpleAction> {
             if let Some(view) = ctx.view.upgrade() {
                 view.set_mode(mode);
             }
-            ctx.modes
-                .set_visible_child_name(if columns { "columns" } else { "view" });
+            let here = ctx.shared.state.borrow().current.clone();
+            // The cards stay under a mode change: the choice is between grid, list
+            // and columns, and a location with no rows behind it has none of the
+            // three to move to. The preference below still records the choice, so
+            // the next folder the user opens uses it.
+            let child = here.as_ref().map_or_else(
+                || if columns { "columns" } else { "view" },
+                |location| presentation(location, mode),
+            );
+            ctx.modes.set_visible_child_name(child);
             // Coming back to columns after a while, or arriving here for the
             // first time: the chain has to be built, and any pane that was
             // dropped while hidden has to come back.
-            if columns && !was_columns {
+            if columns && !was_columns && child == "columns" {
                 let (current, shown) = {
                     let state = ctx.shared.state.borrow();
                     (state.current.clone(), state.shown.clone())

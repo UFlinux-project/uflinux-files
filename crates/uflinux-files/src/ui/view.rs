@@ -76,6 +76,9 @@ struct Status {
     labels: RefCell<Vec<gtk::Label>>,
     shown: Cell<usize>,
     selected: Cell<usize>,
+    /// A line to say instead of the count, for the presentation beside this one
+    /// that has no rows of its own. See [`View::set_status`].
+    said: RefCell<Option<String>>,
 }
 
 impl Status {
@@ -84,19 +87,22 @@ impl Status {
             labels: RefCell::new(Vec::new()),
             shown: Cell::new(0),
             selected: Cell::new(0),
+            said: RefCell::new(None),
         }
     }
 
     fn report(&self) {
-        let shown = self.shown.get();
-        let selected = self.selected.get();
-        let text = if selected > 0 && selected != shown {
-            format!("{selected} of {shown} selected")
-        } else if shown == 0 {
-            "Empty folder".to_string()
-        } else {
-            format_items(u64::try_from(shown).unwrap_or(u64::MAX))
-        };
+        let text = self.said.borrow().clone().unwrap_or_else(|| {
+            let shown = self.shown.get();
+            let selected = self.selected.get();
+            if selected > 0 && selected != shown {
+                format!("{selected} of {shown} selected")
+            } else if shown == 0 {
+                "Empty folder".to_string()
+            } else {
+                format_items(u64::try_from(shown).unwrap_or(u64::MAX))
+            }
+        });
         for label in self.labels.borrow().iter() {
             label.set_text(&text);
         }
@@ -256,6 +262,10 @@ impl View {
         let rows = Row::rows(entries);
         self.status.shown.set(rows.len());
         self.status.selected.set(0);
+        // Rows the view is itself showing, so the count describes them again. An
+        // override belongs to a presentation with no rows, and lasts exactly as
+        // long as that presentation is on screen.
+        *self.status.said.borrow_mut() = None;
         self.store.splice(0, self.store.n_items(), &rows);
         self.status.report();
         // Replacing the rows can change what the selection means without any
@@ -269,7 +279,20 @@ impl View {
     pub fn push_batch(&self, entries: &[Entry]) {
         let rows = Row::rows(entries.to_vec());
         self.status.shown.set(self.len() + rows.len());
+        *self.status.said.borrow_mut() = None;
         self.store.extend_from_slice(&rows);
+        self.status.report();
+    }
+
+    /// Say `line` in the status bar instead of a row count, until the view is
+    /// given rows of its own.
+    ///
+    /// The My Computer cards are not rows, and a view holding six of them while
+    /// the bar reads "Empty folder" is a bar that contradicts the window. Passing
+    /// `None` asks for the count back, which is what any folder read does by
+    /// itself through [`View::set_entries`].
+    pub fn set_status(&self, line: Option<&str>) {
+        *self.status.said.borrow_mut() = line.map(str::to_string);
         self.status.report();
     }
 

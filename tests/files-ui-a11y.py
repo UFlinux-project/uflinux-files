@@ -121,6 +121,24 @@ def dump():
     return 0
 
 
+def dump_frame(wanted):
+    """Print the subtree of one window, by title.
+
+    The same tree `dump` prints, cut to one frame. A test that asks "does the
+    Computer view show a system drive" has to ask it of the Computer window: an
+    unscoped dump would answer yes because some other window happens to carry the
+    same word, which is not what was asked.
+    """
+    root = frame_named(wanted)
+    if root is None:
+        print("no frame named %s" % wanted)
+        return 2
+    lines = []
+    walk(root, lines)
+    print("\n".join(lines))
+    return 0
+
+
 def first_entry():
     """The first node with the `entry` role, which is the search field.
 
@@ -359,6 +377,8 @@ def main(argv):
     command = argv[0] if argv else "dump"
     if command == "dump":
         return dump()
+    if command == "dump-frame":
+        return dump_frame(argv[1])
     if command == "type":
         return type_into(argv[1])
     if command == "entry":
@@ -372,8 +392,8 @@ def main(argv):
     if command == "menu-press":
         return menu_press(argv[1])
     print(
-        "usage: files-ui-a11y.py [dump | type TEXT | entry | press NAME [FRAME] |"
-        " select NAME | menu | menu-press CHORD]",
+        "usage: files-ui-a11y.py [dump | dump-frame NAME | type TEXT | entry | "
+        "press NAME [FRAME] | select NAME | menu | menu-press CHORD]",
         file=sys.stderr,
     )
     return 64

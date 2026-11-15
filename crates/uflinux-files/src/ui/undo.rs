@@ -629,7 +629,6 @@ fn sidecar_path_of(entry: &Location) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
     use std::time::Duration;
 
     use super::super::job::Queue;
@@ -638,9 +637,7 @@ mod tests {
     /// `set_var` is unsafe in edition 2024 precisely because another thread may
     /// be reading the environment at the same time.
     fn env() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: Mutex<()> = Mutex::new(());
-        LOCK.lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        super::super::test_env()
     }
 
     #[allow(unsafe_code)]

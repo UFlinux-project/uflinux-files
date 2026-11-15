@@ -354,6 +354,7 @@ impl Columns {
             // a copy re-reading the folder it is copying into.
             Event::Batch { .. }
             | Event::Mounted { .. }
+            | Event::Unmounted { .. }
             | Event::Operation { .. }
             | Event::Thumb { .. }
             | Event::Sized { .. }

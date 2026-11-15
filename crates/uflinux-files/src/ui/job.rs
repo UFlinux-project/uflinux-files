@@ -53,6 +53,14 @@ pub enum Event {
     /// does. The [`Report`] carries the share id, which is what lets the window
     /// re-read the mount table and move into the new mount point.
     Mounted { report: Report },
+    /// A share was disconnected, or could not be. The same shape as
+    /// [`Event::Mounted`] and for the same reason — the helper blocks, so the
+    /// answer has to reach the main loop through the pipe — but handled
+    /// differently: stepping into the share that just left would land the window
+    /// in an empty mount point, so the window repaints and says what happened
+    /// instead. `My Computer` is where the answer is read, which is also where
+    /// the button that asked for it is.
+    Unmounted { report: Report },
     /// A file operation finished. The other variant that is not about a listing,
     /// and shaped on the same principle: a worker that changed something reports
     /// what it did and which folders it left behind, and the window decides

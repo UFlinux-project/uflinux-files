@@ -41,6 +41,8 @@ error type is named in the signature does not need an essay per method.
 | `uflinux-files-mount` | the argv handed to `mount(8)` contains no argument from the request that begins with `-`; a target that is a symlink, relative, world-readable, or somebody else's is refused; a `credentials=` file anyone can read is refused and its contents never reach an error message; a `pass=` option is refused; the owner comes from `PKEXEC_UID` and is never `0`. |
 | `uflinux-files` | the location on argv reaches the window; `--new-window` gives up being the single instance; the application id matches the desktop entry; a machine with no render node is asked for the cairo renderer, and an explicit `GSK_RENDERER` is never overridden; a paste plan drops the rows that cannot land and names the reason for each, growing `report (2).pdf` rather than replacing; copying a folder takes its contents and deleting one takes what is inside it; a prompt refuses an empty name, hands the typed name over exactly once, and pre-selects the stem of a filename but not its extension; a properties form draws a row only for a fact the entry actually has, spells one file without an `s`, says *at least* for a stopped walk, and holds the size row for a folder so the answer can be delivered into it or dropped when the dialog is gone; the Open With list is deduplicated by desktop entry, drops an entry that asked not to be shown, keeps a fallback when nothing is registered for the type, and names a file whose type nothing owns; a member of an archive is written out under its own name with its own bytes and a second one of the same name does not clobber the first, while a folder inside an archive is refused rather than written as a zero-byte file; a week-old write-out is swept; and a menu over one file offers Open With where a menu over a folder does not; a preview reads only the head of a file, refuses a binary by its `NUL` byte rather than by its extension, says `(empty file)` for an empty one and `(cannot be shown)` for an unreadable one, and takes text from a `JSON`, `XML` or shell script whose registration hides it under `application/`; arriving at columns mode paints the deepest pane from the listing the window already holds, and a read that was already running still overwrites those provisional rows when it answers. |
 | `uflinux-files` (job table) | a report never reaches the strip more than once per throttle window, and the first one always does; a job with no total shows a bar with no fraction rather than a fake one; a tally reads `512 KiB of 1.0 MiB` for bytes and `4 of 9` for rows; finishing the only job empties the table and says so exactly once; pulling the brakes reaches every job on the table, including a second one registered after the first; a report naming a job that already finished is dropped rather than resurrected; the strip's text is read back from the widgets rather than from a parallel copy of it, so it cannot disagree with what is drawn. |
+| `uflinux-files` (My Computer) | Home and the system drive are always cards and a desktop folder becomes one only when it exists; a connected share says `Connected`, carries its protocol's icon and renders its capacity as `256 KiB free of 1.0 MiB`; a share the kernel has lost is still listed but says `Disconnected`, shows its mount point where the capacity would go and cannot be opened; a filesystem that reports no size gets no bar; a share's label beats the last component of its URI; activating a card reaches the open hook exactly once with the card's own id, and a Disconnect button reaches the unmount hook with the record id rather than the label. |
+| `uflinux-files` (history) | an XBEL record becomes a row only for a local file that still exists; a `added` timestamp is decoded to a fixed instant, a UTC offset is subtracted rather than ignored, and `modified` stands in when `added` is absent; percent escapes are decoded; a file written twice is one row carrying the newer time; newest first, capped at the limit; a missing history file is an empty list rather than an error. |
 | `uflinux-files-provider` | the crate does not depend on GTK, checked against its own manifest; the bus name is taken through the C entry point whose handlers are nullable, not the gio-rs wrapper that aborts at logout; the polling deadline is longer than the timer that checks it; a missing login session is refused before the bus is asked for. |
 
 ## Archives
@@ -191,8 +193,22 @@ opens a field and the field takes typed
 text; a
 second invocation opens a `Computer` window in the running instance; `--new-window` opens
 a window rather than focusing an open one; and the indexer answers `Status` on the bus.
-The prompt is driven through the accessibility tree, by the `press` command of the probe,
+The prompt is driven through the accessibility tree, by the `probe`'s `press` command,
 which activates a node by name — the same controller path a mouse click takes.
+
+The Computer window is then read from its own subtree, with the probe's `dump-frame`
+command, and that scoping is load-bearing rather than tidy. The check wants to know
+whether a *card* reports a capacity, and the sidebar's Home row carries a usage bar that
+renders the same phrase — an unscoped dump would answer yes with no card on screen at
+all. So the checks count occurrences where a phrase is shared (two `free of` lines means
+the sidebar and a card, one means only the sidebar) and match on a tab-delimited node
+name where it is not. The window is also checked for the absence of the phrase that the
+bug printed: `not a valid location`, both in the tree and in the process's own output.
+Driving this window rather than pressing the sidebar's `Computer` row is a limitation of
+the probe worth recording: a sidebar row's accessible name sits on the `label` inside it,
+so `press Computer` activates the label, which is a no-op, and the row never fires
+`row-activated`. A row that should carry its place's name as its own accessible name is
+the real fix, and until then the second invocation is the route that reaches the view.
 
 The properties checks are the reason the probe's `press` takes an optional frame name. A
 folder window's titlebar carries a button labelled `Close`, and a depth-first walk from

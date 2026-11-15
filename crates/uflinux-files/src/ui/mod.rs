@@ -20,6 +20,7 @@
 #![allow(dead_code)]
 
 mod columns;
+mod computer;
 mod conflict;
 mod connect;
 mod css;
@@ -32,6 +33,7 @@ mod panel;
 mod popup;
 mod preview;
 mod props;
+mod recent;
 mod row;
 mod search;
 mod thumb;
@@ -42,6 +44,19 @@ mod window;
 
 #[cfg(test)]
 mod tk;
+
+/// Tests that change the process environment have to hold this, because
+/// `set_var` is unsafe in edition 2024 precisely because another thread may be
+/// reading the environment at the same time. The same guard `ufm-core` keeps, for
+/// the same reason: the override variables (`UFLINUX_FILES_DESKTOP_DIR`,
+/// `XDG_DATA_HOME`) are read by code under test in one module and written by a
+/// test in another, and both happen on worker threads of the test harness.
+#[cfg(test)]
+pub(crate) fn test_env() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 
 use std::ffi::OsStr;
 use std::path::Path;

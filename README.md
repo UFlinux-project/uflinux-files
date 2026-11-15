@@ -19,6 +19,11 @@ the model over D-Bus and never opens a window.
 
 - **Three views** of the same folder: icon grid, list with columns, and macOS
   Miller columns. Per-tab view mode, sort order and column widths are remembered.
+- **A My Computer view** for the things that are not folders: `computer://` renders
+  a card per drive and per mounted share, each saying how full its filesystem is
+  and whether the share is still there, with a Disconnect button on the ones that
+  can be. It is a fourth presentation rather than a fourth reader — there is no
+  directory behind it to read.
 - **Archives as folders**: zip, tar and its codecs, and 7z open like a directory
   and unpack with `<Ctrl>E` into a folder named after them. Read-only browsing
   plus extract; no write-back.

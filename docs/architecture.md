@@ -70,9 +70,11 @@ every cache key is a `Location`, and there are two kinds:
   separates the container from the path inside it; a literal `!` in a filename
   is percent-encoded, so the separator is unambiguous.
 
-Three more spellings exist for virtual folders backed by the indexer:
-`computer://`, `recent://`, `starred://` and `search://<id>`. They are views over
-data the other locations already describe, not a second filesystem.
+Three more spellings exist for collections that are not directories at all:
+`computer://`, `recent://` and `starred://`, plus `search://<id>` for the results
+of one query. They are views over data the other locations already describe, not a
+second filesystem, and none of them is ever handed to a `DirReader` — see
+[The My Computer view](#the-my-computer-view).
 
 Because mounting covers the network, `DirReader` has exactly two
 implementations: `Local` and `Archive`. A third per protocol would mean every
@@ -210,6 +212,55 @@ helper path makes.
 Nothing here speaks SMB, NFS or FTP. It plans a mount and runs it. See
 `docs/mounts.md` for the protocols, the privilege split and the credential
 rules.
+
+## The My Computer view
+
+`computer://` is not a directory, and pretending otherwise is what made the
+location print `not a valid location` before the view existed: the location was
+handed to the local reader like any other, the reader refused it because there is
+no path to open, and the window showed the refusal where a set of drives should
+have been. What is behind `computer://` is a set of *capacities* — the home
+folder, the system drive, a desktop folder that may or may not exist, and whatever
+the user has mounted — and a directory listing has no way to say
+`46.2 GiB free of 232 GiB`.
+
+So the view is a presentation, not a reader: the third child of the window's mode
+stack, beside the grid and the tree table. `navigate()` keeps all of its
+bookkeeping for a virtual location — history, sidebar selection, button
+sensitivity — and only the tail differs: it short-circuits before any worker
+exists, so no read is started for something that cannot be read.
+
+The cards are assembled by one pure function, `computer::cards(records, state,
+hints)`, which takes the mount table, a way to ask a record's state and a way to
+ask a path's capabilities, and returns plain `Card` values. The closures are the
+point. The window's state sits behind a `RefCell` that a card builder would
+otherwise have to borrow while painting, and the rules worth testing — which
+places always appear, when a desktop folder becomes a card, what a share whose
+kernel entry has gone missing says about itself — do not need a display, or a
+window, or a mount. The mount table is re-read before each repaint: a share that
+died while the window was open is a card that should say `Disconnected` rather
+than a badge that says `Connected` about an empty mount point.
+
+A share whose filesystem reports no size gets a card with the mount point where
+the capacity would go, and no bar, rather than a bar stuck at zero. A share that
+is gone is listed but not walked into; `can_open` follows the state, so activating
+a dead card does nothing rather than opening an empty folder and looking like a
+bug in the listing.
+
+The two things a card can do — open, disconnect — travel as hooks set once at
+construction rather than per repaint, because `set_cards` throws every widget away
+and rebuilding a handler each time would mean the handler a click reaches is the
+one from the last repaint. Disconnecting runs on a worker with the same layout the
+mount dialog uses, and reports through `Event::Unmounted`, which is also what
+repaints the cards: the view and the mount table are kept in step by the same
+event that keeps the sidebar in step.
+
+`recent://` is the other collection that is not a directory, and it is deliberately
+the boring case: `recently-used.xbel` is parsed into a list of paths, each one is
+`stat`ed through the reader the window already has, and the result is handed to the
+ordinary listing. Recent files *are* files, so only the source of the list is
+unusual. `starred://` has no writer yet and says so with a banner rather than
+showing an empty view, which reads as a folder that failed to fill.
 
 ## File operations
 
