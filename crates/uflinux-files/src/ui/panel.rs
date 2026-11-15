@@ -25,6 +25,8 @@ use ufm_core::entry::human_size;
 use ufm_core::paths;
 use ufm_core::sort::SortKey;
 
+use crate::ui::popup::MenuRow;
+
 /// A place the panel can offer to take the user.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Place {
@@ -246,6 +248,56 @@ impl Usage {
 
 type Opened = Rc<dyn Fn(&Place)>;
 
+/// What the right-click handler needs. The place, the widget the press landed on
+/// and the coordinates inside it — the same three the view's menu is built from,
+/// so the window can point the two menus at the same spot.
+type Context = Rc<dyn Fn(&Place, &gtk::Widget, f64, f64)>;
+
+/// The menu for one sidebar row.
+///
+/// The rows are [`MenuRow`]s rather than [`Command`]s because each one names the
+/// bookmark it acts on: the target is a URI rather than an index, since an index is
+/// a fact about a rendering that the next rebuild may have changed and a menu can
+/// stay open across a rebuild.
+///
+/// Only a bookmark has anything to say about itself. The standard places are
+/// derived from the filesystem, so renaming `Documents` would be a name with
+/// nothing behind it, and the mount rows belong to the mount table, which has its
+/// own dialog and its own Disconnect button on the card. A row with no rows is no
+/// menu at all rather than a popover with nothing in it.
+#[must_use]
+pub fn menu_for(place: &Place) -> Vec<MenuRow> {
+    let Place::Bookmark(bookmark) = place else {
+        return Vec::new();
+    };
+    let uri = bookmark.location.to_string();
+    vec![
+        MenuRow {
+            label: "Rename\u{2026}",
+            action: "win.rename-bookmark",
+            target: Some(uri.clone()),
+        },
+        // The two directions before the destructive row, because they are the
+        // reversible ones and because a menu that files `Remove` in the middle
+        // invites the mistake it is there to allow.
+        MenuRow {
+            label: "Move Up",
+            action: "win.bookmark-up",
+            target: Some(uri.clone()),
+        },
+        MenuRow {
+            label: "Move Down",
+            action: "win.bookmark-down",
+            target: Some(uri.clone()),
+        },
+        MenuRow {
+            label: "Remove",
+            action: "win.remove-bookmark",
+            target: Some(uri),
+        },
+    ]
+}
+
 /// What the click handler needs. Kept behind an `Rc` because a signal handler
 /// must own everything it touches: borrowing the panel itself would tie the
 /// handler to a borrow that outlives the method that installed it.
@@ -253,6 +305,7 @@ type Opened = Rc<dyn Fn(&Place)>;
 struct Shared {
     places: RefCell<Vec<Place>>,
     on_open: RefCell<Option<Opened>>,
+    on_context: RefCell<Option<Context>>,
 }
 
 /// The sidebar.
@@ -299,6 +352,12 @@ impl Panel {
     /// React to the user choosing a place.
     pub fn on_open<F: Fn(&Place) + 'static>(&self, f: F) {
         *self.shared.on_open.borrow_mut() = Some(Rc::new(f));
+    }
+
+    /// React to a right-click on a place's row. The window owns the menu; the
+    /// panel only says which row was pressed and where the pointer was.
+    pub fn on_context<F: Fn(&Place, &gtk::Widget, f64, f64) + 'static>(&self, f: F) {
+        *self.shared.on_context.borrow_mut() = Some(Rc::new(f));
     }
 
     /// Rebuild the list. The order is the caller's, so bookmarks stay where the
@@ -393,7 +452,39 @@ impl Panel {
         // activating the row activates the label, which does nothing.
         let name = place.label();
         row.update_property(&[gtk::accessible::Property::Label(&name)]);
+        row.add_controller(self.context_gesture(place));
         row
+    }
+
+    /// The right-click gesture for one row.
+    ///
+    /// The place travels with the gesture rather than being looked up by index,
+    /// because the index is a fact about the current rebuild.
+    ///
+    /// The row is deliberately *not* selected on press, unlike a row in the view.
+    /// A view's selection is the user's to move; the sidebar's is a rendering of
+    /// which folder the window is standing in, repainted on every navigation. Lit
+    /// up a row the window did not walk into and the two halves of the window
+    /// disagree about where the user is — which is worse than a menu pointing at a
+    /// row that is not lit, especially as the menu is already pointing at it.
+    fn context_gesture(&self, place: &Place) -> gtk::GestureClick {
+        let gesture = gtk::GestureClick::new();
+        gesture.set_button(3);
+        let shared = Rc::clone(&self.shared);
+        let place = place.clone();
+        gesture.connect_pressed(move |controller, n_press, x, y| {
+            if n_press != 1 {
+                return;
+            }
+            let Some(widget) = controller.widget() else {
+                return;
+            };
+            let handler = shared.on_context.borrow().as_ref().map(Rc::clone);
+            if let Some(handler) = handler {
+                handler(&place, &widget, x, y);
+            }
+        });
+        gesture
     }
 
     fn wire(&self) {
@@ -594,6 +685,61 @@ mod tests {
             previous = Some(*group);
         }
         assert_eq!(runs, 1, "the folder rows should be one contiguous run");
+    }
+
+    #[test]
+    fn a_bookmark_row_offers_a_menu_about_itself() {
+        let bookmark = Bookmark {
+            location: Location::parse("/srv/work").expect("a path is a location"),
+            label: Some("Work".into()),
+            icon: None,
+        };
+        let rows = menu_for(&Place::Bookmark(bookmark));
+        let labels: Vec<&str> = rows.iter().map(|row| row.label).collect();
+        assert_eq!(
+            labels,
+            ["Rename\u{2026}", "Move Up", "Move Down", "Remove"],
+            "the reversible rows before the destructive one, in the order a person reads them"
+        );
+        for row in &rows {
+            assert!(
+                row.action.starts_with("win."),
+                "{} points outside this window's actions: {}",
+                row.label,
+                row.action
+            );
+            // Every row names the bookmark rather than a position in the list, so
+            // that a menu left open across a rebuild still edits the row it opened
+            // over.
+            assert_eq!(
+                row.target.as_deref(),
+                Some("file:///srv/work"),
+                "{} should say which bookmark it means",
+                row.label
+            );
+        }
+    }
+
+    #[test]
+    fn a_row_that_cannot_answer_for_itself_gets_no_menu() {
+        // No menu at all rather than an empty popover: these rows are derived from
+        // the filesystem or owned by the mount table, which has its own dialog.
+        for place in [
+            Place::Home,
+            Place::Trash,
+            Place::Starred,
+            Place::Folder(PathBuf::from("/srv/work")),
+            Place::Mount {
+                id: "smb-nas-filmy".into(),
+                label: "nas/filmy".into(),
+            },
+        ] {
+            assert!(
+                menu_for(&place).is_empty(),
+                "{} should not offer a menu",
+                place.label()
+            );
+        }
     }
 
     #[test]

@@ -18,7 +18,8 @@ the model over D-Bus and never opens a window.
 ## What it does
 
 - **Three views** of the same folder: icon grid, list with columns, and macOS
-  Miller columns. Per-tab view mode, sort order and column widths are remembered.
+  Miller columns. View mode, sort order and column widths are remembered per
+  folder, so a folder opened in columns stays in columns.
 - **A My Computer view** for the things that are not folders: `computer://` renders
   a card per drive and per mounted share, each saying how full its filesystem is
   and whether the share is still there, with a Disconnect button on the ones that
@@ -33,8 +34,9 @@ the model over D-Bus and never opens a window.
 - **Sidebar bookmarks**: `<Ctrl>D` puts the folder the window is standing in in the
   sidebar, and takes it out again if it is already there. Bookmarks are spliced into
   the Folders group rather than listed below the system rows, so the sidebar says
-  `Folders` once, and a bookmark keeps the folder's own name until there is a way to
-  rename it.
+  `Folders` once. Right-clicking a bookmark renames it, moves it up or down the
+  list, or takes it out — the only sidebar row with a menu of its own, because it is
+  the only one that is not derived from something else.
 - **Archives as folders**: zip, tar and its codecs, and 7z open like a directory
   and unpack with `<Ctrl>E` into a folder named after them. Read-only browsing
   plus extract; no write-back.

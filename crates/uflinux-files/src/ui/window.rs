@@ -47,7 +47,7 @@ use super::job::{Event, Handle, Queue};
 use super::jobs::Jobs;
 use super::openwith;
 use super::ops;
-use super::panel::{Panel, Place, Usage};
+use super::panel::{self, Panel, Place, Usage};
 use super::popup::{self, Popup};
 use super::preview::{self, Preview};
 use super::props;
@@ -1783,6 +1783,25 @@ fn wire_handlers(panel: &Rc<Panel>, view: &Rc<View>, columns: &Rc<Columns>, ctx:
     };
     view.on_context(on_context.clone());
     columns.on_context(on_context);
+    // The sidebar answers for itself as well, but only the rows that have anything
+    // to say: [`panel::menu_for`] returns nothing for a derived place, and
+    // [`Popup::show_rows`] opens nothing at all when handed no rows, so a
+    // right-click on `Home` costs one call and shows no popover.
+    //
+    // The row is not selected first, which the view and the panes both do. The
+    // sidebar's selection is a rendering of the folder the window is standing in,
+    // so lighting a row the window did not walk into would leave the sidebar and
+    // the title bar disagreeing about where the user is.
+    panel.on_context({
+        let ctx = ctx.clone();
+        move |place, widget, x, y| {
+            let Some(window) = ctx.window.upgrade() else {
+                return;
+            };
+            ctx.popup
+                .show_rows(&window, &panel::menu_for(place), Some((widget, x, y)));
+        }
+    });
     // The cards answer for themselves rather than through a row: a card names a
     // folder or a share, and the only two things worth doing with either are
     // walking into it and letting go of it.
@@ -1859,6 +1878,7 @@ fn wire_actions(app: &gtk::Application, window: &gtk::ApplicationWindow, ctx: &C
     let mut actions = nav_actions(ctx);
     actions.extend(view_actions(app, ctx));
     actions.extend(op_actions(ctx));
+    actions.extend(bookmark_actions(ctx));
     actions.extend(context_actions(ctx));
     for action in &actions {
         ActionMapExt::add_action(window, action.as_ref());
@@ -2432,15 +2452,11 @@ fn sync_bookmark(ctx: &Ctx) {
 
 /// Whether the folder on screen is already in the sidebar, which is what decides
 /// whether a menu says `Bookmark` or `Remove Bookmark`. Asked of the store rather
-/// than of the sidebar's rows, because the rows are a rendering of it.
+/// than of the sidebar's rows, because the rows are a rendering of it — and through
+/// [`Bookmarks::find`], so that the answer follows the same comparison the store
+/// itself makes rather than a second rule written beside it.
 fn current_bookmarked(ctx: &Ctx) -> bool {
-    let Some(folder) = target_folder(ctx) else {
-        return false;
-    };
-    ctx.shared
-        .bookmark_items()
-        .iter()
-        .any(|bookmark| bookmark.location == folder)
+    target_folder(ctx).is_some_and(|folder| ctx.shared.bookmarks.borrow().find(&folder).is_some())
 }
 
 /// `bookmark`: put the folder in the title bar in the sidebar, or take it out.
@@ -2467,23 +2483,169 @@ fn bookmark_action(ctx: &Ctx) -> Rc<gio::SimpleAction> {
                 .map_or_else(|| folder.display(), ToString::to_string);
             let message = {
                 let mut bookmarks = ctx.shared.bookmarks.borrow_mut();
-                if bookmarks
-                    .items
-                    .iter()
-                    .any(|bookmark| bookmark.location == folder)
-                {
+                if bookmarks.find(&folder).is_some() {
                     bookmarks.remove(&folder);
                     format!("Bookmark removed for {name}")
                 } else {
-                    // No label: the folder's own name is what the row should say
-                    // until the user decides it should say something else, and
-                    // there is no UI for that decision yet.
+                    // No label, so the row says the folder's own name. That is the
+                    // right default rather than a placeholder: the name a person
+                    // would type is usually the one already on the folder, and
+                    // `Rename` on the sidebar's menu is there for the times it is
+                    // not.
                     bookmarks.add(folder.clone(), None);
                     format!("Bookmarked {name}")
                 }
             };
             let _ = ctx.shared.bookmarks.borrow().save(&Bookmarks::path());
             bookmarks_changed(&ctx, &message);
+        }
+    });
+    Rc::new(action)
+}
+
+/// Save the bookmark store and repaint the sidebar from it. The two halves of
+/// every bookmark command, split out because all four of them do exactly this and
+/// a command that forgot one of the two leaves the file and the screen disagreeing.
+fn bookmarks_updated(ctx: &Ctx, message: &str) {
+    let _ = ctx.shared.bookmarks.borrow().save(&Bookmarks::path());
+    bookmarks_changed(ctx, message);
+}
+
+/// The bookmark a sidebar menu row named.
+///
+/// The parameter is the URI the row was built with, re-parsed rather than carried
+/// as a position: the menu can sit open across a rebuild, and a position says
+/// nothing about which bookmark was meant once the list has moved. A URI that no
+/// longer names a bookmark is not an error to report — the store lookup that
+/// follows answers it — so this only answers whether there is a place to look up.
+fn bookmark_named(parameter: Option<&glib::Variant>) -> Option<Location> {
+    Location::parse(parameter?.str()?).ok()
+}
+
+/// The four commands a sidebar row offers, all of them about the bookmark the row
+/// names rather than about the folder in the title bar.
+///
+/// None of the four is ever disabled, unlike [`bookmark_action`]: the gate is the
+/// menu itself, which [`panel::menu_for`] only builds for a bookmark row. What the
+/// store holds can change while the menu is open — another window, or a folder
+/// deleted out from under the row — so each handler asks the store again and says
+/// so when the answer has gone.
+fn bookmark_actions(ctx: &Ctx) -> Vec<Rc<gio::SimpleAction>> {
+    vec![
+        rename_bookmark_action(ctx),
+        shift_bookmark_action("bookmark-up", true, ctx),
+        shift_bookmark_action("bookmark-down", false, ctx),
+        remove_bookmark_action(ctx),
+    ]
+}
+
+/// `rename-bookmark`: ask what the shortcut should be called, then write it.
+///
+/// The prompt is the reason this is a separate action from [`bookmark_action`]:
+/// that one knows the folder and not the new name, and this one knows the name and
+/// not the folder. The initial text is [`Bookmark::display`] rather than the stored
+/// label, so a bookmark that has never been renamed is offered the name its row
+/// actually shows rather than an empty box.
+fn rename_bookmark_action(ctx: &Ctx) -> Rc<gio::SimpleAction> {
+    let action = gio::SimpleAction::new("rename-bookmark", Some(glib::VariantTy::STRING));
+    action.connect_activate({
+        let ctx = ctx.clone();
+        move |_action, parameter| {
+            let (Some(window), Some(location)) = (ctx.window.upgrade(), bookmark_named(parameter))
+            else {
+                return;
+            };
+            let Some(bookmark) = ctx
+                .shared
+                .bookmark_items()
+                .into_iter()
+                .find(|bookmark| bookmark.location == location)
+            else {
+                return;
+            };
+            let current = bookmark.display();
+            let worker = ctx.clone();
+            ops::ask_bookmark_label(&window, &current, move |typed| {
+                let message = if worker
+                    .shared
+                    .bookmarks
+                    .borrow_mut()
+                    .rename(&location, Some(typed))
+                {
+                    "Bookmark renamed"
+                } else {
+                    // The prompt outlived the bookmark — removed in another window,
+                    // or by the same keystroke twice. Nothing was written.
+                    "That bookmark is no longer in the sidebar"
+                };
+                bookmarks_updated(&worker, message);
+            });
+        }
+    });
+    Rc::new(action)
+}
+
+/// `bookmark-up` and `bookmark-down`: one row, one direction, so one function.
+///
+/// The store's own reorder is what decides whether anything moves: a bookmark
+/// already at the end of the list asked to go further down stays where it is, which
+/// is why the row is offered rather than hidden at the edges — a menu whose rows
+/// appear and disappear as the list moves is harder to learn than one that is
+/// sometimes inert.
+fn shift_bookmark_action(name: &'static str, up: bool, ctx: &Ctx) -> Rc<gio::SimpleAction> {
+    let action = gio::SimpleAction::new(name, Some(glib::VariantTy::STRING));
+    action.connect_activate({
+        let ctx = ctx.clone();
+        move |_action, parameter| {
+            let Some(location) = bookmark_named(parameter) else {
+                return;
+            };
+            let message = {
+                let mut bookmarks = ctx.shared.bookmarks.borrow_mut();
+                let Some(at) = bookmarks.find(&location) else {
+                    return;
+                };
+                let name = bookmarks.items[at].display();
+                let to = if up {
+                    at.saturating_sub(1)
+                } else {
+                    at.saturating_add(1)
+                };
+                bookmarks.move_item(at, to);
+                let word = if up { "up" } else { "down" };
+                format!("Moved {name} {word}")
+            };
+            bookmarks_updated(&ctx, &message);
+        }
+    });
+    Rc::new(action)
+}
+
+/// `remove-bookmark`: take the row out of the sidebar.
+///
+/// Not the same action as <kbd>Ctrl</kbd>D, which acts on the folder in the title
+/// bar. Reached from a row, this one has to act on the row, and standing in
+/// `~/Projects` while right-clicking the shortcut for `/srv/data` is exactly the
+/// case where the two differ.
+fn remove_bookmark_action(ctx: &Ctx) -> Rc<gio::SimpleAction> {
+    let action = gio::SimpleAction::new("remove-bookmark", Some(glib::VariantTy::STRING));
+    action.connect_activate({
+        let ctx = ctx.clone();
+        move |_action, parameter| {
+            let Some(location) = bookmark_named(parameter) else {
+                return;
+            };
+            let name = {
+                let bookmarks = ctx.shared.bookmarks.borrow();
+                // Already gone — removed in another window while this menu was open.
+                // Nothing to write, and no message claiming a row was taken out.
+                let Some(at) = bookmarks.find(&location) else {
+                    return;
+                };
+                bookmarks.items[at].display()
+            };
+            ctx.shared.bookmarks.borrow_mut().remove(&location);
+            bookmarks_updated(&ctx, &format!("Bookmark removed for {name}"));
         }
     });
     Rc::new(action)

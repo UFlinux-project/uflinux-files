@@ -337,9 +337,9 @@ A bookmark is a location the user asked to keep a row for, and it is the one pie
 sidebar state that is not derived: the XDG folders are found, the mounts come from the
 mount table, the two collections are computed, and a bookmark exists only because some-
 body said it should. `ufm_core::config::Bookmarks` owns the file — load, save, `add`,
-`remove`, `move_item` — and, like the star list, knows nothing about GTK. `add` dedupes
-by location and appends, so the order in the file is the order the user asked for and
-re-bookmarking a folder cannot produce the same row twice.
+`find`, `rename`, `remove`, `move_item` — and, like the star list, knows nothing about
+GTK. `add` dedupes by location and appends, so the order in the file is the order the
+user asked for and re-bookmarking a folder cannot produce the same row twice.
 
 The window holds one `Bookmarks`, loaded once, for the same reason as the stars: the
 sidebar is built from memory rather than from a file read per navigation. The store is
@@ -373,6 +373,37 @@ Changing it rebuilds the sidebar wholesale, which is what `set_places` already d
 mounts, and re-highlights the current place afterwards because a rebuild drops the
 selection. Nothing is re-read from disk: unlike a star, which changes what a listing
 says about itself, a bookmark changes only the sidebar.
+
+A bookmark row is also the only row in the sidebar that can answer for itself. A
+right-click on one offers Rename, Move Up, Move Down and Remove; nothing else gets a
+menu, because the standard places are derived — renaming `Home` would be a name with
+nothing attached to it — and a mount has a dialog of its own with a Disconnect button
+already in it. `panel::menu_for` says which rows a place gets, and `popup::MenuRow` is
+what a row looks like. The type lives with the menu builder rather than with the
+sidebar for the same reason `Command` does: the popup builds a model from rows, reads a
+built model back apart, and owns the one popover a window has, and none of that needs to
+know what a `Place` is. A row with no rows opens no popover at all.
+
+Each of those rows carries the bookmark's URI rather than its position in the list. A
+position is a fact about a rendering, and a menu can sit open across a rebuild that
+changes it — another window taking out the first bookmark is enough — so a row aimed at
+index 2 would then act on whatever had moved into that slot. A URI either still names a
+bookmark or names nothing, so each handler re-asks the store before writing, and none of
+the four actions is ever disabled: the menu is the gate, and the honest answer to a
+request about a row that has gone away is a banner saying so rather than a greyed-out
+row that never explains itself. `find` is where that comparison lives, so the title-bar
+toggle, the menu and the reorder rows all ask the same question the same way.
+
+Pressing a row opens its menu without selecting it — the one place the sidebar's
+selection is not the user's to move, because it is a rendering of which folder the window
+is standing in, and selecting the row under the pointer would leave the title bar and the
+highlighted row disagreeing about where the user is. Renaming is the only prompt in the
+app with no worker behind it: a bookmark's name is a line in a config file the window
+already holds, so `ops::ask_bookmark_label` hands the answer straight back to the caller,
+who writes the file and rebuilds. It pre-fills `display()` rather than the stored label,
+so a bookmark never renamed offers the name its row actually shows rather than an empty
+box, and selects the whole name rather than a stem, because the point of editing a word
+the user chose is to replace all of it.
 
 ## File operations
 

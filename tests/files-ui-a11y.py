@@ -139,19 +139,35 @@ def dump_frame(wanted):
     return 0
 
 
-def first_entry():
-    """The first node with the `entry` role, which is the search field.
+def first_entry(frame=None):
+    """The first node that is a field one can type into.
 
     Depth-first, so the answer is the same one every run: the search bar sits
     above the folder views in the widget tree, and it is the only editable field
     a window has until the connect dialog or a name prompt is open.
+
+    Two roles, in that order. GTK reports a `GtkSearchEntry` as `entry` and a
+    plain `GtkEntry` — which is what a name prompt builds — as `text`, so a walk
+    that knew only the first would report the prompt has no field at all while a
+    user was typing into one. Trying `entry` before `text` keeps the answer for a
+    folder window the search bar it has always been.
+
+    With FRAME, the search is limited to that window's subtree. A prompt is a
+    window of its own and its field is the one a test means, so leaving the walk
+    to start at the desktop would answer with whichever field the tree reaches
+    first — usually the folder window's search bar, which is a different field
+    holding different text.
     """
-    stack = list(apps())
-    while stack:
-        acc = stack.pop(0)
-        if role(acc) == "entry":
-            return acc
-        stack = children(acc) + stack
+    root = frame_named(frame) if frame else None
+    if frame and root is None:
+        return None
+    for role_wanted in ("entry", "text"):
+        stack = [root] if root else list(apps())
+        while stack:
+            acc = stack.pop(0)
+            if role(acc) == role_wanted:
+                return acc
+            stack = children(acc) + stack
     return None
 
 
@@ -170,8 +186,8 @@ def first_named(wanted):
     return None
 
 
-def type_into(text):
-    acc = first_entry()
+def type_into(text, frame=None):
+    acc = first_entry(frame)
     if acc is None:
         print("no entry")
         return 2
@@ -183,8 +199,8 @@ def type_into(text):
     return 0
 
 
-def read_entry():
-    acc = first_entry()
+def read_entry(frame=None):
+    acc = first_entry(frame)
     if acc is None:
         print("no entry")
         return 2
@@ -380,9 +396,9 @@ def main(argv):
     if command == "dump-frame":
         return dump_frame(argv[1])
     if command == "type":
-        return type_into(argv[1])
+        return type_into(argv[1], argv[2] if len(argv) > 2 else None)
     if command == "entry":
-        return read_entry()
+        return read_entry(argv[1] if len(argv) > 1 else None)
     if command == "press":
         return press(argv[1], argv[2] if len(argv) > 2 else None)
     if command == "select":
@@ -392,8 +408,9 @@ def main(argv):
     if command == "menu-press":
         return menu_press(argv[1])
     print(
-        "usage: files-ui-a11y.py [dump | dump-frame NAME | type TEXT | entry | "
-        "press NAME [FRAME] | select NAME | menu | menu-press CHORD]",
+        "usage: files-ui-a11y.py [dump | dump-frame NAME | type TEXT [FRAME] | "
+        "entry [FRAME] | press NAME [FRAME] | select NAME | menu | "
+        "menu-press CHORD]",
         file=sys.stderr,
     )
     return 64

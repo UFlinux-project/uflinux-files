@@ -504,6 +504,45 @@ pub fn model(rows: &[Command]) -> gio::Menu {
     menu
 }
 
+/// One row of a menu whose commands act on a thing named at the moment the menu
+/// was built rather than on whatever the selection turns out to be.
+///
+/// The [`Command`] enum cannot express that: it is a fixed set of labels, and the
+/// whole point of the sidebar's menu is that the row says *which* bookmark to
+/// rename. A target is also why the row is a struct rather than a pair — a menu
+/// with no target is the common case and deserves to say so by name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MenuRow {
+    /// What the row says.
+    pub label: &'static str,
+    /// The window action to activate, in GTK's `win.name` form.
+    pub action: &'static str,
+    /// The parameter to hand it, when it takes one.
+    pub target: Option<String>,
+}
+
+/// The menu model for rows that carry their own target: one section, in the order
+/// handed over. No grouping, because these menus are four rows about one thing and
+/// a separator between `Move Up` and `Move Down` would say they are different
+/// kinds of command.
+#[must_use]
+pub fn model_for(rows: &[MenuRow]) -> gio::Menu {
+    let menu = gio::Menu::new();
+    let part = gio::Menu::new();
+    for row in rows {
+        let item = gio::MenuItem::new(Some(row.label), Some(row.action));
+        if let Some(target) = &row.target {
+            item.set_action_and_target_value(
+                Some(row.action),
+                Some(&glib::Variant::from(target.clone())),
+            );
+        }
+        part.append_item(&item);
+    }
+    menu.append_section(None, &part);
+    menu
+}
+
 /// The labels of a menu model, grouped as drawn. For tests and for the
 /// accessibility check: a flat list would pass even with the grouping lost.
 /// Generic over the model so that a [`gio::Menu`] can be handed straight back.
@@ -514,6 +553,34 @@ pub fn sections(model: &impl IsA<gio::MenuModel>) -> Vec<Vec<String>> {
         .map(|index| match model.item_link(index, "section") {
             Some(section) => labels(&section),
             None => vec![label_of(model, index).unwrap_or_default()],
+        })
+        .collect()
+}
+
+/// Every row of a menu, flat, with the target each one carries. The sidebar's
+/// menu is read back this way: a label alone would pass even if the URI that says
+/// *which* bookmark to rename had been dropped on the way into the model.
+#[must_use]
+pub fn targets(model: &impl IsA<gio::MenuModel>) -> Vec<(String, Option<String>)> {
+    let model = model.upcast_ref();
+    (0..model.n_items())
+        .flat_map(|index| match model.item_link(index, "section") {
+            Some(section) => flat(&section),
+            None => vec![(label_of(model, index).unwrap_or_default(), None)],
+        })
+        .collect()
+}
+
+fn flat(model: &impl IsA<gio::MenuModel>) -> Vec<(String, Option<String>)> {
+    let model = model.upcast_ref();
+    (0..model.n_items())
+        .map(|index| {
+            (
+                label_of(model, index).unwrap_or_default(),
+                model
+                    .item_attribute_value(index, "target", Some(glib::VariantTy::STRING))
+                    .and_then(|value| value.str().map(str::to_string)),
+            )
         })
         .collect()
 }
@@ -572,6 +639,17 @@ impl Popup {
             .map_or_else(Vec::new, |model| sections(&model))
     }
 
+    /// The rows the menu is offering, with the target each one carries. For a menu
+    /// built from [`MenuRow`], where the target is half the row: a label with no
+    /// URI would rename some bookmark, and which one is the question the row
+    /// exists to answer.
+    #[must_use]
+    pub fn targeted(&self) -> Vec<(String, Option<String>)> {
+        self.menu
+            .menu_model()
+            .map_or_else(Vec::new, |model| targets(&model))
+    }
+
     /// Open the menu with `rows`, pointing at `spot` — the widget the press
     /// landed on and the coordinates inside it — or at the focused widget when
     /// there is no pointer to follow.
@@ -592,6 +670,29 @@ impl Popup {
             self.menu.set_pointing_to(Some(&rect));
         }
         self.menu.set_menu_model(Some(&model(rows)));
+        self.menu.popup();
+    }
+
+    /// Open the menu with rows that carry their own target. The same popover, for
+    /// the same reasons — one menu per window means one menu to close, and
+    /// `win.` still resolves against this window's actions.
+    ///
+    /// The sidebar's menu is the only caller: its rows name a bookmark rather than
+    /// a selection, so they cannot be [`Command`]s.
+    pub fn show_rows(
+        &self,
+        window: &gtk::ApplicationWindow,
+        rows: &[MenuRow],
+        spot: Option<(&gtk::Widget, f64, f64)>,
+    ) {
+        self.menu.popdown();
+        if rows.is_empty() {
+            return;
+        }
+        if let Some(rect) = pointing_to(window, spot) {
+            self.menu.set_pointing_to(Some(&rect));
+        }
+        self.menu.set_menu_model(Some(&model_for(rows)));
         self.menu.popup();
     }
 }
@@ -997,6 +1098,53 @@ mod tests {
                 vec!["Copy".to_string(), "Cut".to_string()],
                 vec!["Extract to Folder".to_string(), "Properties".to_string()],
             ]
+        );
+    }
+
+    #[test]
+    fn a_targeted_menu_keeps_the_thing_each_row_means() {
+        // The sidebar's menu: four rows about one bookmark. The labels are the easy
+        // half — a menu that lost every target would still print four correct rows
+        // and then rename the wrong bookmark, so the readback has to look at the
+        // parameter too.
+        let rows = [
+            MenuRow {
+                label: "Rename\u{2026}",
+                action: "win.rename-bookmark",
+                target: Some("file:///srv/work".into()),
+            },
+            MenuRow {
+                label: "Remove",
+                action: "win.remove-bookmark",
+                target: Some("file:///srv/work".into()),
+            },
+            MenuRow {
+                label: "Say Nothing",
+                action: "win.nothing",
+                target: None,
+            },
+        ];
+        let menu = model_for(&rows);
+        assert_eq!(
+            sections(&menu),
+            vec![vec![
+                "Rename\u{2026}".to_string(),
+                "Remove".to_string(),
+                "Say Nothing".to_string()
+            ]],
+            "one section: these are three answers about one thing, not three kinds of command"
+        );
+        assert_eq!(
+            targets(&menu),
+            vec![
+                (
+                    "Rename\u{2026}".to_string(),
+                    Some("file:///srv/work".to_string())
+                ),
+                ("Remove".to_string(), Some("file:///srv/work".to_string())),
+                ("Say Nothing".to_string(), None),
+            ],
+            "the URI has to survive the trip into the model"
         );
     }
 

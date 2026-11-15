@@ -1357,6 +1357,31 @@ pub fn ask_rename(parent: &gtk::ApplicationWindow, handle: &Handle, entry: &Entr
     );
 }
 
+/// Ask for the name a sidebar bookmark should show.
+///
+/// No [`Handle`], unlike every other prompt here: a bookmark's name is a line in a
+/// config file the window already holds in memory, so there is no worker to hand
+/// the answer to and `on_ok` runs on the main thread the moment the button is
+/// pressed. The whole name is selected rather than just a stem, because a bookmark's
+/// name is usually a word the user chose and the point of editing it is to replace
+/// all of it.
+pub fn ask_bookmark_label(
+    parent: &gtk::ApplicationWindow,
+    current: &str,
+    on_ok: impl FnOnce(String) + 'static,
+) {
+    let end = i32::try_from(current.chars().count()).unwrap_or(i32::MAX);
+    ask(
+        parent,
+        "Rename Bookmark",
+        "Name for the shortcut:",
+        current,
+        "_Rename",
+        Some((0, end)),
+        on_ok,
+    );
+}
+
 /// A modal prompt for one line of text, in the shape [`super::connect`] uses: a
 /// plain [`gtk::Window`] rather than a dialog class, because `GTK4` has no entry
 /// dialog to subclass.
@@ -1729,9 +1754,13 @@ mod tests {
 
     #[test]
     fn a_rename_onto_an_existing_file_is_refused() {
-        let root = std::path::Path::new("/tmp");
-        let row = file(root, "definitely-unique-ufm.txt");
-        let RenamePlan::Refused(message) = plan_rename(&row, ".X11-unix") else {
+        // A folder we make ourselves: whether a name is taken has to come from a
+        // file we put there, not from whatever the machine happens to keep in
+        // `/tmp`, which is empty on a headless runner.
+        let root = tempfile::tempdir().expect("a folder to rename into");
+        tree(root.path());
+        let row = file(root.path(), "todo.txt");
+        let RenamePlan::Refused(message) = plan_rename(&row, "notes.txt") else {
             panic!("an existing name should be refused");
         };
         assert!(message.contains("already exists"), "{message}");

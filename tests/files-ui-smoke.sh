@@ -1207,6 +1207,147 @@ if [ "$(printf '%s\n' "$BFRAME" | grep -cF "$(printf '\tFolders\t')")" -eq 1 ]; 
 else
     fail "the sidebar says Folders once ($(printf '%s\n' "$BFRAME" | grep -cF "$(printf '\tFolders\t')") headings)"
 fi
+
+# --- what a bookmark row's menu does ------------------------------------------------
+# The rows a right-click offers are four window actions, and the tree reader can
+# see an action even though it cannot see a pointer, so the menu is driven over the
+# bus here. What is worth asserting end to end is the effect on the file: which
+# rows a place gets, and that each one carries the URI it acts on, are the
+# sidebar's own decision and covered by `panel.rs` and `popup.rs`.
+URI=file://$TARGET
+for row in rename-bookmark bookmark-up bookmark-down remove-bookmark; do
+    if describe "$row" | grep -qF '(true'; then
+        ok "a bookmark row's $row action is one the window answers"
+    else
+        fail "a bookmark row's $row action is one the window answers ($(describe "$row"))"
+    fi
+done
+
+# A second bookmark first, on the folder above. Reordering needs two rows to trade
+# places, and a row that is not the folder the window is standing in is what lets
+# the removal below tell "the row that was clicked" from "the folder in the title
+# bar" — the distinction the two commands exist apart for.
+ONE_URI=file://$ROOT/tree
+act up "[]" "[]"
+act bookmark "[]" "[]"
+act back "[]" "[]"
+i=0
+while [ "$i" -lt 50 ] && ! grep -qF "\"$ONE_URI\"" "$BOOK_FILE" 2>/dev/null; do
+    i=$((i + 1))
+    sleep 0.2
+done
+BFRAME=$(python3 "$A11Y" dump-frame "$TARGET" 2>/dev/null || true)
+if printf '%s\n' "$BFRAME" | grep -qF "$(printf 'list item\ttree\t')"; then
+    ok "a second bookmark appears as a row of its own"
+else
+    fail "a second bookmark appears as a row of its own (no list item named 'tree')"
+fi
+# The prompt, answered. Scoped to its own window on the way in and out: the folder
+# window's search bar holds an entry too, and an unscoped walk reaches that one
+# first, so an unscoped check would type a bookmark's name into a search field.
+act rename-bookmark "[<'$URI'>]" "[]"
+has_frame "Rename Bookmark" "a bookmark row asks for a name rather than a new folder"
+prompt=$(python3 "$A11Y" entry "Rename Bookmark" 2>/dev/null || true)
+if [ "$prompt" = "alpha" ]; then
+    ok "the prompt starts from the name the row already shows"
+else
+    fail "the prompt starts from the name the row already shows (reads '$prompt')"
+fi
+if ! python3 "$A11Y" type Workspaces "Rename Bookmark" >/dev/null 2>&1; then
+    fail "the bookmark prompt has a field of its own to type into"
+else
+    got=$(python3 "$A11Y" entry "Rename Bookmark" 2>/dev/null || true)
+    if [ "$got" = "Workspaces" ]; then
+        ok "the bookmark prompt takes the name typed into it"
+    else
+        fail "the bookmark prompt takes the name typed into it (reads '$got')"
+    fi
+fi
+python3 "$A11Y" press Rename "Rename Bookmark" >/dev/null 2>&1 || true
+i=0
+while [ "$i" -lt 50 ] && ! grep -qF '"label": "Workspaces"' "$BOOK_FILE" 2>/dev/null; do
+    i=$((i + 1))
+    sleep 0.2
+done
+if grep -qF '"label": "Workspaces"' "$BOOK_FILE"; then
+    ok "answering the prompt stores the name beside the bookmark"
+else
+    fail "answering the prompt stores the name beside the bookmark"
+fi
+if wait_no_frame "Rename Bookmark"; then
+    ok "answering the bookmark prompt closes it"
+else
+    fail "answering the bookmark prompt closes it"
+fi
+has_named Workspaces "the sidebar row takes the name the user gave it"
+# Where a bookmark sits is where its row is drawn, so a move has to show up as the
+# two entries trading places in the file. The list is written one field per line,
+# so the earlier bookmark is simply the earlier line — no parser needed to tell an
+# order from a pair of positions.
+order() {
+    local tree_line work_line
+    tree_line=$(grep -nF "\"$ONE_URI\"" "$BOOK_FILE" | head -1 | cut -d: -f1)
+    work_line=$(grep -nF "\"$URI\"" "$BOOK_FILE" | head -1 | cut -d: -f1)
+    tree_at=${tree_line:-}
+    work_at=${work_line:-}
+}
+order
+if [ -n "$tree_at" ] && [ -n "$work_at" ] && [ "$work_at" -lt "$tree_at" ]; then
+    ok "a second bookmark is appended below the first"
+else
+    fail "a second bookmark is appended below the first (Workspaces line ${work_at:-none}, tree line ${tree_at:-none})"
+fi
+act bookmark-up "[<'$ONE_URI'>]" "[]"
+i=0
+while [ "$i" -lt 50 ]; do
+    order
+    [ -n "$tree_at" ] && [ -n "$work_at" ] && [ "$tree_at" -lt "$work_at" ] && break
+    i=$((i + 1))
+    sleep 0.2
+done
+if [ -n "$tree_at" ] && [ -n "$work_at" ] && [ "$tree_at" -lt "$work_at" ]; then
+    ok "Move Up swaps a bookmark with the one above it"
+else
+    fail "Move Up swaps a bookmark with the one above it (tree line ${tree_at:-none}, Workspaces line ${work_at:-none})"
+fi
+act bookmark-down "[<'$ONE_URI'>]" "[]"
+i=0
+while [ "$i" -lt 50 ]; do
+    order
+    [ -n "$tree_at" ] && [ -n "$work_at" ] && [ "$work_at" -lt "$tree_at" ] && break
+    i=$((i + 1))
+    sleep 0.2
+done
+if [ -n "$tree_at" ] && [ -n "$work_at" ] && [ "$work_at" -lt "$tree_at" ]; then
+    ok "Move Down puts it back where it came from"
+else
+    fail "Move Down puts it back where it came from (tree line ${tree_at:-none}, Workspaces line ${work_at:-none})"
+fi
+# Removal, aimed at the row rather than the window. The window is standing in
+# `alpha`, so a command that acted on the title bar would empty the wrong entry.
+act remove-bookmark "[<'$ONE_URI'>]" "[]"
+i=0
+while [ "$i" -lt 50 ] && grep -qF "\"$ONE_URI\"" "$BOOK_FILE" 2>/dev/null; do
+    i=$((i + 1))
+    sleep 0.2
+done
+if ! grep -qF "\"$ONE_URI\"" "$BOOK_FILE" 2>/dev/null; then
+    ok "the sidebar menu removes the bookmark it was opened on"
+else
+    fail "the sidebar menu removes the bookmark it was opened on ($ONE_URI still in $BOOK_FILE)"
+fi
+if grep -qF "\"$URI\"" "$BOOK_FILE"; then
+    ok "removing another row leaves the folder the window is standing in alone"
+else
+    fail "removing another row leaves the folder the window is standing in alone"
+fi
+refresh
+if printf '%s\n' "$DUMP" | grep -qF "$(printf 'list item\ttree\t')"; then
+    fail "the row goes out of the sidebar with its bookmark"
+else
+    ok "the row goes out of the sidebar with its bookmark"
+fi
+
 # The same command takes it back out, which is the half a toggle gets wrong: a
 # second activation that only ever added would leave a row the user cannot
 # remove. The file stays, emptied — a list with nothing in it is still a list.

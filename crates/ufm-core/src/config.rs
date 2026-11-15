@@ -342,6 +342,33 @@ impl Bookmarks {
         });
     }
 
+    /// Where a location's bookmark sits, if it has one. The comparison is by URI
+    /// rather than by `Location`, which is what [`Self::add`] does and for the
+    /// same reason: two parses of the same place can differ in their parsed parts.
+    #[must_use]
+    pub fn find(&self, location: &Location) -> Option<usize> {
+        let uri = location.to_string();
+        self.items
+            .iter()
+            .position(|b| b.location.to_string() == uri)
+    }
+
+    /// Give a bookmark a name of its own, or take the name back off so the row
+    /// says the folder's again. A name that is only whitespace is the same as no
+    /// name: a row that reads as one space is worse than one that reads as the
+    /// folder.
+    ///
+    /// Answers whether there was a bookmark to rename, so a caller can say so
+    /// rather than reporting a change that did not happen — the list can have
+    /// changed under a prompt left open.
+    pub fn rename(&mut self, location: &Location, label: Option<String>) -> bool {
+        let Some(index) = self.find(location) else {
+            return false;
+        };
+        self.items[index].label = label.filter(|text| !text.trim().is_empty());
+        true
+    }
+
     pub fn remove(&mut self, location: &Location) {
         let uri = location.to_string();
         self.items.retain(|b| b.location.to_string() != uri);
@@ -606,6 +633,29 @@ mod tests {
             back.items[0].location,
             Location::parse("archive:///t/a.zip!/").unwrap()
         );
+    }
+
+    #[test]
+    fn a_bookmark_takes_a_name_and_gives_it_back() {
+        let mut b = Bookmarks::default();
+        let work = Location::parse("/data/work").unwrap();
+        b.add(work.clone(), None);
+        assert!(b.rename(&work, Some("Prace".into())));
+        assert_eq!(b.items[0].display(), "Prace");
+        assert!(
+            b.rename(&work, Some("   ".into())),
+            "a name of spaces is accepted and means no name"
+        );
+        assert_eq!(
+            b.items[0].display(),
+            "work",
+            "and the row falls back to the folder"
+        );
+        assert!(
+            !b.rename(&Location::parse("/data/gone").unwrap(), Some("x".into())),
+            "a bookmark removed while the prompt was open is reported, not ignored"
+        );
+        assert_eq!(b.items.len(), 1, "and nothing was added");
     }
 
     #[test]
