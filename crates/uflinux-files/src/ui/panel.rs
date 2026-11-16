@@ -460,10 +460,6 @@ impl Panel {
     /// Rebuild the list. The order is the caller's, so bookmarks stay where the
     /// user put them; a heading is inserted wherever the group changes.
     pub fn set_places(&self, places: Vec<Place>) {
-        let places: Vec<_> = places
-            .into_iter()
-            .filter(|p| !matches!(p, Place::Mount { .. }))
-            .collect();
         self.list.unselect_all();
         for child in child_widgets(&self.list) {
             self.list.remove(&child);

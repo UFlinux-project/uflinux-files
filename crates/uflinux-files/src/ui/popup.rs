@@ -100,7 +100,8 @@ impl Listeners {
         Rc::new(move |widget, target, x, y| {
             // Cloned out first, so a handler may add or drop listeners without
             // tripping the borrow this iteration holds.
-            for listener in shared.borrow().clone() {
+            let listeners = shared.borrow().clone();
+            for listener in listeners {
                 listener(widget, target, x, y);
             }
         })
@@ -801,12 +802,15 @@ mod tests {
 
     /// The one controller a widget carries, as a click gesture.
     fn only_gesture(widget: &impl IsA<gtk::Widget>) -> gtk::GestureClick {
-        let controllers = widget.observe_controllers();
-        assert_eq!(controllers.n_items(), 1, "expected exactly one controller");
-        controllers
-            .item(0)
-            .and_downcast::<gtk::GestureClick>()
-            .expect("the controller should be a click gesture")
+        let gestures: Vec<_> = widget
+            .observe_controllers()
+            .snapshot()
+            .into_iter()
+            .filter_map(|object| object.downcast::<gtk::GestureClick>().ok())
+            .filter(|gesture| gesture.button() == 3)
+            .collect();
+        assert_eq!(gestures.len(), 1, "expected one context-menu gesture");
+        gestures[0].clone()
     }
 
     /// A window to hang a popover off. Not shown: nothing here asserts on screen,

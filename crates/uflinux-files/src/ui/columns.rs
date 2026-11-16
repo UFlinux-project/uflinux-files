@@ -38,7 +38,7 @@ use ufm_core::entry::Entry;
 use ufm_core::sort::{SortKey, sort_entries};
 use ufm_vfs::{Readers, read_all};
 
-use super::job::{Event, Handle};
+use super::job::{Event, Handle, ReadId};
 use super::popup::{self, ContextHandler, Listeners};
 use super::row::Row;
 use super::thumb::Pipeline;
@@ -81,10 +81,9 @@ struct Pane {
     /// The listing as read, before re-sorting. Kept so that changing the sort
     /// order costs no disk access.
     entries: RefCell<Vec<Entry>>,
-    /// The folder whose listing this pane is still waiting for, or `None` once
-    /// one has been shown. A second delivery for the same folder is dropped,
-    /// which is what stops a stale read from overwriting a newer one.
-    waiting: RefCell<Option<Location>>,
+    /// The request this pane expects. Path equality alone cannot distinguish an
+    /// old read from a later visit to the same folder.
+    waiting: RefCell<Option<ReadId>>,
 }
 
 /// The widget's state, behind an `Rc` because every signal handler needs it and
@@ -226,7 +225,7 @@ impl Columns {
     pub fn reload(&self) {
         let panes = self.inner.panes.borrow();
         for pane in panes.iter().take(panes.len().saturating_sub(1)) {
-            *pane.waiting.borrow_mut() = Some(pane.location.clone());
+            *pane.waiting.borrow_mut() = Some(ReadId::new());
             start(&self.inner, pane);
         }
     }
@@ -243,7 +242,7 @@ impl Columns {
         let Some(pane) = self.pane_for(location) else {
             return;
         };
-        *pane.waiting.borrow_mut() = Some(pane.location.clone());
+        *pane.waiting.borrow_mut() = Some(ReadId::new());
         start(&self.inner, &pane);
     }
 
@@ -256,10 +255,10 @@ impl Columns {
     /// [`Columns::reload`] skips this pane for the opposite reason — on a reload
     /// the window is re-reading the folder anyway, and starting a second read of
     /// one directory would race the first. This asks for no read at all.
-    pub fn expect_leaf(&self) {
+    pub fn expect_leaf(&self, read: ReadId) {
         let panes = self.inner.panes.borrow();
         if let Some(pane) = panes.last() {
-            *pane.waiting.borrow_mut() = Some(pane.location.clone());
+            *pane.waiting.borrow_mut() = Some(read);
         }
     }
 
@@ -378,17 +377,15 @@ impl Columns {
             | Event::Progress { .. }
             | Event::JobFinished { .. } => {}
             Event::Finished {
-                location, entries, ..
+                read,
+                location,
+                entries,
+                ..
             } => {
                 let Some(pane) = self.pane_for(location) else {
                     return;
                 };
-                if !pane
-                    .waiting
-                    .borrow()
-                    .as_ref()
-                    .is_some_and(|w| w == location)
-                {
+                if !pane.waiting.borrow().as_ref().is_some_and(|w| w == read) {
                     return;
                 }
                 pane.waiting.borrow_mut().take();
@@ -406,8 +403,15 @@ impl Columns {
                     pane.list.scroll_to(0, gtk::ListScrollFlags::NONE, None);
                 }
             }
-            Event::Failed { location, message } => {
+            Event::Failed {
+                read,
+                location,
+                message,
+            } => {
                 if let Some(pane) = self.pane_for(location) {
+                    if pane.waiting.borrow().as_ref() != Some(read) {
+                        return;
+                    }
                     pane.waiting.borrow_mut().take();
                     pane.entries.borrow_mut().clear();
                     paint(&pane, &[]);
@@ -599,7 +603,7 @@ fn build(inner: &Rc<Inner>, location: &Location, read: bool) -> Rc<Pane> {
         store,
         selection,
         entries: RefCell::new(Vec::new()),
-        waiting: RefCell::new(Some(location.clone())),
+        waiting: RefCell::new(Some(ReadId::new())),
     });
     wire(&pane, inner);
     if read {
@@ -620,6 +624,7 @@ fn start(inner: &Rc<Inner>, pane: &Pane) {
     let Some(handle) = inner.handle.borrow().clone() else {
         return;
     };
+    let read = *pane.waiting.borrow().as_ref().expect("a pending read");
     let readers = Arc::clone(&inner.readers);
     let location = pane.location.clone();
     let key = *inner.key.borrow();
@@ -630,11 +635,13 @@ fn start(inner: &Rc<Inner>, pane: &Pane) {
             let reader = readers.for_location(&location);
             match read_all(reader, &location, key, show_hidden, None) {
                 Ok(entries) => handle.send(Event::Finished {
+                    read,
                     location,
                     entries,
                     hints: None,
                 }),
                 Err(error) => handle.send(Event::Failed {
+                    read,
                     location,
                     message: error.to_string(),
                 }),
@@ -839,8 +846,16 @@ mod tests {
         )
     }
 
-    fn done(path: &str, entries: Vec<Entry>) -> Event {
+    fn pending(columns: &Columns, path: &str) -> ReadId {
+        columns
+            .pane_for(&location(path))
+            .and_then(|pane| *pane.waiting.borrow())
+            .unwrap_or_else(ReadId::new)
+    }
+
+    fn done(columns: &Columns, path: &str, entries: Vec<Entry>) -> Event {
         Event::Finished {
+            read: pending(columns, path),
             location: location(path),
             entries,
             hints: None,
@@ -855,6 +870,32 @@ mod tests {
             .get(index)
             .cloned()
             .expect("the pane")
+    }
+
+    #[test]
+    fn old_successes_and_failures_cannot_answer_a_new_column_read() {
+        tk::ui(|| {
+            let columns = columns();
+            columns.show_chain(&location("/home/u"));
+            let old = done(&columns, "/home/u", vec![file("old")]);
+            let old_read = pending(&columns, "/home/u");
+            columns.reload_one(&location("/home/u"));
+            columns.apply(&old);
+            columns.apply(&Event::Failed {
+                read: old_read,
+                location: location("/home/u"),
+                message: "old failure".into(),
+            });
+            assert!(waiting(&columns, 2));
+            assert_eq!(columns.pane_len(2), 0);
+            columns.apply(&done(&columns, "/home/u", vec![file("current")]));
+            assert_eq!(columns.pane_len(2), 1);
+            assert!(!waiting(&columns, 2));
+            columns.forget();
+            columns.show_chain(&location("/home/u"));
+            columns.apply(&old);
+            assert_eq!(columns.pane_len(2), 0);
+        });
     }
 
     #[test]
@@ -929,11 +970,11 @@ mod tests {
             let columns = columns();
             columns.show_chain(&location("/home/u"));
             assert_eq!(columns.pane_len(2), 0);
-            columns.apply(&done("/home/u", vec![file("a"), file("b")]));
+            columns.apply(&done(&columns, "/home/u", vec![file("a"), file("b")]));
             assert_eq!(columns.pane_len(2), 2);
             // A second delivery for the same folder is a stale read, and a
             // stale read must not replace what is on screen.
-            columns.apply(&done("/home/u", Vec::new()));
+            columns.apply(&done(&columns, "/home/u", Vec::new()));
             assert_eq!(columns.pane_len(2), 2);
         });
     }
@@ -950,7 +991,7 @@ mod tests {
             // The rows are painted but the pane is still waiting, so a read
             // that was already running when the mode changed still gets to
             // replace them. That answer is fresher than the rows on screen.
-            columns.apply(&done("/home/u", vec![file("a"), file("b")]));
+            columns.apply(&done(&columns, "/home/u", vec![file("a"), file("b")]));
             assert_eq!(columns.pane_len(2), 2);
         });
     }
@@ -971,6 +1012,7 @@ mod tests {
             let columns = columns();
             columns.show_chain(&location("/home/u"));
             columns.apply(&Event::Batch {
+                read: ReadId::new(),
                 location: location("/home/u"),
                 entries: vec![file("a")],
             });
@@ -983,8 +1025,9 @@ mod tests {
         tk::ui(|| {
             let columns = columns();
             columns.show_chain(&location("/home/u"));
-            columns.apply(&done("/elsewhere", vec![file("a")]));
+            columns.apply(&done(&columns, "/elsewhere", vec![file("a")]));
             columns.apply(&Event::Failed {
+                read: ReadId::new(),
                 location: location("/elsewhere"),
                 message: "gone".to_string(),
             });
@@ -999,7 +1042,7 @@ mod tests {
         tk::ui(|| {
             let columns = columns();
             columns.show_chain(&location("/home/u"));
-            columns.apply(&done("/home/u", vec![file("a"), file("b")]));
+            columns.apply(&done(&columns, "/home/u", vec![file("a"), file("b")]));
             columns.resort(SortKey {
                 descending: true,
                 ..SortKey::default()
@@ -1039,6 +1082,7 @@ mod tests {
             let columns = columns();
             columns.show_chain(&location("/home/u"));
             columns.apply(&Event::Failed {
+                read: pending(&columns, "/home/u"),
                 location: location("/home/u"),
                 message: "Permission denied".to_string(),
             });
@@ -1053,6 +1097,7 @@ mod tests {
         let locations = columns.pane_locations();
         for location in &locations {
             columns.apply(&done(
+                columns,
                 &location.as_path().expect("a folder").display().to_string(),
                 vec![file("a"), file("b")],
             ));
@@ -1073,12 +1118,12 @@ mod tests {
             assert!(!waiting(&columns, 2));
             // The window re-reads the folder in its title bar for its own rows; the
             // leaf holds those same rows and has to be told to expect them.
-            columns.expect_leaf();
+            columns.expect_leaf(ReadId::new());
             assert!(waiting(&columns, 2));
             // Marking is not reading: the pane keeps painting what it had, so the
             // column does not blink empty while the window's read is on its way.
             assert_eq!(columns.pane_len(2), 2);
-            columns.apply(&done("/home/u", vec![file("a")]));
+            columns.apply(&done(&columns, "/home/u", vec![file("a")]));
             assert_eq!(columns.pane_len(2), 1);
             assert!(!waiting(&columns, 2));
         });

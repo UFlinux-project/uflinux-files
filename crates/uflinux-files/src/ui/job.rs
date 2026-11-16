@@ -17,6 +17,7 @@ use std::io;
 use std::mem;
 use std::os::fd::RawFd;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use glib::ControlFlow;
@@ -28,6 +29,17 @@ use ufm_vfs::{FsHints, Tally};
 
 use crate::runner::Report;
 use crate::ui::ops::Outcome;
+
+/// Identifies one listing request, including repeated visits to the same path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReadId(u64);
+
+impl ReadId {
+    pub fn new() -> Self {
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        Self(NEXT.fetch_add(1, Ordering::Relaxed))
+    }
+}
 
 /// Something a worker wants the main thread to know. The listing variants each
 /// name the folder they were read from, because a worker cannot know whether the
@@ -45,17 +57,20 @@ pub enum Event {
     },
     /// A chunk of a listing that is still being read, in read order.
     Batch {
+        read: ReadId,
         location: Location,
         entries: Vec<Entry>,
     },
     /// The complete listing, filtered and sorted. The read is over.
     Finished {
+        read: ReadId,
         location: Location,
         entries: Vec<Entry>,
         hints: Option<FsHints>,
     },
     /// The read failed. The message is for the banner, so it is already worded.
     Failed {
+        read: ReadId,
         location: Location,
         message: String,
     },
@@ -298,6 +313,7 @@ mod tests {
 
     fn event() -> Event {
         Event::Failed {
+            read: ReadId::new(),
             location: Location::file("/nowhere"),
             message: "no".to_string(),
         }

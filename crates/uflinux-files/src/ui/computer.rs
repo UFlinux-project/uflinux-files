@@ -855,7 +855,7 @@ mod tests {
         super::super::tk::ui(|| {
             use std::cell::RefCell;
             use std::rc::Rc;
-            let view = ComputerView::new();
+            let view = ComputerView::network();
             let seen = Rc::new(RefCell::new(Vec::new()));
             view.on_open({
                 let seen = Rc::clone(&seen);
@@ -863,7 +863,7 @@ mod tests {
             });
             // A stale share: described, but activating it would only produce an error.
             let dead = Card {
-                id: CardId::Local(PathBuf::from("/")),
+                id: CardId::Mount("nas-stale".into()),
                 label: "System".into(),
                 detail: "/".into(),
                 icon: "drive-harddisk-symbolic".into(),
@@ -905,7 +905,7 @@ mod tests {
         super::super::tk::ui(|| {
             use std::cell::RefCell;
             use std::rc::Rc;
-            let view = ComputerView::new();
+            let view = ComputerView::network();
             let seen = Rc::new(RefCell::new(Vec::new()));
             view.on_unmount({
                 let seen = Rc::clone(&seen);
@@ -937,8 +937,9 @@ mod tests {
         }
         widget
             .observe_children()
-            .iter::<gtk::Widget>()
-            .filter_map(Result::ok)
+            .snapshot()
+            .into_iter()
+            .filter_map(|object| object.downcast::<gtk::Widget>().ok())
             .find_map(|child| find_button(Some(child.as_ref())))
     }
 }

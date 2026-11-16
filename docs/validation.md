@@ -234,6 +234,18 @@ sits beside it the desktop is exercised too. Anything missing — `labwc`, `grim
 `gdbus`, the AT-SPI typelib — makes it print a `SKIP` line and exit 0, so a build host
 with no compositor is not read as a broken program.
 
+Navigation regression checks enter locations through the address editor, activate
+Home shortcuts and sidebar rows, and walk Back, Forward and Up through folders,
+Computer, Network and an archive. They assert visible destination rows as well as
+the window title. `wtype` supplies Return through the headless compositor for
+controls whose AT-SPI implementation has no activation action.
+
+Set `UFLINUX_FILES_REQUIRE_DISPLAY=1` for validation runs: GTK widget tests then
+fail if they cannot open a display, and the smoke script fails instead of skipping
+when its display tools are missing. Run the widget suite under a private session
+bus and headless compositor; `cargo test` alone can still skip widget bodies on
+build hosts without GTK display support.
+
 The assertions are on the accessibility tree, read out-of-process by
 `tests/files-ui-a11y.py` (an in-process AT-SPI walk deadlocks against the bus the walked
 process is itself serving). The tree is what a screen reader sees, so it is the closest

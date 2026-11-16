@@ -385,6 +385,7 @@ fn clear(inner: &Rc<Inner>) {
 
 /// Put the bar away and say nothing.
 fn reset(inner: &Rc<Inner>) {
+    next_generation(inner);
     stop_timer(inner);
     inner.waiting.borrow_mut().take();
     inner.quiet.set(true);
@@ -839,6 +840,22 @@ mod tests {
             Request::SearchFiles { query } => query,
             other => panic!("expected a files query, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn reset_invalidates_an_in_flight_reply_without_restoring_the_old_folder() {
+        tk::ui(|| {
+            let search = Search::new(&SearchScope::Home, false, false);
+            let seen = Rc::new(RefCell::new(Vec::new()));
+            let replies = Rc::clone(&seen);
+            search.on_reply(move |reply| replies.borrow_mut().push(reply));
+            search.show();
+            let old = next_generation(&search.inner);
+            search.reset();
+            deliver(&search.inner, old, Outcome::Failed("late failure".into()));
+            assert!(seen.borrow().is_empty());
+            assert!(!search.is_open());
+        });
     }
 
     #[test]

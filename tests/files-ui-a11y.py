@@ -29,6 +29,8 @@ Run directly to see the tree:
 """
 
 import sys
+import subprocess
+import time
 
 import gi
 
@@ -262,6 +264,59 @@ def press(wanted, frame=None):
     return 0
 
 
+def press_role(wanted_role, wanted, frame=None):
+    """Activate an exact role/name, avoiding labels that repeat a button's name."""
+    root = frame_named(frame) if frame else None
+    if frame and root is None:
+        print("no frame named %s" % frame)
+        return 2
+    stack = [root] if root else list(apps())
+    while stack:
+        acc = stack.pop(0)
+        if role(acc) == wanted_role and name(acc) == wanted:
+            if wanted_role == "button":
+                action = Atspi.Accessible.get_action_iface(acc)
+                if action and action.get_n_actions() and action.do_action(0):
+                    return 0
+                print("button refused activation")
+                return 3
+            return submit_node(acc)
+        stack = children(acc) + stack
+    print("no %s named %s" % (wanted_role, wanted))
+    return 2
+
+
+def keyboard(keys):
+    # Give GTK time to receive the virtual keyboard's keymap before its first key.
+    return subprocess.run(["wtype", "-s", "100", *keys, "-s", "50"], check=False).returncode
+
+
+def submit_node(acc):
+    if acc is None:
+        print("no entry")
+        return 2
+    if role(acc) != "list item":
+        # win.location already focuses its editor. GtkText does not implement
+        # AT-SPI grab_focus on every GTK version.
+        return keyboard(["-k", "Return"])
+    parent = Atspi.Accessible.get_parent(acc)
+    rows = [row for row in children(parent)
+            if Atspi.Accessible.get_state_set(row).contains(Atspi.StateType.FOCUSABLE)]
+    target = next((i for i, row in enumerate(rows) if name(row) == name(acc)), None)
+    if target is None:
+        print("sidebar row is not focusable")
+        return 3
+    for _ in range(40):
+        if any(Atspi.Accessible.get_state_set(row).contains(Atspi.StateType.FOCUSED)
+               for row in rows):
+            keys = ["-k", "Home"] + ["-k", "Down"] * target + ["-k", "Return"]
+            return keyboard(keys)
+        keyboard(["-k", "Tab"])
+        time.sleep(0.02)
+    print("sidebar could not receive keyboard focus")
+    return 3
+
+
 def named_under(root, wanted):
     """The first node inside ROOT whose name is WANTED, depth-first."""
     stack = list(children(root))
@@ -400,6 +455,10 @@ def main(argv):
         return read_entry(argv[1] if len(argv) > 1 else None)
     if command == "press":
         return press(argv[1], argv[2] if len(argv) > 2 else None)
+    if command == "press-role":
+        return press_role(argv[1], argv[2], argv[3] if len(argv) > 3 else None)
+    if command == "submit":
+        return submit_node(first_entry(argv[1] if len(argv) > 1 else None))
     if command == "select":
         return select(argv[1])
     if command == "menu":
@@ -408,7 +467,8 @@ def main(argv):
         return menu_press(argv[1])
     print(
         "usage: files-ui-a11y.py [dump | dump-frame NAME | type TEXT [FRAME] | "
-        "entry [FRAME] | press NAME [FRAME] | select NAME | menu | "
+        "entry [FRAME] | submit [FRAME] | press NAME [FRAME] | "
+        "press-role ROLE NAME [FRAME] | select NAME | menu | "
         "menu-press CHORD]",
         file=sys.stderr,
     )

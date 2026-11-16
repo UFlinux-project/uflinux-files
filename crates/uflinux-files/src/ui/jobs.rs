@@ -666,14 +666,14 @@ mod tests {
             let (jobs, _parent) = installed();
             let (first, _) = jobs.begin(Kind::Copy, "a.txt", Some(1), Unit::Rows);
             let (second, _) = jobs.begin(Kind::Move, "b.txt", Some(1), Unit::Rows);
-            jobs.finish(first);
+            jobs.finish(second);
             assert!(jobs.shown(), "one is still running");
             assert_eq!(
                 jobs.label_text(),
                 "Copying a.txt",
                 "the label names the oldest job, which is the one still owed an answer"
             );
-            jobs.finish(second);
+            jobs.finish(first);
             assert!(!jobs.shown());
         });
     }
@@ -713,7 +713,7 @@ mod tests {
             jobs.record(record_at("/tmp/a"));
             assert!(jobs.take().is_some(), "the record is there to be spent");
             assert!(jobs.take().is_none(), "and spending it is not repeatable");
-            assert_eq!(heard.borrow().as_str(), "-u-");
+            assert_eq!(heard.borrow().as_str(), "u-");
         });
     }
 

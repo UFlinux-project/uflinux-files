@@ -47,7 +47,7 @@ use super::conflict;
 use super::connect;
 use super::devices;
 use super::extract;
-use super::job::{Event, Handle, Queue};
+use super::job::{Event, Handle, Queue, ReadId};
 use super::jobs::Jobs;
 use super::openwith;
 use super::ops;
@@ -830,6 +830,7 @@ struct State {
     history: History,
     /// The read in flight, if any. Replaced and cancelled on every navigation.
     cancel: Option<Cancel>,
+    read: Option<ReadId>,
     /// The listing as read, before the search filter. Kept so that deleting a
     /// character from the query restores rows instead of asking the disk again.
     shown: Vec<Entry>,
@@ -863,6 +864,7 @@ impl State {
             current: Some(start.clone()),
             history,
             cancel: None,
+            read: None,
             shown: Vec::new(),
             results: None,
             query: String::new(),
@@ -876,6 +878,10 @@ impl State {
     /// folder they can no longer describe.
     fn shows(&self, location: &Location) -> bool {
         self.current.as_ref() == Some(location)
+    }
+
+    fn accepts(&self, read: ReadId, location: &Location) -> bool {
+        self.read == Some(read) && self.shows(location)
     }
 }
 
@@ -998,6 +1004,8 @@ fn navigate(ctx: &Ctx, location: Location, record: bool) {
             old.cancel();
         }
         state.current = Some(location.clone());
+        state.read = None;
+        ctx.shared.reading.set(false);
         state.shown = Vec::new();
         state.results = None;
         state.query.clear();
@@ -1052,6 +1060,11 @@ fn navigate(ctx: &Ctx, location: Location, record: bool) {
     // thing that replaces them, and reporting `Cleared` here would paint over it.
     ctx.find.reset();
     ctx.find.set_folder(location.as_path());
+    if let Some(entry) = ctx.search.borrow().as_ref() {
+        entry.set_text("");
+        entry.set_visible(false);
+    }
+    show_location(ctx, &location, &view);
     // Empty first, so a folder that is slow to read shows an empty view rather
     // than the folder being left. For a virtual location this also clears the
     // override the cards left in the status bar.
@@ -1067,16 +1080,37 @@ fn navigate(ctx: &Ctx, location: Location, record: bool) {
         sync_watches(ctx);
         return;
     }
-    // Only while columns are on screen: building a chain reads every folder on
-    // the path, and in grid mode that is work for panes nobody can see.
-    if columns_on(ctx) {
-        ctx.columns.show_chain(&location);
-    }
     select_place(ctx, &location);
     sync_buttons(ctx);
 
     spawn_read(ctx, location, cancel, &view);
     sync_watches(ctx);
+}
+
+/// Apply the destination's presentation without recording history or reading it.
+fn show_location(ctx: &Ctx, location: &Location, view: &View) {
+    let (mode, key) = {
+        let prefs = ctx.shared.prefs.borrow();
+        (prefs.view_mode_for(location), prefs.sort_for(location))
+    };
+    view.set_mode(mode);
+    view.resort(key);
+    ctx.columns.resort(key);
+    let child = presentation(location, mode);
+    ctx.modes.set_visible_child_name(child);
+    if child == "columns" {
+        ctx.columns.show_chain(location);
+    } else {
+        ctx.columns.forget();
+    }
+    if let Some(window) = ctx.window.upgrade() {
+        if let Some(action) = window
+            .lookup_action("mode")
+            .and_then(|action| action.downcast::<gio::SimpleAction>().ok())
+        {
+            action.set_state(&mode_name(mode).to_variant());
+        }
+    }
 }
 
 /// Highlight the sidebar row a location belongs to, or clear the highlight.
@@ -1260,7 +1294,6 @@ fn reread(ctx: &Ctx, location: Location) {
             old.cancel();
         }
     }
-    ctx.columns.expect_leaf();
     spawn_read(ctx, location, cancel, &view);
     // Re-declaring the watches is what picks up a folder that was deleted and
     // created again: deleting a directory makes the kernel retire its watch, and
@@ -1277,6 +1310,11 @@ fn spawn_read(ctx: &Ctx, location: Location, cancel: Cancel, view: &View) {
     let Some(handle) = ctx.handle.borrow().clone() else {
         return;
     };
+    let read = ReadId::new();
+    ctx.shared.state.borrow_mut().read = Some(read);
+    if columns_on(ctx) {
+        ctx.columns.expect_leaf(read);
+    }
     let readers = Arc::clone(&ctx.shared.readers);
     let key = view.sort_key();
     let show_hidden = ctx.shared.prefs.borrow().show_hidden;
@@ -1292,6 +1330,7 @@ fn spawn_read(ctx: &Ctx, location: Location, cancel: Cancel, view: &View) {
         .spawn(move || {
             let mut sink = Sink {
                 handle: handle.clone(),
+                read,
                 cancel: token.clone(),
                 location: location.clone(),
                 final_entries: Vec::new(),
@@ -1301,6 +1340,7 @@ fn spawn_read(ctx: &Ctx, location: Location, cancel: Cancel, view: &View) {
                 Ok(_) => {
                     let hints = location.as_path().map(|path| readers.local().hints(path));
                     handle.send(Event::Finished {
+                        read,
                         location,
                         entries: sink.final_entries,
                         hints,
@@ -1308,6 +1348,7 @@ fn spawn_read(ctx: &Ctx, location: Location, cancel: Cancel, view: &View) {
                 }
                 Err(error) if error.is_cancelled() => {}
                 Err(error) => handle.send(Event::Failed {
+                    read,
                     location,
                     message: error.to_string(),
                 }),
@@ -1317,6 +1358,7 @@ fn spawn_read(ctx: &Ctx, location: Location, cancel: Cancel, view: &View) {
         // Out of threads. The window stays on the folder it had, which is
         // confusing but recoverable, so say which folder was not read.
         ctx.shared.reading.set(false);
+        ctx.shared.state.borrow_mut().read = None;
         view.set_entries(Vec::new());
         show_banner(ctx, &format!("{display}: cannot start a reader."));
     }
@@ -1351,6 +1393,7 @@ fn watch_for(ctx: &Ctx) -> Option<Rc<Live>> {
 /// kept for the one `Finished` event.
 struct Sink {
     handle: Handle,
+    read: ReadId,
     cancel: Cancel,
     location: Location,
     final_entries: Vec<Entry>,
@@ -1362,6 +1405,7 @@ impl ufm_vfs::ListingSink for Sink {
             return;
         }
         self.handle.send(Event::Batch {
+            read: self.read,
             location: self.location.clone(),
             entries: entries.to_vec(),
         });
@@ -1403,8 +1447,12 @@ fn apply(ctx: &Ctx, mut event: Event) {
         return;
     };
     match event {
-        Event::Batch { location, entries } => {
-            if !ctx.shared.state.borrow().shows(&location) {
+        Event::Batch {
+            read,
+            location,
+            entries,
+        } => {
+            if !ctx.shared.state.borrow().accepts(read, &location) {
                 return; // the user moved on while this was read
             }
             // The store currently holds result rows, and appending folder rows
@@ -1415,13 +1463,14 @@ fn apply(ctx: &Ctx, mut event: Event) {
             view.push_batch(&entries);
         }
         Event::Finished {
+            read,
             location,
             entries,
             hints,
         } => {
             let query = {
                 let state = ctx.shared.state.borrow();
-                if !state.shows(&location) {
+                if !state.accepts(read, &location) {
                     return;
                 }
                 state.query.clone()
@@ -1451,8 +1500,12 @@ fn apply(ctx: &Ctx, mut event: Event) {
             view.set_entries(filtered);
             settled(ctx);
         }
-        Event::Failed { location, message } => {
-            if !ctx.shared.state.borrow().shows(&location) {
+        Event::Failed {
+            read,
+            location,
+            message,
+        } => {
+            if !ctx.shared.state.borrow().accepts(read, &location) {
                 return;
             }
             settled(ctx);
@@ -1533,6 +1586,7 @@ fn apply(ctx: &Ctx, mut event: Event) {
 /// not showing.
 fn settled(ctx: &Ctx) {
     ctx.shared.reading.set(false);
+    ctx.shared.state.borrow_mut().read = None;
     if !ctx.shared.missed.replace(false) {
         return;
     }
@@ -1772,12 +1826,19 @@ fn restored(ctx: &Ctx) {
         return;
     };
     ctx.path.set_label(&location.display());
-    let mode = ctx.shared.prefs.borrow().view_mode_for(&location);
-    ctx.modes
-        .set_visible_child_name(presentation(&location, mode));
-    if mode == ViewMode::Columns && !location.is_virtual() {
-        ctx.columns.show_chain(&location);
+    show_location(ctx, &location, &view);
+    if let Some(dir) = location.virtual_dir() {
+        show_virtual(ctx, dir, &view);
+    } else if columns_on(ctx) {
+        let read = ctx.shared.state.borrow().read;
+        if let Some(read) = read {
+            ctx.columns.expect_leaf(read);
+        } else {
+            ctx.columns.fill_leaf(&location, &shown);
+        }
+        ctx.columns.set_filter(&location, &filter(&shown, &query));
     }
+    sync_watches(ctx);
 }
 
 /// Which child of the mode stack a location should be shown in.
@@ -1876,7 +1937,19 @@ fn activate(ctx: &Ctx, row: &Row) {
 /// panes, whose rows are their own widgets, can share the path.
 fn activate_entry(ctx: &Ctx, entry: &Entry) {
     if entry.navigable() {
-        navigate(ctx, entry.location.clone(), true);
+        let target =
+            if entry.kind == ufm_core::entry::EntryKind::Archive && entry.location.is_real() {
+                Location::archive(
+                    entry.location.as_path().expect("a local archive"),
+                    &[] as &[&str],
+                )
+            } else {
+                Ok(entry.location.clone())
+            };
+        match target {
+            Ok(location) => navigate(ctx, location, true),
+            Err(error) => show_banner(ctx, &error.to_string()),
+        }
         return;
     }
     let uri = entry.location.as_path().map_or_else(
@@ -3006,7 +3079,10 @@ fn mode_action(ctx: &Ctx) -> Rc<gio::SimpleAction> {
                     // until the next navigation. While a read really is running
                     // the pane stays as the chain left it, because those rows
                     // would then be thrown away by the answer that is coming.
-                    if !ctx.shared.reading.get() {
+                    let read = ctx.shared.state.borrow().read;
+                    if let Some(read) = read {
+                        ctx.columns.expect_leaf(read);
+                    } else {
                         ctx.columns.fill_leaf(&location, &shown);
                     }
                 }
@@ -3968,41 +4044,46 @@ fn path_label(location: &Location) -> gtk::Label {
     label
 }
 
+fn breadcrumb_locations(location: &Location) -> Vec<Location> {
+    let mut chain = vec![location.clone()];
+    while let Some(parent) = chain.last().and_then(Location::parent) {
+        chain.push(parent);
+    }
+    chain.reverse();
+    chain
+}
+
 fn update_crumbs(ctx: &Ctx, location: &Location) {
     while let Some(child) = ctx.crumbs.first_child() {
         ctx.crumbs.remove(&child);
     }
-    if let Some(path) = location.as_path() {
-        let mut chain = Vec::new();
-        let mut current = Some(path);
-        while let Some(part) = current {
-            chain.push(part.to_path_buf());
-            current = part.parent();
-        }
-        chain.reverse();
-        for path in chain {
-            let label = if path == paths::home() {
-                "Home".to_string()
-            } else if path == Path::new("/") {
-                "/".to_string()
-            } else {
-                path.file_name().map_or_else(
-                    || path.display().to_string(),
-                    |v| v.to_string_lossy().into_owned(),
-                )
-            };
-            let button = gtk::Button::with_label(&label);
-            button.connect_clicked({
-                let ctx = ctx.clone();
-                move |_| navigate(&ctx, Location::file(path.clone()), true)
-            });
-            ctx.crumbs.append(&button);
-        }
-    } else {
-        let label = gtk::Label::new(Some(&location.display()));
-        label.set_margin_start(12);
-        label.set_margin_end(12);
-        ctx.crumbs.append(&label);
+    for target in breadcrumb_locations(location) {
+        let label = match &target {
+            Location::Archive { archive, inner } => {
+                if inner.is_empty() {
+                    archive
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .into_owned()
+                } else {
+                    inner.rsplit('/').next().unwrap_or(inner).to_string()
+                }
+            }
+            Location::File { path } if *path == paths::home() => "Home".to_string(),
+            Location::File { path } => path.file_name().map_or_else(
+                || path.display().to_string(),
+                |name| name.to_string_lossy().into_owned(),
+            ),
+            _ => target.display(),
+        };
+        let button = gtk::Button::with_label(&label);
+        button.set_tooltip_text(Some(&target.display()));
+        button.connect_clicked({
+            let ctx = ctx.clone();
+            move |_| navigate(&ctx, target.clone(), true)
+        });
+        ctx.crumbs.append(&button);
     }
 }
 
@@ -4069,6 +4150,219 @@ mod tests {
             child_count: None,
             icon_key: "text/plain".to_string(),
         }
+    }
+
+    fn with_navigation_window(body: impl FnOnce(&Ctx, &View)) {
+        let _env = env();
+        let _config = ConfigDir::new();
+        let _mount = MountRoot::new();
+        static NEXT_APP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let id = NEXT_APP.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let app = gtk::Application::new(
+            Some(&format!("org.uflinux.NavigationTest.t{id}")),
+            gio::ApplicationFlags::NON_UNIQUE,
+        );
+        app.register(None::<&gio::Cancellable>)
+            .expect("register test application");
+        open(&app, &["computer://".into()]);
+        let ctx = OPEN.with(|windows| windows.borrow().last().expect("test window").ctx.clone());
+        let view = ctx.view.upgrade().expect("test view");
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| body(&ctx, &view)));
+        if let Some(cancel) = ctx.shared.state.borrow_mut().cancel.take() {
+            cancel.cancel();
+        }
+        ctx.window.upgrade().expect("test window").close();
+        if let Err(error) = result {
+            std::panic::resume_unwind(error);
+        }
+    }
+
+    #[test]
+    fn navigation_restores_destination_presentations_preferences_and_history() {
+        super::super::tk::ui(|| {
+            with_navigation_window(|ctx, view| {
+                let temp = tempfile::tempdir().unwrap();
+                let folder = Location::file(temp.path());
+                let key = SortKey {
+                    descending: true,
+                    ..SortKey::default()
+                };
+                ctx.shared
+                    .prefs
+                    .borrow_mut()
+                    .set_view_mode_for(&folder, ViewMode::Columns);
+                ctx.shared.prefs.borrow_mut().set_sort_for(&folder, key);
+                navigate(ctx, folder.clone(), true);
+                assert!(columns_on(ctx));
+                assert_eq!(view.mode(), ViewMode::Columns);
+                assert_eq!(view.sort_key(), key);
+                assert_eq!(ctx.columns.pane_locations().last(), Some(&folder));
+                let window = ctx.window.upgrade().unwrap();
+                assert_eq!(
+                    window
+                        .lookup_action("mode")
+                        .unwrap()
+                        .state()
+                        .unwrap()
+                        .get::<String>()
+                        .as_deref(),
+                    Some("columns")
+                );
+                gtk::prelude::WidgetExt::activate_action(&window, "win.back", None).unwrap();
+                assert_eq!(ctx.modes.visible_child_name().as_deref(), Some("computer"));
+                assert!(ctx.columns.pane_locations().is_empty());
+                assert!(!ctx.shared.reading.get());
+                gtk::prelude::WidgetExt::activate_action(&window, "win.forward", None).unwrap();
+                assert!(columns_on(ctx));
+                navigate(ctx, Location::parse("network://").unwrap(), true);
+                assert_eq!(ctx.modes.visible_child_name().as_deref(), Some("network"));
+                navigate(ctx, folder.clone(), true);
+                assert!(columns_on(ctx));
+                navigate(ctx, Location::parse("recent://").unwrap(), true);
+                assert_eq!(ctx.modes.visible_child_name().as_deref(), Some("view"));
+                assert!(!ctx.shared.reading.get());
+                navigate(ctx, folder.clone(), true);
+                assert!(columns_on(ctx));
+                let list_path = temp.path().join("list");
+                std::fs::create_dir(&list_path).unwrap();
+                let list_folder = Location::file(list_path);
+                ctx.shared
+                    .prefs
+                    .borrow_mut()
+                    .set_view_mode_for(&list_folder, ViewMode::List);
+                navigate(ctx, list_folder, true);
+                assert_eq!(view.mode(), ViewMode::List);
+                assert_eq!(ctx.modes.visible_child_name().as_deref(), Some("view"));
+                assert!(ctx.columns.pane_locations().is_empty());
+                go_up(ctx);
+                assert_eq!(ctx.shared.state.borrow().current.as_ref(), Some(&folder));
+                assert!(columns_on(ctx));
+            })
+        });
+    }
+
+    #[test]
+    fn stale_reads_cannot_replace_a_later_visit_to_the_same_folder() {
+        super::super::tk::ui(|| {
+            with_navigation_window(|ctx, _view| {
+                let temp = tempfile::tempdir().unwrap();
+                let folder = Location::file(temp.path());
+                navigate(ctx, folder.clone(), true);
+                let old = ctx.shared.state.borrow().read.unwrap();
+                navigate(ctx, Location::computer(), true);
+                navigate(ctx, folder.clone(), true);
+                let current = ctx.shared.state.borrow().read.unwrap();
+                apply(
+                    ctx,
+                    Event::Batch {
+                        read: old,
+                        location: folder.clone(),
+                        entries: vec![entry("stale")],
+                    },
+                );
+                apply(
+                    ctx,
+                    Event::Failed {
+                        read: old,
+                        location: folder.clone(),
+                        message: "stale failure".into(),
+                    },
+                );
+                apply(
+                    ctx,
+                    Event::Finished {
+                        read: old,
+                        location: folder.clone(),
+                        entries: vec![entry("stale")],
+                        hints: None,
+                    },
+                );
+                assert!(ctx.shared.state.borrow().shown.is_empty());
+                assert!(!ctx.banner.is_visible());
+                assert_eq!(ctx.shared.state.borrow().read, Some(current));
+                apply(
+                    ctx,
+                    Event::Finished {
+                        read: current,
+                        location: folder,
+                        entries: vec![entry("current")],
+                        hints: None,
+                    },
+                );
+                assert_eq!(ctx.shared.state.borrow().shown[0].name, "current");
+                assert!(!ctx.shared.reading.get());
+            })
+        });
+    }
+
+    #[test]
+    fn dismissing_search_populates_the_restored_column_leaf() {
+        super::super::tk::ui(|| {
+            with_navigation_window(|ctx, _view| {
+                let temp = tempfile::tempdir().unwrap();
+                let folder = Location::file(temp.path());
+                ctx.shared
+                    .prefs
+                    .borrow_mut()
+                    .set_view_mode_for(&folder, ViewMode::Columns);
+                navigate(ctx, folder.clone(), true);
+                let read = ctx.shared.state.borrow().read.unwrap();
+                ctx.find.show();
+                found(
+                    ctx,
+                    Found {
+                        entries: vec![entry("result")],
+                        total: 1,
+                        status: "1 match".into(),
+                    },
+                );
+                apply(
+                    ctx,
+                    Event::Finished {
+                        read,
+                        location: folder.clone(),
+                        entries: vec![entry("kept")],
+                        hints: None,
+                    },
+                );
+                assert!(!ctx.shared.reading.get());
+                ctx.find.clear();
+                assert!(columns_on(ctx));
+                assert_eq!(
+                    ctx.columns.pane_len(ctx.columns.pane_locations().len() - 1),
+                    1
+                );
+                assert_eq!(ctx.shared.state.borrow().shown[0].name, "kept");
+            })
+        });
+    }
+
+    #[test]
+    fn activating_an_archive_enters_its_root_and_breadcrumbs_keep_inner_paths() {
+        super::super::tk::ui(|| {
+            with_navigation_window(|ctx, _view| {
+                let temp = tempfile::tempdir().unwrap();
+                let path = temp.path().join("bundle.tar");
+                std::fs::copy("../../tests/archive-fixtures/nested.tar", &path).unwrap();
+                let mut archive = entry("bundle.tar");
+                archive.kind = EntryKind::Archive;
+                archive.location = Location::file(&path);
+                activate_entry(ctx, &archive);
+                let root = Location::archive(&path, &[] as &[&str]).unwrap();
+                assert_eq!(ctx.shared.state.borrow().current.as_ref(), Some(&root));
+                let inner = root.join("docs").unwrap().join("deep").unwrap();
+                let crumbs = breadcrumb_locations(&inner);
+                assert_eq!(
+                    &crumbs[crumbs.len() - 3..],
+                    &[root.clone(), root.join("docs").unwrap(), inner]
+                );
+                go_up(ctx);
+                assert_eq!(
+                    ctx.shared.state.borrow().current,
+                    Some(Location::file(temp.path()))
+                );
+            })
+        });
     }
 
     #[test]

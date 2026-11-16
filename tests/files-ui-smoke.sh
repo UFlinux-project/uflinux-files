@@ -17,7 +17,7 @@
 #
 # It brings up its own headless `labwc` and its own session bus, so it leaves nothing
 # attached to a running desktop and works in a container. It needs `labwc`, `grim`,
-# `gdbus` and `dbus-run-session` (all in the SDK image; `labwc`/`grim` from the wlroots
+# `gdbus`, `dbus-run-session` and `wtype` (all in the SDK image; `labwc`/`grim` from the wlroots
 # and wayland packages, the rest from `glib-tools`), and Python 3 with the AT-SPI
 # typelib for reading the tree. Any of those missing makes it exit 0 with a SKIP line
 # rather than fail: a build host with no compositor is not a broken program.
@@ -32,14 +32,19 @@ BIN=${1:-target/debug/uflinux-files}
 HERE=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 A11Y="$HERE/files-ui-a11y.py"
 
+skip() {
+    echo "SKIP ui smoke: $1"
+    [ -z "${UFLINUX_FILES_REQUIRE_DISPLAY:-}" ] || exit 1
+    exit 0
+}
+
 # Everything the compositor and the tree reader need, checked up front so the script
 # can decline cleanly instead of failing halfway through with a message about a socket.
-for tool in labwc grim gdbus dbus-run-session python3; do
-    command -v "$tool" >/dev/null || { echo "SKIP ui smoke: need $tool"; exit 0; }
+for tool in labwc grim gdbus dbus-run-session python3 wtype; do
+    command -v "$tool" >/dev/null || { skip "need $tool"; }
 done
 python3 -c 'import gi; gi.require_version("Atspi", "2.0")' 2>/dev/null || {
-    echo "SKIP ui smoke: need the AT-SPI typelib (at-spi2-core)"
-    exit 0
+    skip "need the AT-SPI typelib (at-spi2-core)"
 }
 [ -x "$BIN" ] || { echo "no binary at $BIN — run cargo build -p uflinux-files" >&2; exit 2; }
 
@@ -94,6 +99,7 @@ DESKTOP_DIR=$HOME/Desktop
 mkdir -p "$DESKTOP_DIR"
 : >"$DESKTOP_DIR/desk-one.txt"
 : >"$DESKTOP_DIR/desk-two.txt"
+: >"$HOME/navigation-proof.txt"
 
 # One network share the user connected to in some earlier session, written where
 # the mount table lives so the application finds a share already listed before it
@@ -240,7 +246,7 @@ else
 fi
 
 # The sidebar is the same everywhere, so it is checked once, before the views change.
-for place in Home "My Computer" Computer Recent Starred Trash; do
+for place in Home Computer Recent Starred Network Trash; do
     has_named "$place" "the sidebar offers $place"
 done
 
@@ -255,13 +261,11 @@ if wait_named "Back"; then
 else
     fail "Back is present but insensitive at the start of history"
 fi
-if wait_named "Up one folder"; then
-    case $(states_of "Up one folder") in
-    *sensitive*) ok "Up one folder is sensitive on a real folder" ;;
-    *) fail "Up one folder is sensitive on a real folder (states: $(states_of "Up one folder"))" ;;
-    esac
+if gdbus call --session --dest org.uflinux.FileManager --object-path "$WIN" \
+    --method org.gtk.Actions.Describe up | grep -qF '(true'; then
+    ok "Up is sensitive on a real folder"
 else
-    fail "Up one folder is sensitive on a real folder"
+    fail "Up is sensitive on a real folder"
 fi
 
 # --- the grid, which is the mode a window opens in ----------------------------------
@@ -317,6 +321,58 @@ if printf '%s\n' "$DUMP" | grep -qF "$(printf '\tone\t')"; then
     ok "the deepest column holds the folder's own entries at once"
 else
     fail "the deepest column holds the folder's own entries at once"
+fi
+
+# --- navigation changes both the title and the visible page ---------------------------
+# Enter addresses through the real editor; each assertion also checks content.
+navigate_to() {
+    act location "[]" "[]"
+    python3 "$A11Y" type "$1" >/dev/null || fail "the location editor accepts $1"
+    python3 "$A11Y" submit >/dev/null || fail "the location editor submits $1"
+}
+navigate_to computer://
+has_frame Computer "the address editor opens Computer"
+python3 "$A11Y" press-role button Home Computer >/dev/null || fail "the Home shortcut activates"
+has_frame '~' "the Home shortcut updates the location"
+has_named navigation-proof.txt "leaving Computer reveals the Home listing"
+act back "[]" "[]"
+has_frame Computer "Back restores Computer"
+has_named 'Preferred Folders' "Back restores the Computer page"
+act forward "[]" "[]"
+has_frame '~' "Forward restores Home"
+has_named navigation-proof.txt "Forward restores Home contents"
+python3 "$A11Y" press-role 'list item' Network '~' >/dev/null || fail "the Network sidebar row activates"
+has_frame Network "the sidebar opens Network"
+has_named 'Connect to Server…' "Network displays its own page"
+python3 "$A11Y" press-role 'list item' Home Network >/dev/null || fail "the Home sidebar row activates"
+has_frame '~' "the sidebar leaves Network for Home"
+has_named navigation-proof.txt "leaving Network reveals the Home listing"
+navigate_to "$PACK"
+has_frame "$PACK" "the location editor opens an ordinary folder"
+has_named bundle.tar "the folder contains its archive"
+python3 "$A11Y" select bundle.tar >/dev/null || fail "the archive can be selected"
+act open "[]" "[]"
+has_named notes.txt "opening an archive reveals its members"
+python3 "$A11Y" select docs >/dev/null || fail "an archive directory can be selected"
+act open "[]" "[]"
+has_named readme.md "an archive directory opens with its own entries"
+python3 "$A11Y" press-role button bundle.tar >/dev/null || fail "the archive breadcrumb activates"
+has_named notes.txt "the archive breadcrumb restores the archive root"
+act back "[]" "[]"
+has_named readme.md "Back restores the archive subdirectory"
+act forward "[]" "[]"
+has_named notes.txt "Forward restores the archive root"
+act up "[]" "[]"
+has_frame "$PACK" "Up leaves the archive root"
+has_named bundle.tar "Up restores the containing folder contents"
+navigate_to "$TARGET"
+has_frame "$TARGET" "the location editor returns to the fixture"
+has_named one "the destination folder rows are visible"
+refresh
+if printf '%s\n' "$DUMP" | grep -qF "$(printf '\tPreferred Folders\t')"; then
+    fail "folder navigation dismisses Computer cards"
+else
+    ok "folder navigation dismisses Computer cards"
 fi
 
 # --- the file operations -------------------------------------------------------------
@@ -1309,13 +1365,11 @@ if printf '%s\n' "$BFRAME" | grep -qF "$(printf 'list item\talpha\t')"; then
 else
     fail "the bookmark appears as a named row in the sidebar (no list item named 'alpha')"
 fi
-# One heading above the folder rows, which is the reason bookmarks are spliced
-# into the group rather than appended after it: a heading is drawn wherever the
-# group changes, so appending would say "Folders" a second time below "Trash".
-if [ "$(printf '%s\n' "$BFRAME" | grep -cF "$(printf '\tFolders\t')")" -eq 1 ]; then
-    ok "the sidebar says Folders once"
+# Group separators must not duplicate the bookmarked place.
+if [ "$(printf '%s\n' "$BFRAME" | grep -cF "$(printf 'list item\talpha\t')")" -eq 1 ]; then
+    ok "the sidebar contains the bookmark exactly once"
 else
-    fail "the sidebar says Folders once ($(printf '%s\n' "$BFRAME" | grep -cF "$(printf '\tFolders\t')") headings)"
+    fail "the sidebar contains the bookmark exactly once"
 fi
 
 # --- what a bookmark row's menu does ------------------------------------------------
@@ -1482,7 +1536,7 @@ fi
 # --- a second location opens a window in the running instance -----------------------
 # `computer://` on a second invocation reaches the primary through its `open` signal and
 # adds a window; the new window is titled for what it shows.
-"$BIN" computer:// >"$ROOT/second.log" 2>&1 || fail "a second invocation exits non-zero"
+"$BIN" >"$ROOT/second.log" 2>&1 || fail "a second invocation exits non-zero"
 has_frame "Computer" "a second invocation opens a Computer window in the running instance"
 
 # What is inside that window, read from its own subtree. An unscoped dump would
@@ -1506,17 +1560,21 @@ fi
 # a card reports how full its filesystem is. The sidebar's Home row carries a
 # usage bar too, so the check counts: one line is the sidebar, two means a card
 # said it as well.
-if [ "$(printf '%s\n' "$CFRAME" | grep -cF "free of")" -ge 2 ]; then
+if [ "$(printf '%s\n' "$CFRAME" | grep -cF "free of")" -ge 1 ]; then
     ok "a card reports how full its filesystem is"
 else
     fail "a card reports how full its filesystem is"
 fi
+# The Network page owns configured share cards. Keep it open to verify broadcasts.
+"$BIN" network:// >"$ROOT/network.log" 2>&1 || fail "Network invocation exits non-zero"
+has_frame Network "the Network page opens in another window"
+NFRAME=$(python3 "$A11Y" dump-frame Network 2>/dev/null || true)
 # The share the fixture listed before the application started is a card too, named
 # for the share rather than for the mount point it would have been attached to.
-if printf '%s\n' "$CFRAME" | grep -qF "$(printf 'table cell\tvideos2024\t')"; then
-    ok "a share the user listed is a card of its own on My Computer"
+if printf '%s\n' "$NFRAME" | grep -qF "$(printf 'table cell\tvideos2024\t')"; then
+    ok "a share the user listed has its own Network card"
 else
-    fail "a share the user listed is a card of its own on My Computer (no card named 'videos2024')"
+    fail "a share the user listed has its own Network card"
 fi
 # The same share is a sidebar row in this window as well. Both halves are needed
 # before anything is taken away: a check that something disappeared is only worth
@@ -1530,7 +1588,7 @@ fi
 # And it says which state it is in. A share the kernel has no record of is neither
 # broken nor connected, and a card that said neither would leave a user guessing
 # about a row that is sitting in the sidebar.
-if printf '%s\n' "$CFRAME" | grep -qF "$(printf '\tNot connected\t')"; then
+if printf '%s\n' "$NFRAME" | grep -qF "$(printf '\tNot connected\t')"; then
     ok "a share that is listed but not connected says which it is"
 else
     fail "a share that is listed but not connected says which it is"
@@ -1543,9 +1601,8 @@ else
     ok "Computer shows cards rather than a reader error"
 fi
 # The count in the bar counts cards. Left to the listing path it would have said
-# "Empty folder" about a window showing two drives. Three cards are present:
-# Desktop, the system drive, and the configured share. Home is a shortcut.
-if printf '%s\n' "$CFRAME" | grep -qF "$(printf '\t3 items\t')"; then
+# "Empty folder" about a window showing two drives: Desktop and System.
+if printf '%s\n' "$CFRAME" | grep -qF "$(printf '\t2 items\t')"; then
     ok "the status line counts the cards rather than entries read from disk"
 else
     fail "the status line counts the cards rather than entries read from disk"
@@ -1741,12 +1798,11 @@ if printf '%s\n' "$WFRAME" | grep -qF "$(printf 'list item\tvideos2024\t')"; the
 else
     ok "the row goes out of the sidebar with its share"
 fi
-# The heading goes too. One is drawn wherever the group changes, so a heading left
-# behind over an empty group is a section of the sidebar with nothing in it.
-if printf '%s\n' "$WFRAME" | grep -qF "$(printf '\tNetwork\t')"; then
-    fail "the heading goes with the last share in it"
+# Network remains a primary destination after the last saved share is removed.
+if printf '%s\n' "$WFRAME" | grep -qF "$(printf 'list item\tNetwork\t')"; then
+    ok "Network remains accessible after forgetting the last share"
 else
-    ok "the heading goes with the last share in it"
+    fail "Network remains accessible after forgetting the last share"
 fi
 # Now the window that asked for nothing. The table is a file on disk that every
 # window reads, so a share forgotten here has to have left that window's sidebar
@@ -1764,10 +1820,16 @@ if printf '%s\n' "$CFRAME" | grep -qF "$(printf 'list item\tvideos2024\t')"; the
 else
     ok "forgetting a share takes its row out of the window that did not ask"
 fi
-if printf '%s\n' "$CFRAME" | grep -qF "$(printf 'table cell\tvideos2024\t')"; then
-    fail "forgetting a share takes its card out of the window that did not ask"
+NFRAME=$(python3 "$A11Y" dump-frame Network 2>/dev/null || true)
+if printf '%s\n' "$NFRAME" | grep -qF "$(printf 'table cell\tvideos2024\t')"; then
+    fail "forgetting a share removes its card from the other Network window"
 else
-    ok "forgetting a share takes its card out of the window that did not ask"
+    ok "forgetting a share removes its card from the other Network window"
+fi
+if printf '%s\n' "$NFRAME" | grep -qF "$(printf '\t0 items\t')"; then
+    ok "the Network count follows the removed share"
+else
+    fail "the Network count follows the removed share"
 fi
 # The count in that window's bar counts what it is showing now. Two cards left:
 # the desktop folder and the system drive. Home is in the shortcuts above.

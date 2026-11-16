@@ -37,8 +37,13 @@ pub fn ui(body: impl FnOnce() + Send + 'static) {
     let (tx, rx) = mpsc::sync_channel::<Result<(), Box<dyn Any + Send>>>(1);
     let queued = pool.push(move || {
         if !drawable() {
-            // No display: nothing to build widgets on, so nothing to assert.
-            let _ = tx.send(Ok(()));
+            // CI can require real widget execution instead of a silent skip.
+            let result = if std::env::var_os("UFLINUX_FILES_REQUIRE_DISPLAY").is_some() {
+                Err(Box::new("GTK tests require a working display") as Box<dyn Any + Send>)
+            } else {
+                Ok(())
+            };
+            let _ = tx.send(result);
             return;
         }
         let _ = tx.send(panic::catch_unwind(AssertUnwindSafe(body)));

@@ -714,10 +714,14 @@ mod tests {
     #[test]
     fn the_popover_holds_the_row_s_facts_and_nothing_else_until_a_reply_arrives() {
         tk::ui(|| {
-            let app = gtk::Application::builder()
-                .application_id("org.uflinux.FileManager.preview.test")
-                .build();
+            let app = gtk::Application::new(None::<&str>, gio::ApplicationFlags::NON_UNIQUE);
+            app.register(None::<&gio::Cancellable>)
+                .expect("test application");
             let window = gtk::ApplicationWindow::new(&app);
+            let listing = gtk::Button::with_label("listing");
+            window.set_child(Some(&listing));
+            window.present();
+            listing.grab_focus();
             let preview = Preview::install(&window);
             assert!(!preview.is_visible(), "a fresh preview is closed");
             // A pipeline with no handle refuses requests, which is the state a
@@ -738,6 +742,7 @@ mod tests {
             assert!(find(&content, "ufm-preview-image").is_none());
             preview.hide(&window);
             assert!(!preview.is_visible(), "hide closes it");
+            window.close();
         });
     }
 

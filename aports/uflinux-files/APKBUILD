@@ -1,12 +1,15 @@
 # Maintainer: UFLinux contributors <noreply@example.invalid>
 pkgname=uflinux-files
 pkgver=0.1.0
-pkgrel=0
+pkgrel=1
 pkgdesc="UFLinux file manager: GTK4 browsing, archives, mounts and search"
 url="${UFLINUX_PROJECT_URL:-https://github.com}"
 arch="x86 x86_64 aarch64 armv7 ppc64le s390x riscv64"
 license="GPL-3.0-only"
-depends="uflinux-files-searchd=$pkgver-r$pkgrel desktop-file-utils hicolor-icon-theme lsblk"
+# Image formats and archive codecs are required runtime capabilities.
+# The loader metapackage tracks every Glycin loader supplied by Alpine.
+depends="uflinux-files-searchd=$pkgver-r$pkgrel desktop-file-utils hicolor-icon-theme lsblk
+	glycin-loaders-all 7zip libarchive-tools gzip bzip2 xz zstd lz4"
 # Not `udisks2`: UFLinux has no udisks2, so SMB and NFS go through our own
 # polkit action and /usr/libexec/uflinux-files-mount. The session agent that
 # answers the pkexec prompt is the one uflinux-desktop already registers.
@@ -24,15 +27,9 @@ subpackages="$pkgname-dbg $pkgname-doc $pkgname-searchd:searchd
 # The provider is its own binary so that it stays out of the file manager's
 # library closure; see crates/uflinux-files-provider/Cargo.toml.
 _bin_provider="uflinux-files-provider"
-# Optional at runtime, and each one is named in the UI when it is missing:
-# `7z` comes from p7zip (Alpine's package provides `7z`, not `7zz`), the tar
-# codecs and `bsdtar` from libarchive-tools, and `xdg-open` for "Open With".
-# Recommends rather than depends, so a minimal install still browses a directory
-# and the package that is absent is a message rather than a broken feature.
-# One assignment only: this file is sourced by a shell, so a second `recommends=`
-# would silently replace the first.
+# Desktop integration and the privileged helper remain optional components.
 recommends="$pkgname-desktop=$pkgver-r$pkgrel $pkgname-mount-helper=$pkgver-r$pkgrel
-	p7zip libarchive-tools xdg-utils"
+	xdg-utils"
 options="net"
 # Generated from the repository by scripts/files-source.py, independently verified.
 source="$pkgname-$pkgver.tar"
@@ -112,7 +109,7 @@ desktop() {
 	# has no windows. Enforced by the crate's dependency list, not by a wish: the
 	# binary maps twenty-five shared libraries and gtk4 is not among them, where
 	# the file manager maps a hundred and eleven. See docs/memory-budget.md.
-	depends="dbus"
+	depends="dbus glycin-loaders-all"
 	amove usr/bin/$_bin_provider \
 		usr/share/dbus-1/services/org.uflinux.FileManager.Desktop1.service
 }
@@ -127,5 +124,5 @@ mount_helper() {
 # Filled in by scripts/files-source.py --update; empty here so the recipe still
 # parses as shell before a bundle has been generated.
 sha512sums="
-c9bc072ec3ed9ecd87625da61b670bcc5061d3823547f87d9714870b4445a8f35d7713b1c24ef0424d8fb3af0a238b2507e569f25cf655e2d33003520be188ef  uflinux-files-0.1.0.tar
+9efa847271624a77111beac7c5ca064360e83ee033f0de781958fca293275348448eead235dc800f5199824527d1a73093ca6b4d3b20df0ef9a94c8f5ed90f25  uflinux-files-0.1.0.tar
 "
