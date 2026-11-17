@@ -2260,21 +2260,6 @@ fn header(ctx: &Ctx, menu: &gio::Menu) -> gtk::HeaderBar {
         bar.pack_start(&button);
     }
 
-    let sidebar = gtk::Button::from_icon_name("sidebar-show-left-symbolic");
-    sidebar.set_tooltip_text(Some("Toggle places sidebar"));
-    sidebar.connect_clicked({
-        let ctx = ctx.clone();
-        move |_| {
-            if let Some(panel) = ctx.panel.upgrade() {
-                let places = panel.widget();
-                places.set_visible(!places.is_visible());
-                if places.is_visible() && places.parent().is_some_and(|p| p.is::<gtk::Overlay>()) {
-                    ctx.preview.widget().set_visible(false);
-                }
-            }
-        }
-    });
-    bar.pack_end(&sidebar);
     let search = folder_filter(ctx);
     *ctx.search.borrow_mut() = Some(search.clone());
     let modes = gtk::MenuButton::builder()
@@ -2292,10 +2277,6 @@ fn header(ctx: &Ctx, menu: &gio::Menu) -> gtk::HeaderBar {
         views.append(&button);
     }
     bar.pack_end(&views);
-    let inspector = gtk::Button::from_icon_name("sidebar-show-right-symbolic");
-    inspector.set_action_name(Some("win.preview"));
-    inspector.set_tooltip_text(Some("Toggle preview pane (Space)"));
-    bar.pack_end(&inspector);
 
     let search_button = gtk::Button::from_icon_name("system-search-symbolic");
     search_button.set_tooltip_text(Some("Search files"));

@@ -20,6 +20,10 @@ elif tool == 'rustc':
 elif tool == 'cargo':
     if args == ['pgo', 'info']:
         sys.exit(0)
+    flags = os.environ.get('RUSTFLAGS', '')
+    assert '-Ctarget-cpu=generic' in flags, flags
+    assert flags.index('-Clink-arg=-Wl,-z,nopack-relative-relocs') > flags.index('-Clink-arg=-Wl,-z,pack-relative-relocs'), flags
+    assert ('-Clink-arg=-Wl,-fini,0' in flags) == (os.environ['TEST_FINI_ARRAY'] == '1'), flags
     if args[:1] == ['pgo']:
         cargo_args = args[args.index('--') + 1:]
         subprocess.run(['cargo', 'build', *cargo_args], check=True)
@@ -56,7 +60,7 @@ elif tool == 'timeout':
 
 
 class DriverTests(unittest.TestCase):
-    def run_driver(self, arch='x86_64', failure='', target=None):
+    def run_driver(self, arch='x86_64', failure='', target=None, abi='musl'):
         with tempfile.TemporaryDirectory() as scratch:
             root = Path(scratch)
             tools = root / 'tools'
@@ -66,7 +70,7 @@ class DriverTests(unittest.TestCase):
                 path = tools / name
                 path.write_text(MOCK)
                 path.chmod(0o755)
-            host = arch + '-test-linux-musl'
+            host = arch + '-test-linux-' + abi
             output = root / 'custom-target'
             for name in NAMES:
                 for directory, filename in [('pgo-profiles', 'stale.profraw'),
@@ -75,7 +79,9 @@ class DriverTests(unittest.TestCase):
                     stale.parent.mkdir(parents=True, exist_ok=True)
                     stale.write_text('stale')
             env = dict(os.environ, PATH=str(tools) + ':' + os.environ['PATH'],
-                       CARGO_TARGET_DIR=str(output), TEST_HOST=host, TEST_FAIL=failure)
+                       CARGO_TARGET_DIR=str(output), TEST_HOST=host, TEST_FAIL=failure,
+                       RUSTFLAGS='-Ctarget-cpu=generic -Clink-arg=-Wl,-z,pack-relative-relocs',
+                       TEST_FINI_ARRAY=str(int(arch == 'aarch64' and abi == 'musl')))
             env.pop('CARGO_ENCODED_RUSTFLAGS', None)
             result = subprocess.run(['sh', str(ROOT / 'scripts/files-pgo-build.sh'), target or host],
                                     env=env, capture_output=True, text=True, timeout=30)
@@ -92,6 +98,11 @@ class DriverTests(unittest.TestCase):
         for arch in ['x86_64', 'aarch64']:
             with self.subTest(arch=arch):
                 self.run_driver(arch)
+
+    def test_gnu_targets_keep_their_legacy_fini_hook(self):
+        for arch in ['x86_64', 'aarch64']:
+            with self.subTest(arch=arch):
+                self.run_driver(arch, abi='gnu')
 
     def test_every_executable_requires_profiles_and_final_check(self):
         for name in NAMES:

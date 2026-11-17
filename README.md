@@ -198,6 +198,11 @@ The four optimized executables are written to `target/release/` (or under
 Intermediate binaries and fresh profiles live in `target/pgo-bolt/<target>/<executable>/`.
 The pipeline follows [cargo-pgo's combined PGO+BOLT workflow](https://github.com/Kobzol/cargo-pgo#bolt--pgo),
 keeps symbols until BOLT finishes, and preserves cargo-auditable metadata.
+It disables packed relative relocations throughout the pipeline to avoid
+[LLVM 22 BOLT's RELR addend rewriting bug](https://github.com/llvm/llvm-project/pull/213000),
+overriding Alpine's packaging default while retaining other Rust flags.
+On aarch64 musl, it suppresses the unused legacy `DT_FINI` tag so BOLT flushes
+profiles through `DT_FINI_ARRAY`; the linker setting is kept across all stages.
 Training covers small and large directory listings, all three view modes,
 hidden files, navigation, thumbnails, archive browsing, Computer and Trash.
 Missing training tools, empty profiles and failed final executable checks fail the

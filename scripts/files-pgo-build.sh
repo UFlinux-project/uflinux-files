@@ -51,6 +51,20 @@ export CARGO_INCREMENTAL=0
 # BOLT needs symbols and relocations until its final rewrite. abuild strips
 # the installed artifact later. cargo-pgo adds --emit-relocs for the BOLT steps.
 export CARGO_PROFILE_RELEASE_STRIP=none
+# Alpine enables packed relative relocations by default. LLVM 22 BOLT has
+# RELR addend rewriting bugs; use ordinary RELA relocations for the entire
+# pipeline, overriding an earlier packaging flag without dropping other flags.
+RUSTFLAGS="${RUSTFLAGS:-} -Clink-arg=-Wl,-z,nopack-relative-relocs"
+export RUSTFLAGS
+# musl on AArch64 ignores DT_FINI, but BOLT prefers it over DT_FINI_ARRAY.
+# Suppress the unused legacy tag so BOLT hooks the supported fini array and
+# actually flushes its profiles. Keep this flag in every compilation stage.
+case "$target" in
+    aarch64-*-linux-musl*)
+        RUSTFLAGS="${RUSTFLAGS:-} -Clink-arg=-Wl,-fini,0"
+        export RUSTFLAGS
+        ;;
+esac
 cargo pgo info
 binaries="uflinux-files uflinux-files-provider uflinux-searchd uflinux-files-mount"
 for name in $binaries; do

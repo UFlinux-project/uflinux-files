@@ -74,6 +74,15 @@ for location in "file://$scratch/tree/small" "file://$scratch/tree/large" \
         i=$((i + 1))
         if [ "$i" -ge 100 ] || ! kill -0 "$app" 2>/dev/null; then
             echo "GUI training could not reach org.uflinux.Files at $window ($location)" >&2
+            if ! kill -0 "$app" 2>/dev/null; then
+                if wait "$app"; then
+                    app_status=0
+                else
+                    app_status=$?
+                fi
+                echo "GUI training process exited with status $app_status: $binary" >&2
+                app=
+            fi
             cat "$scratch/actions.log" "$scratch/app.log" >&2
             exit 1
         fi
