@@ -55,11 +55,11 @@ while [ ! -S "$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY" ]; do
     fi
     sleep 0.1
 done
-window=/org/uflinux/FileManager/window/1
+window=/org/uflinux/Files/window/1
 call() {
     method=$1
     shift
-    gdbus call --session --dest org.uflinux.FileManager --object-path "$window" \
+    gdbus call --session --dest org.uflinux.Files --object-path "$window" \
         --method "org.gtk.Actions.$method" "$@"
 }
 activate() {
@@ -70,10 +70,11 @@ for location in "file://$scratch/tree/small" "file://$scratch/tree/large" \
     env HOME="$scratch/home" "$binary" "$location" >"$scratch/app.log" 2>&1 &
     app=$!
     i=0
-    until call List >/dev/null 2>&1; do
+    until call List >"$scratch/actions.log" 2>&1; do
         i=$((i + 1))
         if [ "$i" -ge 100 ] || ! kill -0 "$app" 2>/dev/null; then
-            cat "$scratch/app.log" >&2
+            echo "GUI training could not reach org.uflinux.Files at $window ($location)" >&2
+            cat "$scratch/actions.log" "$scratch/app.log" >&2
             exit 1
         fi
         sleep 0.1
