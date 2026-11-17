@@ -198,6 +198,10 @@ The four optimized executables are written to `target/release/` (or under
 Intermediate binaries and fresh profiles live in `target/pgo-bolt/<target>/<executable>/`.
 The pipeline follows [cargo-pgo's combined PGO+BOLT workflow](https://github.com/Kobzol/cargo-pgo#bolt--pgo),
 keeps symbols until BOLT finishes, and preserves cargo-auditable metadata.
+It uses [Rust's v0 symbol format](https://doc.rust-lang.org/rustc/symbol-mangling/v0.html)
+so BOLT does not mistake module names such as
+`warming` for split-function fragments. A small native Rust/BOLT profile test
+runs before the workspace build to catch incompatible toolchains early.
 It disables packed relative relocations throughout the pipeline to avoid
 [LLVM 22 BOLT's RELR addend rewriting bug](https://github.com/llvm/llvm-project/pull/213000),
 overriding Alpine's packaging default while retaining other Rust flags.

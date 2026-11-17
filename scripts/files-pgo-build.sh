@@ -55,6 +55,10 @@ export CARGO_PROFILE_RELEASE_STRIP=none
 # RELR addend rewriting bugs; use ordinary RELA relocations for the entire
 # pipeline, overriding an earlier packaging flag without dropping other flags.
 RUSTFLAGS="${RUSTFLAGS:-} -Clink-arg=-Wl,-z,nopack-relative-relocs"
+# BOLT 22 mistakes `.warm` inside legacy Rust names such as
+# `tantivy..reader..warming` for a split-function suffix. v0 mangling avoids
+# those embedded dotted paths. Use it for all PGO and BOLT compilations.
+RUSTFLAGS="$RUSTFLAGS -Csymbol-mangling-version=v0"
 export RUSTFLAGS
 # musl on AArch64 ignores DT_FINI, but BOLT prefers it over DT_FINI_ARRAY.
 # Suppress the unused legacy tag so BOLT hooks the supported fini array and
@@ -66,6 +70,8 @@ case "$target" in
         ;;
 esac
 cargo pgo info
+# Catch toolchain/symbol compatibility failures before compiling the workspace.
+python3 tests/files-pgo-symbols.py
 binaries="uflinux-files uflinux-files-provider uflinux-searchd uflinux-files-mount"
 for name in $binaries; do
     work=$stage/$name

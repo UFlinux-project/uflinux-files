@@ -3,6 +3,7 @@
 import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -22,6 +23,7 @@ elif tool == 'cargo':
         sys.exit(0)
     flags = os.environ.get('RUSTFLAGS', '')
     assert '-Ctarget-cpu=generic' in flags, flags
+    assert '-Csymbol-mangling-version=v0' in flags, flags
     assert flags.index('-Clink-arg=-Wl,-z,nopack-relative-relocs') > flags.index('-Clink-arg=-Wl,-z,pack-relative-relocs'), flags
     assert ('-Clink-arg=-Wl,-fini,0' in flags) == (os.environ['TEST_FINI_ARRAY'] == '1'), flags
     if args[:1] == ['pgo']:
@@ -42,6 +44,10 @@ elif tool == 'cargo':
             binary.parent.mkdir(parents=True, exist_ok=True)
             binary.write_text(name + suffix)
             binary.chmod(0o755)
+elif tool == 'python3':
+    assert args == ['tests/files-pgo-symbols.py'], args
+    if os.environ.get('TEST_FAIL') == 'symbols':
+        sys.exit(1)
 elif tool == 'timeout':
     binary = p(args[-1])
     name = binary.name.removesuffix('-bolt-instrumented').removesuffix('-bolt-optimized')
@@ -66,9 +72,9 @@ class DriverTests(unittest.TestCase):
             tools = root / 'tools'
             tools.mkdir()
             for name in ['id', 'rustc', 'cargo', 'cargo-pgo', 'cargo-auditable', 'llvm-bolt',
-                         'merge-fdata', 'labwc', 'dbus-run-session', 'gdbus', 'timeout']:
+                         'merge-fdata', 'labwc', 'dbus-run-session', 'gdbus', 'timeout', 'python3']:
                 path = tools / name
-                path.write_text(MOCK)
+                path.write_text(MOCK.replace('#!/usr/bin/env python3', '#!' + sys.executable, 1))
                 path.chmod(0o755)
             host = arch + '-test-linux-' + abi
             output = root / 'custom-target'
@@ -111,6 +117,9 @@ class DriverTests(unittest.TestCase):
                     result = self.run_driver(failure=name + ':' + phase)
                     if phase != 'final':
                         self.assertIn('no profiles for ' + name, result.stderr)
+
+    def test_symbol_check_fails_before_publishing(self):
+        self.run_driver(failure='symbols')
 
     def test_cross_target_rejected(self):
         self.assertIn('requires a native build', self.run_driver(target='aarch64-test-linux-musl').stderr)
