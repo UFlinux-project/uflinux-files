@@ -46,7 +46,14 @@ pub const LFTP_NETRC_ENV: &str = "LFTP_NETRC";
 /// The directories searched for a helper. `$PATH` alone is not enough: the
 /// system administrators' mount helpers live in `/sbin` and `/usr/sbin`, which a
 /// desktop session does not always have in its path.
-const SYSTEM_DIRS: &[&str] = &["/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin"];
+const SYSTEM_DIRS: &[&str] = &[
+    "/usr/libexec",
+    "/usr/local/bin",
+    "/usr/bin",
+    "/bin",
+    "/usr/sbin",
+    "/sbin",
+];
 
 /// Where to look for a helper program. Injectable so a test can put a directory
 /// of stub executables in front of the real ones and assert on the argv that
@@ -193,7 +200,7 @@ impl Backend {
         let helper = || -> Result<PathBuf> {
             paths.find("uflinux-files-mount").ok_or_else(|| {
                 Error::Mount(format!(
-                    "{}: the mount helper {} is missing; reinstall uflinux-files",
+                    "{}: the mount helper {} is missing; install uflinux-files-mount-helper",
                     share.protocol.label(),
                     crate::plan::HELPER
                 ))

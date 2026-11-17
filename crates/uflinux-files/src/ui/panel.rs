@@ -31,6 +31,14 @@ use crate::ui::popup::MenuRow;
 /// A place the panel can offer to take the user.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Place {
+    Device {
+        path: PathBuf,
+        mountpoint: Option<PathBuf>,
+        label: String,
+        icon: String,
+        usage: String,
+        used_per_mille: Option<u16>,
+    },
     Home,
     Desktop,
     Documents,
@@ -77,6 +85,7 @@ impl Place {
     #[must_use]
     pub fn label(&self) -> String {
         match self {
+            Self::Device { label, .. } => label.clone(),
             Self::Home => "Home".to_string(),
             Self::Desktop => "Desktop".to_string(),
             Self::Documents => "Documents".to_string(),
@@ -99,8 +108,9 @@ impl Place {
     }
 
     #[must_use]
-    pub fn icon_name(&self) -> &'static str {
+    pub fn icon_name(&self) -> &str {
         match self {
+            Self::Device { icon, .. } => icon,
             Self::Home => "user-home",
             Self::Desktop => "user-desktop",
             Self::Documents => "folder-documents",
@@ -111,7 +121,7 @@ impl Place {
             Self::Starred => "starred",
             Self::Recent => "document-open-recent",
             Self::Computer => "computer",
-            Self::Network => "network-workgroup-symbolic",
+            Self::Network => "network-workgroup",
             Self::Trash => "user-trash",
             // The themed folder for a pinned folder and for a bookmark, whatever a
             // bookmark points at. The record has an `icon` field for a name a user
@@ -126,7 +136,7 @@ impl Place {
     /// Which heading this row belongs under. Rows are grouped in the order the
     /// caller passes them, so this only decides where a heading is drawn.
     #[must_use]
-    pub const fn group(&self) -> PanelGroup {
+    pub fn group(&self) -> PanelGroup {
         match self {
             Self::Desktop
             | Self::Documents
@@ -142,6 +152,8 @@ impl Place {
             | Self::Trash
             | Self::Computer
             | Self::Network => PanelGroup::System,
+            Self::Device { icon, .. } if icon.starts_with("network") => PanelGroup::Network,
+            Self::Device { .. } => PanelGroup::Local,
             Self::Mount { .. } => PanelGroup::Network,
         }
     }
@@ -196,6 +208,9 @@ impl Place {
     #[must_use]
     pub fn location(&self) -> Location {
         match self {
+            Self::Device { mountpoint, .. } => {
+                Location::file(mountpoint.clone().unwrap_or_default())
+            }
             Self::Home => Location::file(paths::home()),
             Self::Desktop => Location::file(paths::desktop_dir()),
             Self::Documents => Location::file(paths::user_dir("XDG_DOCUMENTS_DIR", "Documents")),
@@ -527,14 +542,32 @@ impl Panel {
         let box_ = gtk::Box::new(gtk::Orientation::Vertical, 2);
         let line = gtk::Box::new(gtk::Orientation::Horizontal, 8);
         let image = gtk::Image::from_icon_name(place.icon_name());
-        image.set_pixel_size(16);
+        super::view::regular_icon(&image, place.icon_name(), 24);
         let label = gtk::Label::new(Some(&place.label()));
         label.set_ellipsize(pango_ellipsize());
         label.set_xalign(0.0);
         label.set_hexpand(true);
+        label.set_max_width_chars(24);
         line.append(&image);
         line.append(&label);
         box_.append(&line);
+        if let Place::Device {
+            usage,
+            used_per_mille,
+            ..
+        } = place
+        {
+            if let Some(used) = used_per_mille {
+                let bar = gtk::ProgressBar::new();
+                bar.set_fraction(f64::from(*used) / 1000.0);
+                bar.add_css_class("ufm-usage");
+                box_.append(&bar);
+            }
+            let detail = gtk::Label::new(Some(usage));
+            detail.add_css_class("ufm-meta");
+            detail.set_ellipsize(pango_ellipsize());
+            box_.append(&detail);
+        }
 
         if let Some(usage) = self.usage.borrow().get(place) {
             box_.append(&usage_bar(usage));

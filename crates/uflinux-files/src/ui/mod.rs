@@ -83,7 +83,7 @@ use crate::cli;
 
 /// The application id, also the bus name a shell uses to focus an existing window
 /// and the `X11` class a startup notification is matched against.
-const APP_ID: &str = "org.uflinux.FileManager";
+const APP_ID: &str = "org.uflinux.Files";
 
 /// Run the file manager until its last window closes.
 ///
@@ -101,6 +101,15 @@ pub fn run(options: &cli::Ui) -> ExitCode {
         .application_id(APP_ID)
         .flags(flags(options))
         .build();
+    let open_location = gio::SimpleAction::new("open-location", Some(glib::VariantTy::STRING));
+    let weak = app.downgrade();
+    open_location.connect_activate(move |_, value| {
+        if let (Some(app), Some(path)) = (weak.upgrade(), value.and_then(|v| v.str())) {
+            css::install();
+            window::open(&app, &[path.to_string()]);
+        }
+    });
+    app.add_action(&open_location);
     app.connect_activate(|app| {
         css::install();
         window::open(app, &[]);
@@ -123,6 +132,9 @@ pub fn run(options: &cli::Ui) -> ExitCode {
             .next()
             .unwrap_or_else(|| String::from("uflinux-files")),
     ];
+    if std::env::args().any(|a| a == "--gapplication-service") {
+        argv.push("--gapplication-service".into());
+    }
     argv.extend(options.urls.iter().cloned());
     app.run_with_args(&argv).into()
 }
@@ -238,7 +250,7 @@ mod tests {
     fn the_application_id_matches_the_desktop_entry() {
         // The desktop entry is `data/org.uflinux.Files.desktop`; a shell matches a
         // startup notification to the window that answers it through this name.
-        assert_eq!(APP_ID, "org.uflinux.FileManager");
+        assert_eq!(APP_ID, "org.uflinux.Files");
         let entry = include_str!("../../../../data/org.uflinux.Files.desktop");
         assert!(
             entry.contains("StartupWMClass=uflinux-files"),

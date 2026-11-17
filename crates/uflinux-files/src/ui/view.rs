@@ -35,6 +35,22 @@ pub const GRID_ICON: i32 = 64;
 /// Icon size in list mode, where a row is one line tall.
 pub const LIST_ICON: i32 = 16;
 
+/// Resolve regular theme artwork at a color-capable size, then scale to the row.
+/// Some themes intentionally supply monochrome artwork for their 16px names.
+pub(super) fn regular_icon(image: &gtk::Image, name: &str, size: i32) {
+    let theme = gtk::IconTheme::for_display(&image.display());
+    let paintable = theme.lookup_icon(
+        name,
+        &["text-x-generic"],
+        size.max(32),
+        image.scale_factor(),
+        image.direction(),
+        gtk::IconLookupFlags::FORCE_REGULAR,
+    );
+    image.set_paintable(Some(&paintable));
+    image.set_pixel_size(size);
+}
+
 /// Which column of the list view a factory renders.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Column {
@@ -166,12 +182,14 @@ impl View {
             )),
         );
         grid.set_single_click_activate(false);
+        grid.set_enable_rubberband(true);
         // The width decides the column count; GTK's "no ceiling" is its largest
         // number, and 0 is rejected outright.
         grid.set_max_columns(u32::MAX);
         grid.add_css_class("ufm-grid");
 
         let list = gtk::ColumnView::new(Some(selection.clone()));
+        list.set_enable_rubberband(true);
         list.set_show_row_separators(true);
         list.set_show_column_separators(false);
         list.set_reorderable(false);
@@ -614,13 +632,40 @@ pub(super) fn grid_factory(
         let found = parts(item.child().as_ref());
         if let Some(image) = found.icon {
             image.set_pixel_size(icon_size.get());
-            image.set_icon_name(Some(&row.icon_name()));
+            regular_icon(&image, &row.icon_name(), icon_size.get());
             thumbs.request(&image, &row, icon_size.get());
         }
         if let Some(label) = found.label {
             label.set_text(&row.name());
         }
         paint_badge(found.star.as_ref(), &row, icon_size.get());
+    });
+    factory
+}
+
+/// Compact horizontal rows for the Miller presentation.
+pub(super) fn column_factory(
+    size: Rc<Cell<i32>>,
+    thumbs: Pipeline,
+    on_press: &ContextHandler,
+) -> gtk::SignalListItemFactory {
+    let factory = list_factory(Column::Name, size, thumbs, on_press);
+    factory.connect_bind(|_, object| {
+        let Some(item) = object.downcast_ref::<gtk::ListItem>() else {
+            return;
+        };
+        let Some(row) = item.item().and_then(|o| o.downcast::<Row>().ok()) else {
+            return;
+        };
+        if let Some(cell) = item.child().and_then(|w| w.downcast::<gtk::Box>().ok()) {
+            if let Some(old) = cell.last_child().filter(|w| w.has_css_class("ufm-chevron")) {
+                cell.remove(&old);
+            }
+            let arrow = gtk::Image::from_icon_name("go-next-symbolic");
+            arrow.add_css_class("ufm-chevron");
+            arrow.set_visible(row.with(|e| e.kind.is_dir()));
+            cell.append(&arrow);
+        }
     });
     factory
 }
@@ -700,6 +745,9 @@ fn list_factory(
         });
         label.set_xalign(if column == Column::Size { 1.0 } else { 0.0 });
         label.set_lines(1);
+        label.set_wrap(false);
+        label.set_max_width_chars(if column.is_name() { 80 } else { 18 });
+        label.set_hexpand(column.is_name());
         // Every column carries the gesture, not just the name: a right-click on
         // a size or a date is still a right-click on that row.
         let cell: gtk::Widget = if column.is_name() {
@@ -732,7 +780,7 @@ fn list_factory(
         let found = parts(item.child().as_ref());
         if let Some(image) = found.icon {
             image.set_pixel_size(icon_size.get());
-            image.set_icon_name(Some(&row.icon_name()));
+            regular_icon(&image, &row.icon_name(), icon_size.get());
             thumbs.request(&image, &row, icon_size.get());
         }
         if let Some(label) = found.label {
@@ -749,8 +797,17 @@ fn name_label() -> gtk::Label {
     label.set_wrap(true);
     label.set_lines(2);
     label.set_ellipsize(pango::EllipsizeMode::End);
-    label.set_max_width_chars(18);
+    label.set_max_width_chars(24);
     label.add_css_class("ufm-name");
+    label.set_has_tooltip(true);
+    label.connect_query_tooltip(|label, _, _, _, tooltip| {
+        if label.layout().is_ellipsized() {
+            tooltip.set_text(Some(&label.text()));
+            true
+        } else {
+            false
+        }
+    });
     label
 }
 
@@ -782,7 +839,9 @@ fn parts(child: Option<&gtk::Widget>) -> Parts {
     let mut candidates: Vec<gtk::Widget> = child.into_iter().cloned().collect();
     while let Some(widget) = candidates.pop() {
         if let Some(picture) = widget.downcast_ref::<gtk::Image>() {
-            if widget.has_css_class("ufm-starred") {
+            if widget.has_css_class("ufm-chevron") {
+                continue;
+            } else if widget.has_css_class("ufm-starred") {
                 found.star = Some(picture.clone());
             } else {
                 found.icon = Some(picture.clone());
@@ -829,6 +888,15 @@ mod tests {
             child_count: None,
             icon_key: kind.icon_name().to_string(),
         }
+    }
+
+    #[test]
+    fn both_presentations_allow_area_selection() {
+        tk::ui(|| {
+            let view = View::new(SortKey::default(), Pipeline::new());
+            assert!(view.grid.enables_rubberband());
+            assert!(view.list.enables_rubberband());
+        });
     }
 
     #[test]

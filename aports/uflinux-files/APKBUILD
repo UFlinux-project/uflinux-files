@@ -1,14 +1,14 @@
 # Maintainer: UFLinux contributors <noreply@example.invalid>
 pkgname=uflinux-files
 pkgver=0.1.0
-pkgrel=1
+pkgrel=2
 pkgdesc="UFLinux file manager: GTK4 browsing, archives, mounts and search"
 url="${UFLINUX_PROJECT_URL:-https://github.com}"
 arch="x86 x86_64 aarch64 armv7 ppc64le s390x riscv64"
 license="GPL-3.0-only"
 # Image formats and archive codecs are required runtime capabilities.
 # The loader metapackage tracks every Glycin loader supplied by Alpine.
-depends="uflinux-files-searchd=$pkgver-r$pkgrel desktop-file-utils hicolor-icon-theme lsblk
+depends="uflinux-files-mount-helper=$pkgver-r$pkgrel uflinux-files-searchd=$pkgver-r$pkgrel desktop-file-utils hicolor-icon-theme lsblk
 	glycin-loaders-all 7zip libarchive-tools gzip bzip2 xz zstd lz4"
 # Not `udisks2`: UFLinux has no udisks2, so SMB and NFS go through our own
 # polkit action and /usr/libexec/uflinux-files-mount. The session agent that
@@ -22,13 +22,21 @@ depends="uflinux-files-searchd=$pkgver-r$pkgrel desktop-file-utils hicolor-icon-
 # needs it at runtime.
 makedepends="cargo cargo-auditable gtk4.0-dev gtk4-layer-shell-dev glib-dev
 	gdk-pixbuf-dev shared-mime-info pkgconf dbus"
+# Training executes the target binary, so these builds run on native workers.
+case "$CARCH" in
+	x86_64|aarch64)
+		makedepends="$makedepends llvm22 llvm22-bolt labwc coreutils python3"
+		_pgo=true
+		;;
+	*) _pgo=false ;;
+esac
 subpackages="$pkgname-dbg $pkgname-doc $pkgname-searchd:searchd
 	$pkgname-desktop:desktop $pkgname-mount-helper:mount_helper"
 # The provider is its own binary so that it stays out of the file manager's
 # library closure; see crates/uflinux-files-provider/Cargo.toml.
 _bin_provider="uflinux-files-provider"
-# Desktop integration and the privileged helper remain optional components.
-recommends="$pkgname-desktop=$pkgver-r$pkgrel $pkgname-mount-helper=$pkgver-r$pkgrel
+# Desktop integration remains optional; drive mounting is part of Files.
+recommends="$pkgname-desktop=$pkgver-r$pkgrel
 	xdg-utils"
 options="net"
 # Generated from the repository by scripts/files-source.py, independently verified.
@@ -45,26 +53,46 @@ export CARGO_PROFILE_RELEASE_PANIC=abort
 prepare() {
 	default_prepare
 	cargo fetch --locked --target="$CTARGET"
+	if $_pgo; then
+		# cargo-pgo is not packaged by Alpine. Install the pinned build tool
+		# during the network-enabled prepare phase, outside the source bundle.
+		CARGO_PROFILE_RELEASE_LTO=false CARGO_PROFILE_RELEASE_OPT_LEVEL=2 \
+			cargo install cargo-pgo --version 0.3.0 --locked \
+			--root "$srcdir/pgo-tools"
+	fi
 	# Source bundles normalize timestamps. Never reuse stale workspace binaries.
-	cargo clean -p ufm-core -p ufm-vfs -p ufm-archive -p ufm-mount -p ufm-index \
+	set -- -p ufm-core -p ufm-vfs -p ufm-archive -p ufm-mount -p ufm-index \
 		-p ufm-search -p ufm-desktop-ipc -p ufm-thumb -p uflinux-files-mount \
 		-p uflinux-files -p uflinux-files-provider -p uflinux-searchd
-	cargo clean --release -p ufm-core -p ufm-vfs -p ufm-archive -p ufm-mount \
-		-p ufm-index -p ufm-search -p ufm-desktop-ipc -p ufm-thumb \
-		-p uflinux-files-mount -p uflinux-files -p uflinux-files-provider \
-		-p uflinux-searchd
+	cargo clean "$@"
+	cargo clean --release "$@"
+	if $_pgo; then
+		for binary in uflinux-files uflinux-files-provider uflinux-searchd uflinux-files-mount; do
+			cargo clean --release --target="$CTARGET" \
+				--target-dir "${CARGO_TARGET_DIR:-target}/pgo-bolt/$CTARGET/$binary" "$@"
+		done
+	fi
 }
 build() {
 	# abuild enables Rust debug info when a -dbg subpackage exists, and the
 	# workspace profile strips debuginfo itself.
 	unset CARGO_PROFILE_RELEASE_DEBUG
-	RUSTFLAGS="$RUSTFLAGS --remap-path-prefix=$builddir=/usr/src/uflinux-files" \
-		cargo auditable build --workspace --release --frozen --features uflinux-files/desktop-icons
+	if $_pgo; then
+		PATH="$srcdir/pgo-tools/bin:/usr/lib/llvm22/bin:$PATH" \
+		RUSTFLAGS="$RUSTFLAGS --remap-path-prefix=$builddir=/usr/src/uflinux-files" \
+			sh scripts/files-pgo-build.sh "$CTARGET"
+	else
+		RUSTFLAGS="$RUSTFLAGS --remap-path-prefix=$builddir=/usr/src/uflinux-files" \
+			cargo auditable build --workspace --release --frozen --features uflinux-files/desktop-icons
+	fi
 }
 check() {
 	# The feature is named because it is what `build()` above compiles and what the
 	# image ships. `--workspace` alone would leave the desktop-icons fallback — the
 	# one part of this package with a window in it — untested.
+	if $_pgo; then
+		python3 tests/files-pgo-driver.py
+	fi
 	cargo test --workspace --frozen --features uflinux-files/desktop-icons
 }
 package() {
@@ -124,5 +152,5 @@ mount_helper() {
 # Filled in by scripts/files-source.py --update; empty here so the recipe still
 # parses as shell before a bundle has been generated.
 sha512sums="
-9efa847271624a77111beac7c5ca064360e83ee033f0de781958fca293275348448eead235dc800f5199824527d1a73093ca6b4d3b20df0ef9a94c8f5ed90f25  uflinux-files-0.1.0.tar
+f9016ca3741e532923376e7a9b24f1ef67cd3fa3c76ec9070a773b0b75cc258fda9ed0934b020f1bd566495f2b6ac14e49e0f72123371fc957889d12db4e02ad  uflinux-files-0.1.0.tar
 "

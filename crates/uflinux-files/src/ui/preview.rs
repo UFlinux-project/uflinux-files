@@ -301,7 +301,7 @@ fn text(window: &gtk::ApplicationWindow, handle: &Handle, entry: &Entry) -> Opti
     label.set_wrap(true);
     label.set_selectable(true);
     label.set_max_width_chars(72);
-    label.set_width_chars(48);
+    label.set_width_chars(0);
     label.add_css_class("ufm-mono");
 
     let scroll = gtk::ScrolledWindow::new();
@@ -309,7 +309,7 @@ fn text(window: &gtk::ApplicationWindow, handle: &Handle, entry: &Entry) -> Opti
     scroll.set_policy(gtk::PolicyType::Automatic, gtk::PolicyType::Automatic);
     scroll.set_min_content_height(TEXT_HEIGHT);
     scroll.set_max_content_height(TEXT_HEIGHT);
-    scroll.set_propagate_natural_width(true);
+    scroll.set_propagate_natural_width(false);
     scroll.set_child(Some(&label));
 
     let token = NEXT_TOKEN.with(|next| {

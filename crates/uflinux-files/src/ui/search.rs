@@ -191,8 +191,17 @@ impl Search {
         status.add_css_class("ufm-meta");
         status.set_ellipsize(gtk::pango::EllipsizeMode::End);
         bar.append(&entry);
-        bar.append(&target);
-        bar.append(&status);
+        let options = gtk::MenuButton::builder()
+            .icon_name("view-more-symbolic")
+            .build();
+        options.set_tooltip_text(Some("Search options"));
+        let popover = gtk::Popover::new();
+        let controls = gtk::Box::new(gtk::Orientation::Vertical, 6);
+        controls.append(&target);
+        controls.append(&status);
+        popover.set_child(Some(&controls));
+        options.set_popover(Some(&popover));
+        bar.append(&options);
 
         let wanted = Target::from_scope(scope);
         target.set_selected(wanted.index());

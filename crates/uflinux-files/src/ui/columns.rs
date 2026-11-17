@@ -42,7 +42,7 @@ use super::job::{Event, Handle, ReadId};
 use super::popup::{self, ContextHandler, Listeners};
 use super::row::Row;
 use super::thumb::Pipeline;
-use super::view::{GRID_ICON, grid_factory};
+use super::view::column_factory;
 
 /// How many panes may be on screen. Deep paths lose their topmost components
 /// rather than their leaf: the folder being read is the one being worked in,
@@ -77,7 +77,10 @@ struct Pane {
     scroll: gtk::ScrolledWindow,
     list: gtk::ListView,
     store: gio::ListStore,
-    selection: gtk::SingleSelection,
+    selection: gtk::MultiSelection,
+    pointer_down: Cell<bool>,
+    pointer_origin: Cell<(f64, f64)>,
+    pointer_moved: Cell<bool>,
     /// The listing as read, before re-sorting. Kept so that changing the sort
     /// order costs no disk access.
     entries: RefCell<Vec<Entry>>,
@@ -107,6 +110,8 @@ struct Inner {
     /// Which pane the keyboard is in, so a new column can be scrolled into view
     /// and so the arrow keys know where they were pressed from.
     active: Cell<usize>,
+    widths: RefCell<Vec<u32>>,
+    on_resize: RefCell<Option<Rc<dyn Fn(Vec<u32>)>>>,
     on_open: RefCell<Option<OpenHandler>>,
     on_up: RefCell<Option<UpHandler>>,
     on_selection: RefCell<Option<SelectionHandler>>,
@@ -140,10 +145,12 @@ impl Columns {
             readers,
             key: RefCell::new(key),
             show_hidden: Cell::new(show_hidden),
-            icon_size: Rc::new(Cell::new(GRID_ICON)),
+            icon_size: Rc::new(Cell::new(20)),
             thumbs,
             handle: RefCell::new(None),
             active: Cell::new(0),
+            widths: RefCell::new(Vec::new()),
+            on_resize: RefCell::new(None),
             on_open: RefCell::new(None),
             on_up: RefCell::new(None),
             on_selection: RefCell::new(None),
@@ -161,6 +168,13 @@ impl Columns {
 
     /// The queue listings are delivered through. Until this is set no pane can
     /// be read, which is the state during construction.
+    pub fn set_widths(&self, widths: Vec<u32>) {
+        *self.inner.widths.borrow_mut() = widths;
+    }
+    pub fn on_resize(&self, f: impl Fn(Vec<u32>) + 'static) {
+        *self.inner.on_resize.borrow_mut() = Some(Rc::new(f));
+    }
+
     pub fn set_handle(&self, handle: Handle) {
         *self.inner.handle.borrow_mut() = Some(handle);
     }
@@ -196,6 +210,16 @@ impl Columns {
     /// already on screen. The listing for `target` itself is expected from the
     /// window, which is reading it for the other modes anyway.
     pub fn show_chain(&self, target: &Location) {
+        let focused = self
+            .inner
+            .panes
+            .borrow()
+            .get(self.inner.active.get())
+            .filter(|p| {
+                entry_at(&p.store, p.selection.selection().minimum())
+                    .is_some_and(|e| &e.location == target)
+            })
+            .map(|p| p.location.clone());
         let chain = chain(target);
         let mut left = std::mem::take(&mut *self.inner.panes.borrow_mut());
         let mut next: Vec<Rc<Pane>> = Vec::with_capacity(chain.len());
@@ -209,7 +233,12 @@ impl Columns {
         // Whatever is left over is a pane no longer on the path. Its read may
         // still be running; the event simply finds no pane and is dropped.
         rebuild_track(&self.inner, &next);
-        self.inner.active.set(next.len().saturating_sub(1));
+        self.inner.active.set(
+            focused
+                .as_ref()
+                .and_then(|location| next.iter().position(|p| &p.location == location))
+                .unwrap_or(next.len().saturating_sub(1)),
+        );
         self.inner.panes.replace(next);
         self.reveal_active();
         // A new chain means a new row under the keyboard even when its position
@@ -441,19 +470,23 @@ impl Columns {
         let Some(pane) = panes.get(self.inner.active.get()) else {
             return Vec::new();
         };
-        let at = usize::try_from(pane.selection.selected()).unwrap_or(usize::MAX);
-        // Read from the store rather than from the cached listing: the store is
-        // what is painted, and while the search box narrows a folder the two
-        // disagree about which row number means what.
-        pane.store
-            .item(u32::try_from(at).unwrap_or(u32::MAX))
-            .and_then(|object| object.downcast::<Row>().ok())
-            .map(|row| vec![row.entry()])
-            .unwrap_or_default()
+        (0..pane.store.n_items())
+            .filter(|i| pane.selection.is_selected(*i))
+            .filter_map(|i| pane.store.item(i).and_then(|o| o.downcast::<Row>().ok()))
+            .map(|row| row.entry())
+            .collect()
     }
 
     /// The folders currently shown, outermost first.
     #[must_use]
+    pub fn active_location(&self) -> Option<Location> {
+        self.inner
+            .panes
+            .borrow()
+            .get(self.inner.active.get())
+            .map(|p| p.location.clone())
+    }
+
     pub fn pane_locations(&self) -> Vec<Location> {
         self.inner
             .panes
@@ -539,7 +572,7 @@ fn pane_press(
     inner: Rc<Inner>,
     location: Location,
     store: &gio::ListStore,
-    selection: &gtk::SingleSelection,
+    selection: &gtk::MultiSelection,
 ) -> ContextHandler {
     let on_press = inner.contexts.handler();
     let store = store.clone();
@@ -555,7 +588,9 @@ fn pane_press(
                 // A recycled cell can report a position past the end of a
                 // listing that was replaced since it was bound.
                 if entry_at(&store, position).is_some() {
-                    selection.set_selected(position);
+                    if !selection.is_selected(position) {
+                        selection.select_item(position, true);
+                    }
                 }
                 popup::Target::Row {
                     position,
@@ -572,18 +607,17 @@ fn pane_press(
 /// leaf is left to the window, which is reading that folder already.
 fn build(inner: &Rc<Inner>, location: &Location, read: bool) -> Rc<Pane> {
     let store = gio::ListStore::new::<Row>();
-    let selection = gtk::SingleSelection::new(Some(store.clone()));
-    selection.set_can_unselect(false);
-    selection.set_autoselect(true);
+    let selection = gtk::MultiSelection::new(Some(store.clone()));
     let on_press = pane_press(Rc::clone(inner), location.clone(), &store, &selection);
     let list = gtk::ListView::new(
         Some(selection.clone()),
-        Some(grid_factory(
+        Some(column_factory(
             Rc::clone(&inner.icon_size),
             inner.thumbs.clone(),
             &on_press,
         )),
     );
+    list.set_enable_rubberband(true);
     list.set_show_separators(false);
     list.set_single_click_activate(false);
     list.add_controller(popup::background(&on_press, false));
@@ -602,10 +636,58 @@ fn build(inner: &Rc<Inner>, location: &Location, read: bool) -> Rc<Pane> {
         list,
         store,
         selection,
+        pointer_down: Cell::new(false),
+        pointer_origin: Cell::new((0.0, 0.0)),
+        pointer_moved: Cell::new(false),
         entries: RefCell::new(Vec::new()),
         waiting: RefCell::new(Some(ReadId::new())),
     });
     wire(&pane, inner);
+    let events = gtk::EventControllerLegacy::new();
+    events.set_propagation_phase(gtk::PropagationPhase::Capture);
+    let weak_pane = Rc::downgrade(&pane);
+    let weak_inner = Rc::downgrade(inner);
+    events.connect_event(move |_, event| {
+        let (Some(pane), Some(inner)) = (weak_pane.upgrade(), weak_inner.upgrade()) else {
+            return Propagation::Proceed;
+        };
+        match event.event_type() {
+            gtk::gdk::EventType::ButtonPress => {
+                pane.pointer_down.set(true);
+                pane.pointer_moved.set(false);
+                pane.pointer_origin
+                    .set(event.position().unwrap_or_default());
+            }
+            gtk::gdk::EventType::MotionNotify if pane.pointer_down.get() => {
+                let (x, y) = event.position().unwrap_or_default();
+                let (sx, sy) = pane.pointer_origin.get();
+                if (x - sx).abs() + (y - sy).abs() > 8.0 {
+                    pane.pointer_moved.set(true);
+                }
+            }
+            gtk::gdk::EventType::ButtonRelease => {
+                pane.pointer_down.set(false);
+                let primary = event
+                    .downcast_ref::<gtk::gdk::ButtonEvent>()
+                    .is_some_and(|e| e.button() == 1);
+                if primary
+                    && !pane.pointer_moved.get()
+                    && !event.modifier_state().intersects(
+                        gtk::gdk::ModifierType::CONTROL_MASK | gtk::gdk::ModifierType::SHIFT_MASK,
+                    )
+                {
+                    let selected = pane.selection.selection();
+                    if selected.size() == 1 && navigable_at(&pane.store, selected.minimum()) {
+                        let store = pane.store.clone();
+                        glib::idle_add_local_once(move || open(&inner, &store, selected.minimum()));
+                    }
+                }
+            }
+            _ => {}
+        }
+        Propagation::Proceed
+    });
+    pane.list.add_controller(events);
     if read {
         start(inner, &pane);
     }
@@ -672,8 +754,47 @@ fn rebuild_track(inner: &Rc<Inner>, next: &[Rc<Pane>]) {
     while let Some(child) = inner.track.first_child() {
         inner.track.remove(&child);
     }
-    for pane in next {
+    for (index, pane) in next.iter().enumerate() {
+        pane.scroll.set_width_request(
+            inner
+                .widths
+                .borrow()
+                .get(index)
+                .copied()
+                .unwrap_or(PANE_WIDTH as u32)
+                .clamp(160, 600) as i32,
+        );
         inner.track.append(&pane.scroll);
+        let handle = gtk::Separator::new(gtk::Orientation::Vertical);
+        handle.set_width_request(6);
+        handle.set_cursor_from_name(Some("col-resize"));
+        let drag = gtk::GestureDrag::new();
+        let width = Rc::new(Cell::new(PANE_WIDTH));
+        let scroll = pane.scroll.clone();
+        let initial = width.clone();
+        drag.connect_drag_begin(move |_, _, _| initial.set(scroll.width()));
+        let scroll = pane.scroll.clone();
+        drag.connect_drag_update(move |_, x, _| {
+            scroll.set_width_request((width.get() + x as i32).clamp(160, 600))
+        });
+        let tracked = inner.clone();
+        let scroll = pane.scroll.clone();
+        drag.connect_drag_end(move |_, _, _| {
+            let widths = {
+                let mut widths = tracked.widths.borrow_mut();
+                if widths.len() <= index {
+                    widths.resize(index + 1, PANE_WIDTH as u32);
+                }
+                widths[index] = scroll.width_request() as u32;
+                widths.clone()
+            };
+            let callback = tracked.on_resize.borrow().clone();
+            if let Some(callback) = callback {
+                callback(widths);
+            }
+        });
+        handle.add_controller(drag);
+        inner.track.append(&handle);
     }
 }
 
@@ -734,12 +855,40 @@ fn wire(pane: &Pane, inner: &Rc<Inner>) {
     });
     pane.list.add_controller(focus);
 
-    // The row the keyboard is on, including the first one a freshly painted pane
-    // autoselects. `notify::selected` rather than a selection-model signal:
-    // `GtkSingleSelection` has no `selection-changed`.
+    // Track the pane whose selection changed before notifying window actions.
     let tracked = Rc::clone(inner);
     pane.selection
-        .connect_selected_notify(move |_selection| fire_selection(&tracked));
+        .connect_selection_changed(move |selection, _, _| {
+            if !selection.selection().is_empty() {
+                let at = tracked
+                    .panes
+                    .borrow()
+                    .iter()
+                    .position(|p| p.selection == *selection);
+                if let Some(at) = at {
+                    tracked.active.set(at);
+                }
+            }
+            fire_selection(&tracked);
+            let pane = tracked
+                .panes
+                .borrow()
+                .iter()
+                .find(|p| p.selection == *selection)
+                .cloned();
+            if let Some(pane) = pane {
+                if selection.selection().size() == 1
+                    && !pane.pointer_down.get()
+                    && pane.list.has_focus()
+                    && navigable_at(&pane.store, selection.selection().minimum())
+                {
+                    let tracked = tracked.clone();
+                    let store = pane.store.clone();
+                    let selected = selection.selection().minimum();
+                    glib::idle_add_local_once(move || open(&tracked, &store, selected));
+                }
+            }
+        });
 }
 
 /// The keyboard. Captured before the focused list sees it, because the arrows
@@ -754,7 +903,7 @@ fn install_keys(inner: &Rc<Inner>) {
         let Some(pane) = active else {
             return Propagation::Proceed;
         };
-        let selected = pane.selection.selected();
+        let selected = pane.selection.selection().minimum();
         match key {
             // Right means "go deeper" only for a folder; on a file it has to
             // stay free, or a file could never be passed over with the keyboard.
@@ -775,7 +924,7 @@ fn install_keys(inner: &Rc<Inner>) {
                     return Propagation::Proceed;
                 }
                 if selected == gtk::INVALID_LIST_POSITION {
-                    pane.selection.set_selected(0);
+                    pane.selection.select_item(0, true);
                 }
                 // The list moves within itself; this only made sure it has the
                 // focus and has a row to move from.
@@ -870,6 +1019,34 @@ mod tests {
             .get(index)
             .cloned()
             .expect("the pane")
+    }
+
+    #[test]
+    fn multiple_selected_entries_remain_targets_after_a_context_click() {
+        tk::ui(|| {
+            let columns = columns();
+            columns.show_chain(&location("/"));
+            let pane = pane_at(0, &columns);
+            paint(&pane, &[file("a"), file("b")]);
+            pane.selection.select_item(0, false);
+            pane.selection.select_item(1, false);
+            let press = pane_press(
+                columns.inner.clone(),
+                location("/"),
+                &pane.store,
+                &pane.selection,
+            );
+            press(
+                pane.list.upcast_ref(),
+                popup::Target::Row {
+                    position: 0,
+                    in_current: true,
+                },
+                0.0,
+                0.0,
+            );
+            assert_eq!(columns.selected().len(), 2);
+        });
     }
 
     #[test]

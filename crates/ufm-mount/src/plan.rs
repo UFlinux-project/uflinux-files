@@ -353,16 +353,15 @@ impl Plan {
     }
 
     /// The command as it should actually be run. For a root plan this is
-    /// `pkexec` followed by the polkit action id and the helper's arguments:
-    /// naming the action rather than a path is what makes the polkit policy the
-    /// thing that decides which binary may run, and the policy annotates
-    /// `org.freedesktop.policykit.exec.path` with the helper's location.
+    /// `pkexec` followed by the executable and its arguments. Polkit selects
+    /// the action from the installed `org.freedesktop.policykit.exec.path`
+    /// annotation matching that executable.
     #[must_use]
-    pub fn run(&self, pkexec: &Path, action: &str) -> Command {
+    pub fn run(&self, pkexec: &Path) -> Command {
         match self.privilege {
             Privilege::User => self.command.clone(),
             Privilege::Root => {
-                let mut out = Command::new(pkexec).arg(action);
+                let mut out = Command::new(pkexec);
                 for arg in self.command.argv() {
                     out = out.arg(arg);
                 }
@@ -543,11 +542,10 @@ mod tests {
             "/run/user/1000/ufm/srv-share",
         );
         assert_eq!(plan.privilege(), Privilege::Root);
-        let run = plan.run(Path::new(PKEXEC), ACTION);
+        let run = plan.run(Path::new(PKEXEC));
         assert_eq!(run.program(), Path::new(PKEXEC));
-        assert_eq!(run.arguments()[0], ACTION, "pkexec takes the action first");
-        assert_eq!(run.arguments()[1], HELPER);
-        assert_eq!(run.arguments()[2], "mount");
+        assert_eq!(run.arguments()[0], HELPER);
+        assert_eq!(run.arguments()[1], "mount");
         assert_eq!(
             run.secret_use(),
             SecretUse::File,
@@ -561,7 +559,7 @@ mod tests {
         let inner = Command::new("/usr/bin/sshfs").arg("host:/x").arg("/mnt");
         let plan = Plan::user(inner.clone(), "/mnt");
         assert_eq!(plan.privilege(), Privilege::User);
-        assert_eq!(plan.run(Path::new(PKEXEC), ACTION), inner);
+        assert_eq!(plan.run(Path::new(PKEXEC)), inner);
         assert_eq!(plan.mountpoint(), Path::new("/mnt"));
     }
 

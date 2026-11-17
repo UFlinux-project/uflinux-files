@@ -167,6 +167,42 @@ on Alpine) and are built by the package recipe:
 
     cargo build --release --workspace
 
+Alpine packages on `x86_64` and `aarch64` build all four executables with PGO and
+BOLT through `cargo-pgo` 0.3.0. Each architecture needs a native worker: the
+build trains the instrumented GUI under a private D-Bus session and headless
+labwc, then checks the final rewritten executable before packaging it. The
+provider and search daemon train through private D-Bus sessions. The mount
+helper trains validation and safe no-op unmounts as an ordinary user, without
+performing real mounts.
+Other architectures also keep the ordinary release build.
+
+Build and install `aports/llvm22-bolt` in the SDK repository first. It provides
+LLVM BOLT and its instrumentation runtime, built against Alpine 3.24's LLVM
+22.1.3. The main recipe installs its remaining build dependencies and installs
+pinned `cargo-pgo` during `prepare()`. `llvm-profdata` must match rustc's LLVM
+version; update the LLVM build-tool recipes together when upgrading the SDK.
+
+To run the same pipeline manually on native x86_64 or aarch64 Linux, install the
+GTK development dependencies, `cargo-auditable`, `labwc`, D-Bus (`gdbus` and
+`dbus-run-session`), `timeout`, Python 3, and LLVM BOLT with its runtime and `merge-fdata`:
+
+```sh
+cargo install cargo-pgo --version 0.3.0 --locked
+rustup component add llvm-tools-preview # or the matching distro llvm-profdata
+cargo fetch --locked
+sh scripts/files-pgo-build.sh
+```
+
+The four optimized executables are written to `target/release/` (or under
+`CARGO_TARGET_DIR`) after every final workload passes. Run training as a non-root user.
+Intermediate binaries and fresh profiles live in `target/pgo-bolt/<target>/<executable>/`.
+The pipeline follows [cargo-pgo's combined PGO+BOLT workflow](https://github.com/Kobzol/cargo-pgo#bolt--pgo),
+keeps symbols until BOLT finishes, and preserves cargo-auditable metadata.
+Training covers small and large directory listings, all three view modes,
+hidden files, navigation, thumbnails, archive browsing, Computer and Trash.
+Missing training tools, empty profiles and failed final executable checks fail the
+build. Plain `cargo build --release` remains available for development.
+
 At runtime, everything optional is named in the user's language when it is
 missing rather than failing quietly: `7z` for 7z archives, `cifs-utils` and
 `nfs-utils` for those two protocols, `sshfs-fuse`, `rclone` or `davfs2` for the
@@ -176,3 +212,22 @@ rest.
 
 GPL-3.0-only. See `LICENSE`, and `docs/architecture.md` for the reasoning behind
 the structure above.
+
+## Navigation and removable drives
+
+Click an ancestor breadcrumb to navigate, or click the blank address area / press
+Ctrl+L to enter a path. Escape restores breadcrumbs. The search button and
+Ctrl+Shift+F open indexed search in the address area; Ctrl+F filters the current
+folder. Search options are available from its menu button.
+
+Miller columns use compact rows, support multiple selection, and have draggable
+column dividers. Drag on empty space in any file view to select several items.
+Truncated names show their complete text in a hover tooltip.
+
+Physical volumes appear below ordinary sidebar places, with capacity and usage
+when available. Supported unencrypted USB volumes mount automatically while Files
+is running, including volumes present at startup, without replacing the current
+folder. Failed or cancelled attempts can be retried by clicking the volume.
+Mount support requires the `uflinux-files-mount-helper` package, installed with
+Files. Operation results use desktop notifications; progress and Cancel stay in
+the window.

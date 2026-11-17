@@ -13,7 +13,7 @@ pub fn discover() -> Vec<Card> {
             "--json",
             "--bytes",
             "--output",
-            "PATH,TYPE,FSTYPE,LABEL,UUID,RM,RO,MOUNTPOINTS,SIZE,PARTTYPE",
+            "PATH,TYPE,FSTYPE,LABEL,UUID,RM,RO,MOUNTPOINTS,SIZE,PARTTYPE,TRAN,HOTPLUG",
         ])
         .output()
     else {
@@ -32,7 +32,71 @@ pub fn discover() -> Vec<Card> {
             visit(root, &fs, &mut cards, false);
         }
     }
+    for point in ufm_mount::monitor::Observer::new().points() {
+        if !matches!(
+            point.fstype.as_str(),
+            "cifs" | "nfs" | "nfs4" | "fuse.sshfs" | "fuse.rclone" | "davfs" | "fuse.davfs"
+        ) || point.path.starts_with(ufm_core::paths::mount_root())
+        {
+            continue;
+        }
+        // Bound remote stat calls: an unreachable NFS server must not stall hotplug discovery.
+        let hints = remote_hints(&point.path);
+        cards.push(Card {
+            id: CardId::Device {
+                path: point.path.clone(),
+                mountpoint: Some(point.path.clone()),
+            },
+            label: point.source.clone(),
+            detail: point.path.display().to_string(),
+            icon: "network-server".into(),
+            fraction: hints.used_fraction(),
+            usage: match (hints.total, hints.free) {
+                (Some(total), Some(free)) => format!(
+                    "{} used of {}",
+                    ufm_core::entry::human_size(total.saturating_sub(free)),
+                    ufm_core::entry::human_size(total)
+                ),
+                _ => "Usage unavailable".into(),
+            },
+            state: None,
+            can_open: true,
+            can_disconnect: false,
+        });
+    }
+    let mut seen = std::collections::HashSet::new();
+    cards.retain(|card| match &card.id {
+        CardId::Device { path, .. } => seen.insert(path.clone()),
+        _ => true,
+    });
     cards
+}
+
+fn remote_hints(path: &std::path::Path) -> ufm_vfs::FsHints {
+    let output = Command::new("timeout")
+        .args(["1", "stat", "-f", "-c", "%S %b %a"])
+        .arg(path)
+        .output();
+    let Ok(output) = output else {
+        return ufm_vfs::FsHints::default();
+    };
+    if !output.status.success() {
+        return ufm_vfs::FsHints::default();
+    }
+    let values: Vec<u64> = String::from_utf8_lossy(&output.stdout)
+        .split_whitespace()
+        .filter_map(|n| n.parse().ok())
+        .collect();
+    if let [block, total, free] = values.as_slice() {
+        ufm_vfs::FsHints {
+            total: block.checked_mul(*total),
+            free: block.checked_mul(*free),
+            remote: true,
+            ..Default::default()
+        }
+    } else {
+        ufm_vfs::FsHints::default()
+    }
 }
 
 fn field<'a>(node: &'a Value, key: &str) -> Option<&'a str> {
@@ -43,7 +107,9 @@ fn field<'a>(node: &'a Value, key: &str) -> Option<&'a str> {
 
 fn visit(node: &Value, fs: &FsInfo, cards: &mut Vec<Card>, parent_removable: bool) {
     let kind = field(node, "type").unwrap_or("");
-    let removable = parent_removable || node.get("rm").and_then(Value::as_bool).unwrap_or(false);
+    let removable = parent_removable
+        || field(node, "tran") == Some("usb")
+        || node.get("rm").and_then(Value::as_bool).unwrap_or(false);
     let fstype = field(node, "fstype").unwrap_or("");
     let path = field(node, "path").unwrap_or("");
     let mountpoint = node
@@ -56,14 +122,13 @@ fn visit(node: &Value, fs: &FsInfo, cards: &mut Vec<Card>, parent_removable: boo
                 .find(|p| !p.is_empty())
         })
         .map(PathBuf::from);
-    let system = mountpoint
+    let _system = mountpoint
         .as_deref()
         .is_some_and(|p| p == std::path::Path::new("/"));
     let efi = field(node, "parttype")
         .is_some_and(|p| p.eq_ignore_ascii_case("c12a7328-f81f-11d2-ba4b-00a0c93ec93b"));
     if matches!(kind, "part" | "lvm" | "disk")
         && !fstype.is_empty()
-        && !system
         && !efi
         && !path.is_empty()
         && fstype != "swap"
@@ -91,14 +156,17 @@ fn visit(node: &Value, fs: &FsInfo, cards: &mut Vec<Card>, parent_removable: boo
         );
         let usage = match (hints.free, hints.total) {
             (Some(free), Some(total)) => format!(
-                "{} free of {}",
-                ufm_core::entry::human_size(free),
+                "{} used of {}",
+                ufm_core::entry::human_size(total.saturating_sub(free)),
                 ufm_core::entry::human_size(total)
             ),
             _ if mountpoint.is_some() => "Mounted".to_string(),
             _ if locked => "Locked".to_string(),
             _ if !supported => "Unsupported filesystem".to_string(),
-            _ => "Not mounted".to_string(),
+            _ => format!(
+                "{} · Not mounted",
+                ufm_core::entry::human_size(node.get("size").and_then(Value::as_u64).unwrap_or(0))
+            ),
         };
         cards.push(Card {
             id: CardId::Device {
@@ -108,9 +176,9 @@ fn visit(node: &Value, fs: &FsInfo, cards: &mut Vec<Card>, parent_removable: boo
             label: label.to_string(),
             detail: path.to_string(),
             icon: if removable {
-                "drive-removable-media-symbolic"
+                "drive-removable-media"
             } else {
-                "drive-harddisk-symbolic"
+                "drive-harddisk"
             }
             .to_string(),
             fraction: hints.used_fraction(),
@@ -140,7 +208,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn inventory_skips_system_and_efi_but_keeps_unmounted_and_locked_volumes() {
+    fn usb_transport_marks_children_removable_even_when_rm_is_false() {
+        let node = serde_json::json!({"path":"/dev/sdb", "type":"disk", "tran":"usb", "rm":false,
+            "children":[{"path":"/dev/sdb1", "type":"part", "fstype":"exfat", "size":1024, "mountpoints":[null]}]});
+        let mut cards = Vec::new();
+        visit(&node, &FsInfo::new(), &mut cards, false);
+        assert_eq!(cards.len(), 1);
+        assert_eq!(cards[0].icon, "drive-removable-media");
+        assert!(cards[0].usage.contains("1.0 KiB"));
+    }
+
+    #[test]
+    fn inventory_keeps_system_unmounted_and_locked_volumes_but_skips_efi() {
         let nodes: Value = serde_json::json!({"blockdevices": [
             {"path":"/dev/vda1","type":"part","fstype":"ext4","label":"System","mountpoints":["/"]},
             {"path":"/dev/vda2","type":"part","fstype":"vfat","label":"EFI","parttype":"c12a7328-f81f-11d2-ba4b-00a0c93ec93b","mountpoints":[null]},
@@ -157,9 +236,9 @@ mod tests {
                 .iter()
                 .map(|card| card.label.as_str())
                 .collect::<Vec<_>>(),
-            ["Photos", "Private"]
+            ["System", "Photos", "Private"]
         );
-        assert_eq!(cards[0].state, Some("Not mounted"));
-        assert_eq!(cards[1].state, Some("Locked"));
+        assert_eq!(cards[1].state, Some("Not mounted"));
+        assert_eq!(cards[2].state, Some("Locked"));
     }
 }

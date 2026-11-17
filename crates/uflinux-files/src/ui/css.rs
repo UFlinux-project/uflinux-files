@@ -14,6 +14,10 @@
 /// The rules. Kept short on purpose: every selector here is a class this
 /// crate's own code sets, so nothing depends on a widget's position in a tree.
 pub const CSS: &str = r"
+.ufm-grid > child {
+    margin: 4px;
+    border-radius: 8px;
+}
 .ufm-cell {
     padding: 6px;
     border-radius: 6px;
@@ -31,9 +35,7 @@ button.ufm-shortcut {
 button.ufm-shortcut:hover {
     background-color: alpha(currentColor, 0.08);
 }
-button.ufm-shortcut image {
-    color: @accent_color;
-}
+
 box.ufm-drive {
     min-width: 250px;
     min-height: 76px;
@@ -42,9 +44,7 @@ box.ufm-drive {
     background-color: alpha(currentColor, 0.035);
     border: 1px solid alpha(currentColor, 0.09);
 }
-box.ufm-drive image {
-    color: @accent_color;
-}
+
 .ufm-cell:hover {
     background-color: alpha(currentColor, 0.07);
 }

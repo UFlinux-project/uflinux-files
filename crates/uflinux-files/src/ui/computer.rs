@@ -81,25 +81,15 @@ where
     S: FnMut(&str) -> MountState,
     H: FnMut(&Path) -> FsHints,
 {
-    let mut cards = vec![local(
-        paths::home(),
-        "Home",
-        "user-home-symbolic",
-        &mut hints,
-    )];
+    let mut cards = vec![local(paths::home(), "Home", "user-home", &mut hints)];
     let desktop = paths::desktop_dir();
     if desktop.is_dir() {
-        cards.push(local(
-            desktop,
-            "Desktop",
-            "user-desktop-symbolic",
-            &mut hints,
-        ));
+        cards.push(local(desktop, "Desktop", "user-desktop", &mut hints));
     }
     cards.push(local(
         PathBuf::from("/"),
         "System",
-        "drive-harddisk-symbolic",
+        "drive-harddisk",
         &mut hints,
     ));
     for record in records {
@@ -154,9 +144,9 @@ fn share_card(share: &Share) -> Card {
         label: String::new(),
         detail: String::new(),
         icon: match share.protocol {
-            Protocol::Smb => "network-workgroup-symbolic",
-            Protocol::Nfs | Protocol::Sftp | Protocol::Ftp => "network-server-symbolic",
-            Protocol::WebDav => "folder-remote-symbolic",
+            Protocol::Smb => "network-workgroup",
+            Protocol::Nfs | Protocol::Sftp | Protocol::Ftp => "network-server",
+            Protocol::WebDav => "folder-remote",
         }
         .to_string(),
         fraction: None,
@@ -308,24 +298,16 @@ impl ComputerView {
         shortcuts.set_column_spacing(8);
         shortcuts.set_row_spacing(8);
         for (name, icon, location) in [
-            (
-                "Home",
-                "user-home-symbolic",
-                Some(Location::file(paths::home())),
-            ),
+            ("Home", "user-home", Some(Location::file(paths::home()))),
             (
                 "Recent",
-                "document-open-recent-symbolic",
+                "document-open-recent",
                 Location::parse("recent://").ok(),
             ),
-            (
-                "Starred",
-                "starred-symbolic",
-                Location::parse("starred://").ok(),
-            ),
+            ("Starred", "starred", Location::parse("starred://").ok()),
             (
                 "Documents",
-                "folder-documents-symbolic",
+                "folder-documents",
                 Some(Location::file(paths::user_dir(
                     "XDG_DOCUMENTS_DIR",
                     "Documents",
@@ -333,7 +315,7 @@ impl ComputerView {
             ),
             (
                 "Downloads",
-                "folder-download-symbolic",
+                "folder-download",
                 Some(Location::file(paths::user_dir(
                     "XDG_DOWNLOAD_DIR",
                     "Downloads",
@@ -341,17 +323,17 @@ impl ComputerView {
             ),
             (
                 "Music",
-                "folder-music-symbolic",
+                "folder-music",
                 Some(Location::file(paths::user_dir("XDG_MUSIC_DIR", "Music"))),
             ),
             (
                 "Videos",
-                "folder-videos-symbolic",
+                "folder-videos",
                 Some(Location::file(paths::user_dir("XDG_VIDEOS_DIR", "Videos"))),
             ),
             (
                 "Pictures",
-                "folder-pictures-symbolic",
+                "folder-pictures",
                 Some(Location::file(paths::user_dir(
                     "XDG_PICTURES_DIR",
                     "Pictures",
@@ -385,7 +367,7 @@ impl ComputerView {
         let network = gtk::Button::new();
         network.add_css_class("ufm-shortcut");
         let network_body = gtk::Box::new(gtk::Orientation::Vertical, 6);
-        let network_icon = gtk::Image::from_icon_name("network-workgroup-symbolic");
+        let network_icon = gtk::Image::from_icon_name("network-workgroup");
         network_icon.set_pixel_size(48);
         network_body.append(&network_icon);
         network_body.append(&gtk::Label::new(Some("Network")));
@@ -495,7 +477,7 @@ impl ComputerView {
         let mut locals = 0;
         let mut removable = 0;
         for card in devices.iter().filter(|_| !self.network_only) {
-            if card.icon == "drive-removable-media-symbolic" {
+            if card.icon == "drive-removable-media" {
                 self.removable_flow.append(&build(card, &self.hooks));
                 removable += 1;
             } else {
@@ -737,7 +719,7 @@ mod tests {
         assert_eq!(labels(&without), ["Home", "System"]);
         // Between Home and System, which is where the sidebar keeps it too.
         assert_eq!(labels(&with), ["Home", "Desktop", "System"]);
-        assert_eq!(with[1].icon, "user-desktop-symbolic");
+        assert_eq!(with[1].icon, "user-desktop");
     }
 
     #[test]
@@ -763,7 +745,7 @@ mod tests {
         assert_eq!(card.state, Some("Connected"));
         assert!(card.can_open);
         assert!(card.can_disconnect);
-        assert_eq!(card.icon, "network-workgroup-symbolic");
+        assert_eq!(card.icon, "network-workgroup");
         assert_eq!(card.usage, "256 KiB free of 1.0 MiB");
         assert_eq!(card.fraction, Some(0.75));
     }
@@ -784,7 +766,7 @@ mod tests {
         // With nothing to show, the mount point stands in for a capacity line.
         assert_eq!(card.usage, card.detail);
         assert!(card.usage.starts_with("/m/host-export-"), "{}", card.usage);
-        assert_eq!(card.icon, "network-server-symbolic");
+        assert_eq!(card.icon, "network-server");
     }
 
     #[test]
@@ -796,8 +778,8 @@ mod tests {
             record("webdav://host/dav", "/m"),
         ];
         let cards = cards(&records, |_| MountState::Absent, empty);
-        assert_eq!(cards[2].icon, "network-server-symbolic");
-        assert_eq!(cards[3].icon, "folder-remote-symbolic");
+        assert_eq!(cards[2].icon, "network-server");
+        assert_eq!(cards[3].icon, "folder-remote");
         // Not connected is a different answer from disconnected: nothing has to be
         // detached, and walking in would fail the same way either way.
         assert_eq!(cards[2].state, Some("Not connected"));
@@ -832,7 +814,7 @@ mod tests {
                 id: CardId::Local(PathBuf::from("/")),
                 label: "System".into(),
                 detail: "/".into(),
-                icon: "drive-harddisk-symbolic".into(),
+                icon: "drive-harddisk".into(),
                 fraction: Some(0.5),
                 usage: "1 GiB free of 2 GiB".into(),
                 state: None,
@@ -866,7 +848,7 @@ mod tests {
                 id: CardId::Mount("nas-stale".into()),
                 label: "System".into(),
                 detail: "/".into(),
-                icon: "drive-harddisk-symbolic".into(),
+                icon: "drive-harddisk".into(),
                 fraction: None,
                 usage: "/".into(),
                 state: None,
@@ -877,7 +859,7 @@ mod tests {
                 id: CardId::Mount("nas-filmy".into()),
                 label: "filmy".into(),
                 detail: "/m/nas-filmy".into(),
-                icon: "network-workgroup-symbolic".into(),
+                icon: "network-workgroup".into(),
                 fraction: None,
                 usage: "/m/nas-filmy".into(),
                 state: Some("Connected"),
@@ -915,7 +897,7 @@ mod tests {
                 id: CardId::Mount("nas-filmy".into()),
                 label: "filmy".into(),
                 detail: "/m/nas-filmy".into(),
-                icon: "network-workgroup-symbolic".into(),
+                icon: "network-workgroup".into(),
                 fraction: None,
                 usage: "/m/nas-filmy".into(),
                 state: Some("Connected"),

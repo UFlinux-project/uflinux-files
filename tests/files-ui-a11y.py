@@ -366,6 +366,7 @@ def select_at(trail):
         iface = Atspi.Accessible.get_selection_iface(parent)
         if iface is None:
             continue
+        Atspi.Selection.clear_selection(iface)
         if not Atspi.Selection.select_child(iface, index):
             print("selection refused at index %d" % index)
             return 5
@@ -445,6 +446,13 @@ def menu_press(wanted):
 def main(argv):
     Atspi.init()
     command = argv[0] if argv else "dump"
+    if command == "geometry":
+        frame = frame_named(argv[1])
+        if frame is None:
+            return 3
+        rect = Atspi.Component.get_extents(frame, Atspi.CoordType.SCREEN)
+        print(rect.width, rect.height)
+        return 0
     if command == "dump":
         return dump()
     if command == "dump-frame":

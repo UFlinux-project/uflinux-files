@@ -54,6 +54,7 @@ pub enum Event {
         success: bool,
         target: PathBuf,
         mounted: bool,
+        open_after: bool,
     },
     /// A chunk of a listing that is still being read, in read order.
     Batch {

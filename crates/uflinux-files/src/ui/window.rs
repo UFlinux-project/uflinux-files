@@ -69,6 +69,9 @@ use crate::runner::{Layout, Report, Runner};
 // also how a change to a file two windows share reaches both of them: see
 // [`living`].
 thread_local! {
+    static LAST_NOTICE: RefCell<Option<(String, std::time::Instant)>> = const { RefCell::new(None) };
+    static DEVICES: RefCell<Vec<Card>> = const { RefCell::new(Vec::new()) };
+    static ATTEMPTED: RefCell<std::collections::HashSet<PathBuf>> = RefCell::new(std::collections::HashSet::new());
     static OPEN: RefCell<Vec<Window>> = const { RefCell::new(Vec::new()) };
 }
 
@@ -426,6 +429,12 @@ pub fn open(app: &gtk::Application, urls: &[String]) {
     };
     *ctx.handle.borrow_mut() = Some(queue.handle());
     ctx.columns.set_handle(queue.handle());
+    ctx.columns
+        .set_widths(shared.prefs.borrow().column_widths_px.clone());
+    ctx.columns.on_resize({
+        let shared = shared.clone();
+        move |widths| edit_prefs(&shared, |prefs| prefs.column_widths_px = widths)
+    });
     // Previews travel on the same pipe as listings. A second one would be a
     // second fd source waking the main loop to do the same work.
     thumbs.set_handle(queue.handle());
@@ -443,13 +452,16 @@ pub fn open(app: &gtk::Application, urls: &[String]) {
     wire_actions(app, &window, &ctx);
     wire_jobs(&ctx);
     wire_close(&window);
-    glib::timeout_add_local(Duration::from_secs(10), {
+    glib::timeout_add_local(Duration::from_secs(2), {
         let ctx = ctx.clone();
         move || {
             if ctx.window.upgrade().is_none() {
                 return glib::ControlFlow::Break;
             }
-            if ctx.modes.visible_child_name().as_deref() == Some("computer") {
+            if living()
+                .first()
+                .is_some_and(|first| first.window == ctx.window)
+            {
                 show_cards(&ctx);
             }
             glib::ControlFlow::Continue
@@ -497,6 +509,8 @@ fn mode_stack(
     modes.add_named(columns.widget(), Some("columns"));
     modes.add_named(computer.widget(), Some("computer"));
     modes.add_named(network.widget(), Some("network"));
+    modes.set_hhomogeneous(false);
+    modes.set_vhomogeneous(false);
     modes.set_hexpand(true);
     modes.set_vexpand(true);
     if mode == ViewMode::Columns {
@@ -1544,7 +1558,64 @@ fn apply(ctx: &Ctx, mut event: Event) {
         Event::Preview { token, ref text } => preview::arrived(token, text.as_deref()),
         Event::Devices { cards } => {
             ctx.devices_loading.set(false);
-            ctx.computer.set_devices(cards);
+            let present: std::collections::HashSet<_> = cards
+                .iter()
+                .filter_map(|c| {
+                    if let CardId::Device { path, .. } = &c.id {
+                        Some(path.clone())
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            ATTEMPTED.with(|seen| seen.borrow_mut().retain(|p| present.contains(p)));
+            for card in &cards {
+                if let CardId::Device { path, mountpoint } = &card.id {
+                    let fresh = ATTEMPTED.with(|seen| seen.borrow_mut().insert(path.clone()));
+                    if fresh
+                        && mountpoint.is_none()
+                        && card.icon == "drive-removable-media"
+                        && card.state == Some("Not mounted")
+                    {
+                        device_action(ctx, path.clone(), None);
+                    }
+                }
+            }
+            let lost: Vec<_> = DEVICES.with(|devices| {
+                devices
+                    .borrow()
+                    .iter()
+                    .filter_map(|old| {
+                        if let CardId::Device {
+                            path,
+                            mountpoint: Some(mount),
+                        } = &old.id
+                        {
+                            if !present.contains(path) {
+                                return Some(mount.clone());
+                            }
+                        }
+                        None
+                    })
+                    .collect()
+            });
+            let changed = DEVICES.with(|devices| *devices.borrow() != cards);
+            DEVICES.with(|devices| *devices.borrow_mut() = cards.clone());
+            if !changed {
+                return;
+            }
+            for other in living() {
+                other.computer.set_devices(cards.iter().filter(|c| !matches!(&c.id, CardId::Device { mountpoint: Some(p), .. } if p == Path::new("/"))).cloned().collect());
+                repaint_places(&other);
+                let current = other.shared.state.borrow().current.clone();
+                if current
+                    .as_ref()
+                    .and_then(Location::as_path)
+                    .is_some_and(|p| lost.iter().any(|mount| p.starts_with(mount)))
+                {
+                    navigate(&other, Location::computer(), true);
+                }
+            }
             if ctx.modes.visible_child_name().as_deref() == Some("computer") {
                 if let Some(view) = ctx.view.upgrade() {
                     view.set_status(Some(&format_items(ctx.computer.card_count() as u64)));
@@ -1556,9 +1627,13 @@ fn apply(ctx: &Ctx, mut event: Event) {
             success,
             target,
             mounted,
+            open_after,
         } => {
             show_banner(ctx, &message);
             if success {
+                if mounted && open_after {
+                    navigate(ctx, Location::file(target.clone()), true);
+                }
                 if !mounted
                     && ctx
                         .shared
@@ -2005,6 +2080,22 @@ fn filter(entries: &[Entry], query: &str) -> Vec<Entry> {
 /// are added last because they are their own group and appear below both.
 fn places(shared: &Rc<Shared>) -> Vec<Place> {
     let mut places = Place::with_bookmarks(&shared.bookmark_items());
+    DEVICES.with(|devices| {
+        places.extend(devices.borrow().iter().filter_map(|card| {
+            if let CardId::Device { path, mountpoint } = &card.id {
+                Some(Place::Device {
+                    path: path.clone(),
+                    mountpoint: mountpoint.clone(),
+                    label: card.label.clone(),
+                    icon: card.icon.clone(),
+                    usage: card.usage.clone(),
+                    used_per_mille: card.fraction.map(|f| (f * 1000.0) as u16),
+                })
+            } else {
+                None
+            }
+        }))
+    });
     places.extend(mount_rows(shared));
     places
 }
@@ -2046,12 +2137,7 @@ fn mount_place(runner: &Runner, record: &MountRecord) -> Place {
 fn usages(shared: &Rc<Shared>) -> Vec<Usage> {
     let state = shared.state.borrow();
     let mut usages = Vec::new();
-    let home = shared.hints(&paths::home());
-    usages.push(Usage {
-        place: Place::Home,
-        total: home.total,
-        free: home.free,
-    });
+
     for record in state.runner.table() {
         let hints = shared.hints(&record.mountpoint);
         usages.push(Usage {
@@ -2090,8 +2176,40 @@ fn place_for(bookmarks: &[Bookmark], mounts: &[Place], location: &Location) -> O
 }
 
 fn show_banner(ctx: &Ctx, message: &str) {
-    ctx.banner_label.set_label(message);
-    ctx.banner.set_visible(true);
+    if message == "Nothing starred yet" {
+        if let Some(view) = ctx.view.upgrade() {
+            view.set_status(Some(message));
+        }
+        return;
+    }
+    let duplicate = LAST_NOTICE.with(|last| {
+        let mut last = last.borrow_mut();
+        if last.as_ref().is_some_and(|(text, time)| {
+            text == message && time.elapsed() < Duration::from_millis(500)
+        }) {
+            return true;
+        }
+        *last = Some((message.to_string(), std::time::Instant::now()));
+        false
+    });
+    if duplicate {
+        return;
+    }
+    if let Some(app) = ctx.window.upgrade().and_then(|w| w.application()) {
+        let notification = gio::Notification::new("Files");
+        notification.set_body(Some(message));
+        notification.set_icon(&gio::ThemedIcon::new("org.uflinux.Files"));
+        if let Some(location) = ctx.shared.state.borrow().current.as_ref() {
+            notification.set_default_action_and_target_value(
+                "app.open-location",
+                Some(&location.to_string().to_variant()),
+            );
+        }
+        use std::hash::{Hash, Hasher};
+        let mut hash = std::collections::hash_map::DefaultHasher::new();
+        message.hash(&mut hash);
+        app.send_notification(Some(&format!("notice-{}", hash.finish())), &notification);
+    }
 }
 
 /// Enable or disable the navigation buttons to match the history. GTK disables a
@@ -2178,7 +2296,7 @@ fn header(ctx: &Ctx, menu: &gio::Menu) -> gtk::HeaderBar {
     inspector.set_action_name(Some("win.preview"));
     inspector.set_tooltip_text(Some("Toggle preview pane (Space)"));
     bar.pack_end(&inspector);
-    bar.pack_end(&search);
+
     let search_button = gtk::Button::from_icon_name("system-search-symbolic");
     search_button.set_tooltip_text(Some("Search files"));
     search_button.connect_clicked({
@@ -2188,12 +2306,15 @@ fn header(ctx: &Ctx, menu: &gio::Menu) -> gtk::HeaderBar {
     bar.pack_end(&search_button);
     let title = gtk::Stack::new();
     title.set_hexpand(true);
+    title.set_hhomogeneous(false);
+    title.set_vhomogeneous(false);
     let address = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     address.add_css_class("linked");
     address.set_hexpand(true);
     let location_button = gtk::Button::new();
     location_button.set_hexpand(true);
-    location_button.set_child(Some(&gtk::Image::from_icon_name("document-edit-symbolic")));
+    location_button.set_tooltip_text(Some("Edit location (Ctrl+L)"));
+    location_button.add_css_class("flat");
     let crumb_scroll = gtk::ScrolledWindow::new();
     crumb_scroll.set_policy(gtk::PolicyType::Automatic, gtk::PolicyType::Never);
     crumb_scroll.set_hexpand(true);
@@ -2205,6 +2326,17 @@ fn header(ctx: &Ctx, menu: &gio::Menu) -> gtk::HeaderBar {
     entry.set_hexpand(true);
     title.add_named(&address, Some("address"));
     title.add_named(&entry, Some("entry"));
+    title.add_named(&search, Some("filter"));
+    search.connect_visible_notify({
+        let title = title.clone();
+        move |filter| {
+            title.set_visible_child_name(if filter.is_visible() {
+                "filter"
+            } else {
+                "address"
+            })
+        }
+    });
     title.add_named(ctx.find.widget(), Some("search"));
     let edit = gio::SimpleAction::new("location", None);
     edit.connect_activate({
@@ -2418,7 +2550,18 @@ fn mode_named(name: &str) -> Option<ViewMode> {
 fn wire_handlers(panel: &Rc<Panel>, view: &Rc<View>, columns: &Rc<Columns>, ctx: &Ctx) {
     panel.on_open({
         let ctx = ctx.clone();
-        move |place| navigate(&ctx, place.location(), true)
+        move |place| {
+            if let Place::Device {
+                path,
+                mountpoint: None,
+                ..
+            } = place
+            {
+                start_device_action(&ctx, path.clone(), None, true);
+            } else {
+                navigate(&ctx, place.location(), true);
+            }
+        }
     });
     view.on_activate({
         let ctx = ctx.clone();
@@ -2557,6 +2700,10 @@ fn open_card(ctx: &Ctx, id: CardId) {
 }
 
 fn device_action(ctx: &Ctx, device: PathBuf, mountpoint: Option<PathBuf>) {
+    start_device_action(ctx, device, mountpoint, false);
+}
+
+fn start_device_action(ctx: &Ctx, device: PathBuf, mountpoint: Option<PathBuf>, open_after: bool) {
     let Some(handle) = ctx.handle.borrow().clone() else {
         return;
     };
@@ -2585,13 +2732,42 @@ fn device_action(ctx: &Ctx, device: PathBuf, mountpoint: Option<PathBuf>) {
         }
     }
     thread::spawn(move || {
+        static MOUNT_QUEUE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = MOUNT_QUEUE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        use std::os::unix::fs::OpenOptionsExt;
+        let lock_path = root.join(format!(
+            ".{}.lock",
+            device.file_name().unwrap_or_default().to_string_lossy()
+        ));
+        let lock = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .mode(0o600)
+            .open(lock_path);
+        if let Ok(lock) = &lock {
+            use std::os::fd::AsRawFd;
+            // SAFETY: the descriptor remains open for the duration of this operation.
+            unsafe {
+                libc::flock(lock.as_raw_fd(), libc::LOCK_EX);
+            }
+        }
+        if mounting
+            && ufm_mount::monitor::Observer::new()
+                .points()
+                .iter()
+                .any(|p| Path::new(&p.source) == device)
+        {
+            return;
+        }
         let action = if mounting {
             "device-mount"
         } else {
             "device-unmount"
         };
         let result = OsCommand::new("/usr/bin/pkexec")
-            .arg("org.uflinux.files.mount")
+            .arg(ufm_mount::plan::HELPER)
             .arg(action)
             .arg("--device")
             .arg(&device)
@@ -2620,6 +2796,7 @@ fn device_action(ctx: &Ctx, device: PathBuf, mountpoint: Option<PathBuf>) {
             success,
             target,
             mounted: mounting,
+            open_after,
         });
     });
 }

@@ -106,6 +106,7 @@ pub fn parse(args: &[String]) -> Result<Command, Usage> {
             "--desktop-icons" => desktop = true,
             "--json" => json = true,
             "--new-window" => new_window = true,
+            "--gapplication-service" => {}
             "--idle-after" => {
                 let value = iter
                     .next()

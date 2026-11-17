@@ -148,16 +148,21 @@ done
 APP_LOG=$ROOT/app.log
 # The primary instance, opened on the fixture. Later plain invocations reach this
 # process through its `open` signal and add windows to it; `--new-window` is separate.
+NOTIFICATIONS=$ROOT/notifications.jsonl
+python3 "$HERE/files-notification-capture.py" "$NOTIFICATIONS" >"$ROOT/notifications.log" 2>&1 &
+NOTIFY_PID=$!
+i=0
+while [ ! -e "$NOTIFICATIONS.ready" ] && [ "$i" -lt 50 ]; do sleep 0.1; i=$((i + 1)); done
 "$BIN" "file://$TARGET" >"$APP_LOG" 2>&1 &
 APP=$!
 
-WIN=/org/uflinux/FileManager/window/1
+WIN=/org/uflinux/Files/window/1
 
 # One activation of a window action. The target is a GVariant tuple of targets and a
 # tuple of hints; a parameterless action takes two empty tuples, a string action takes
 # `[<'value'>]`.
 act() {
-    gdbus call --session --dest org.uflinux.FileManager --object-path "$WIN" \
+    gdbus call --session --dest org.uflinux.Files --object-path "$WIN" \
         --method org.gtk.Actions.Activate "$@" >/dev/null 2>&1 || :
 }
 
@@ -167,7 +172,7 @@ act() {
 act_on() {
     path=$1
     shift
-    gdbus call --session --dest org.uflinux.FileManager --object-path "$path" \
+    gdbus call --session --dest org.uflinux.Files --object-path "$path" \
         --method org.gtk.Actions.Activate "$@" >/dev/null 2>&1 || :
 }
 
@@ -261,7 +266,7 @@ if wait_named "Back"; then
 else
     fail "Back is present but insensitive at the start of history"
 fi
-if gdbus call --session --dest org.uflinux.FileManager --object-path "$WIN" \
+if gdbus call --session --dest org.uflinux.Files --object-path "$WIN" \
     --method org.gtk.Actions.Describe up | grep -qF '(true'; then
     ok "Up is sensitive on a real folder"
 else
@@ -273,6 +278,7 @@ has_named "one" "the grid shows the folder's entries"
 has_named "2 items" "the status line counts the entries"
 
 # --- the list view ------------------------------------------------------------------
+INITIAL_GEOMETRY=$(python3 "$A11Y" geometry "$TARGET")
 act mode "[<'list'>]" "[]"
 i=0
 while [ "$i" -lt 50 ] && ! printf '%s\n' "$DUMP" | grep -qF "$(printf 'tree table\t')"; do
@@ -295,6 +301,11 @@ fi
 # --- the Miller columns -------------------------------------------------------------
 # Opening on `.../tree/alpha` and switching to columns renders one pane per path level,
 # so the ancestor chain appears without any navigation.
+if [ "$(python3 "$A11Y" geometry "$TARGET")" = "$INITIAL_GEOMETRY" ]; then
+    ok "switching to list preserves window size"
+else
+    fail "switching to list preserves window size"
+fi
 act mode "[<'columns'>]" "[]"
 i=0
 panes=0
@@ -322,6 +333,9 @@ if printf '%s\n' "$DUMP" | grep -qF "$(printf '\tone\t')"; then
 else
     fail "the deepest column holds the folder's own entries at once"
 fi
+
+# Selection probes below use the flat grid so duplicate ancestor names are unambiguous.
+act mode "[<'grid'>]" "[]"
 
 # --- navigation changes both the title and the visible page ---------------------------
 # Enter addresses through the real editor; each assertion also checks content.
@@ -382,13 +396,13 @@ fi
 # `Describe` reports an action's enabled state, which is how a disabled action is told
 # apart from one that was never registered.
 describe() {
-    gdbus call --session --dest org.uflinux.FileManager --object-path "$WIN" \
+    gdbus call --session --dest org.uflinux.Files --object-path "$WIN" \
         --method org.gtk.Actions.Describe "$1" 2>/dev/null || true
 }
 # The same, on another window. Some commands are only available somewhere other
 # than where the first window is standing.
 describe_on() {
-    gdbus call --session --dest org.uflinux.FileManager --object-path "$1" \
+    gdbus call --session --dest org.uflinux.Files --object-path "$1" \
         --method org.gtk.Actions.Describe "$2" 2>/dev/null || true
 }
 # Whether a path is a window that is still there, rather than one that has been
@@ -471,11 +485,11 @@ fi
 i=0
 while [ "$i" -lt 50 ]; do
     refresh
-    printf '%s\n' "$DUMP" | grep -qF "Moved back" && break
+    grep -qF "Moved back" "$NOTIFICATIONS" && break
     i=$((i + 1))
     sleep 0.2
 done
-if printf '%s\n' "$DUMP" | grep -qF "Moved back"; then
+if grep -qF "Moved back" "$NOTIFICATIONS"; then
     ok "the window says what it moved back"
 else
     fail "the window says what it moved back"
@@ -642,7 +656,7 @@ if printf '%s\n' "$DUMP" | grep -qF "$(printf 'frame\t%s' "$PACK")"; then
 else
     fail "an archive opens as a folder of its own (no frame for $PACK)"
 fi
-ARCH=/org/uflinux/FileManager/window/2
+ARCH=/org/uflinux/Files/window/2
 if describe_on "$ARCH" extract | grep -qF '(true'; then
     ok "Extract is sensitive while standing inside an archive"
 else
@@ -660,7 +674,7 @@ else
     fail "Extract unpacks the container into a folder named after it (no $PACK/bundle)"
 fi
 refresh
-if printf '%s\n' "$DUMP" | grep -qF "Extracted"; then
+if grep -qF "Extracted" "$NOTIFICATIONS"; then
     ok "the window says what it extracted, in the folder it landed in"
 else
     fail "the window says what it extracted, in the folder it landed in"
@@ -1069,8 +1083,8 @@ fi
 # — correct behaviour, and the reason the popover would otherwise appear to
 # flash here: the open-with chooser left this window without focus, and the
 # archive window still holding it. Closing the archive window hands focus back.
-gdbus call --session --dest org.uflinux.FileManager \
-    --object-path /org/uflinux/FileManager/window/2 \
+gdbus call --session --dest org.uflinux.Files \
+    --object-path /org/uflinux/Files/window/2 \
     --method org.gtk.Actions.Activate win.close "[]" "[]" >/dev/null 2>&1 || :
 sleep 1
 python3 "$A11Y" select one >/dev/null 2>&1 || :
@@ -1153,7 +1167,14 @@ fi
 # --- the search bar -----------------------------------------------------------------
 # The bar opens and the field takes text. Whether it finds anything depends on the
 # indexer, which is checked separately below; the field accepting input is the UI's job.
+SEARCH_GEOMETRY=$(python3 "$A11Y" geometry "$TARGET")
 act search "[]" "[]"
+sleep 0.2
+if [ "$(python3 "$A11Y" geometry "$TARGET")" = "$SEARCH_GEOMETRY" ]; then
+    ok "opening search preserves window size"
+else
+    fail "opening search preserves window size"
+fi
 i=0
 while [ "$i" -lt 50 ] && ! printf '%s\n' "$DUMP" | grep -qF "$(printf 'entry\t')"; do
     refresh
@@ -1205,8 +1226,8 @@ i=0
 while [ "$i" -lt 50 ] && [ -z "$SECOND" ]; do
     probe=11
     while [ "$probe" -gt 1 ]; do
-        if alive "/org/uflinux/FileManager/window/$probe"; then
-            SECOND=/org/uflinux/FileManager/window/$probe
+        if alive "/org/uflinux/Files/window/$probe"; then
+            SECOND=/org/uflinux/Files/window/$probe
             break
         fi
         probe=$((probe - 1))
@@ -1710,11 +1731,11 @@ i=0
 WFRAME=$(python3 "$A11Y" dump-frame "$TARGET" 2>/dev/null || true)
 while [ "$i" -lt 50 ]; do
     WFRAME=$(python3 "$A11Y" dump-frame "$TARGET" 2>/dev/null || true)
-    printf '%s\n' "$WFRAME" | grep -qE "$(printf '^label\t')mount error:" && break
+    grep -qF "mount error:" "$NOTIFICATIONS" && break
     i=$((i + 1))
     sleep 0.2
 done
-if printf '%s\n' "$WFRAME" | grep -qE "$(printf '^label\t')mount error:"; then
+if grep -qF "mount error:" "$NOTIFICATIONS"; then
     ok "reconnecting a share reports what stopped it rather than pretending"
 else
     fail "reconnecting a share reports what stopped it rather than pretending"
@@ -1743,7 +1764,7 @@ else
     fail "marking a share connect at login is written to the table ($(cat "$MOUNT_FILE"))"
 fi
 WFRAME=$(python3 "$A11Y" dump-frame "$TARGET" 2>/dev/null || true)
-if printf '%s\n' "$WFRAME" | grep -qF "this share will connect at login"; then
+if grep -qF "this share will connect at login" "$NOTIFICATIONS"; then
     ok "marking a share connect at login says so in the window that asked"
 else
     fail "marking a share connect at login says so in the window that asked"
@@ -1761,7 +1782,7 @@ else
     fail "pressing the same row again takes the share back out of the next session ($(cat "$MOUNT_FILE"))"
 fi
 WFRAME=$(python3 "$A11Y" dump-frame "$TARGET" 2>/dev/null || true)
-if printf '%s\n' "$WFRAME" | grep -qF "this share will no longer connect at login"; then
+if grep -qF "this share will no longer connect at login" "$NOTIFICATIONS"; then
     ok "unmarking a share says the opposite of what marking it said"
 else
     fail "unmarking a share says the opposite of what marking it said"
@@ -1784,11 +1805,11 @@ fi
 i=0
 while [ "$i" -lt 50 ]; do
     WFRAME=$(python3 "$A11Y" dump-frame "$TARGET" 2>/dev/null || true)
-    printf '%s\n' "$WFRAME" | grep -qF "videos2024 is no longer listed" && break
+    grep -qF "videos2024 is no longer listed" "$NOTIFICATIONS" && break
     i=$((i + 1))
     sleep 0.2
 done
-if printf '%s\n' "$WFRAME" | grep -qF "videos2024 is no longer listed"; then
+if grep -qF "videos2024 is no longer listed" "$NOTIFICATIONS"; then
     ok "forgetting a share says so in the window that asked"
 else
     fail "forgetting a share says so in the window that asked"
@@ -1908,8 +1929,8 @@ if [ -x "$PROVIDER" ]; then
     PROV=$!
     i=0
     while [ "$i" -lt 100 ]; do
-        gdbus introspect --session --xml -d org.uflinux.FileManager.Desktop1 \
-            -o /org/uflinux/FileManager/Desktop >/dev/null 2>&1 && break
+        gdbus introspect --session --xml -d org.uflinux.Files.Desktop1 \
+            -o /org/uflinux/Files/Desktop >/dev/null 2>&1 && break
         i=$((i + 1))
         sleep 0.1
     done
@@ -2006,6 +2027,7 @@ fi
 
 kill "$NEW" 2>/dev/null || :
 kill "$APP" 2>/dev/null || :
+kill "$NOTIFY_PID" 2>/dev/null || :
 kill "$LAB" 2>/dev/null || :
 wait 2>/dev/null || :
 

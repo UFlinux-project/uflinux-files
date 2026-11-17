@@ -31,7 +31,7 @@ use ufm_core::error::{Error, Result};
 use ufm_mount::backend::{Backend, MountTarget, Paths as SearchPaths, credential_bytes};
 use ufm_mount::credentials::{CredentialStore, FileStore, Secret};
 use ufm_mount::monitor::{MountState, Observer};
-use ufm_mount::plan::{ACTION, PKEXEC, Plan};
+use ufm_mount::plan::{PKEXEC, Plan};
 use ufm_mount::sweep::{Action, Options as SweepOptions, Sweep, SweepItem};
 use ufm_mount::table::{MountRecord, MountTable};
 use ufm_mount::uri::Share;
@@ -803,7 +803,7 @@ fn backend_serves(share: &Share, search: &SearchPaths) -> bool {
 /// helper is not setuid, and running it directly as the user would fail with
 /// `EPERM` rather than a message that says what to do about it.
 fn run_plan(plan: &Plan, serves: bool, pkexec: &Path) -> std::result::Result<(), Error> {
-    let command = plan.run(pkexec, ACTION);
+    let command = plan.run(pkexec);
     if serves {
         // `lftp mount` *is* the mount: waiting for it would block for the life of
         // the share, and killing it on exit would take the share with it.
@@ -917,9 +917,8 @@ mod tests {
             for name in HELPERS {
                 fixture.stub(name, "#!/bin/sh\nexit 0\n");
             }
-            // The real `pkexec` authorises and then runs the action's program; a
-            // stub that drops the action id and execs is the same shape.
-            fixture.stub("pkexec", "#!/bin/sh\nshift\nexec \"$@\"\n");
+            // The real `pkexec` authorizes the executable and forwards its arguments.
+            fixture.stub("pkexec", "#!/bin/sh\nexec \"$@\"\n");
             fixture
         }
 
@@ -1053,14 +1052,14 @@ mod tests {
     }
 
     #[test]
-    fn a_root_plan_is_run_through_pkexec_naming_the_action() {
+    fn a_root_plan_passes_the_helper_executable_to_pkexec() {
         let fixture = Fixture::new();
         let marker = fixture.path("action");
         let share = share("nfs://srv/export");
         fixture.stub(
             "pkexec",
             &format!(
-                "#!/bin/sh\nprintf '%s' \"$1\" > '{}'\nshift\nexec \"$@\"\n",
+                "#!/bin/sh\nprintf '%s' \"$1\" > '{}'\nexec \"$@\"\n",
                 marker.display()
             ),
         );
@@ -1068,7 +1067,7 @@ mod tests {
         let _ = runner.mount(&share, None);
         assert_eq!(
             fs::read_to_string(&marker).expect("marker"),
-            ufm_mount::plan::ACTION,
+            fixture.path("bin/uflinux-files-mount").to_str().unwrap(),
             "the polkit policy, not the caller, decides what may run as root"
         );
     }
