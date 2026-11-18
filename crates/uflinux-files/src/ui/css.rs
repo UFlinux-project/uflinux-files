@@ -18,6 +18,7 @@ pub const CSS: &str = r"
     margin: 4px;
     border-radius: 8px;
 }
+.ufm-cut { opacity: 0.5; }
 .ufm-cell {
     padding: 6px;
     border-radius: 6px;
@@ -64,11 +65,11 @@ button.ufm-header-active {
     color: @accent_color;
 }
 label.ufm-name {
-    font-size: 10pt;
+    font-size: 1em;
 }
 label.ufm-meta {
     opacity: 0.75;
-    font-size: 9pt;
+    font-size: 0.9em;
 }
 /* The star over a row's icon. Accent-coloured rather than left to the symbolic
    recolouring, which would paint it the same grey as the folder icon it sits on
@@ -80,7 +81,7 @@ image.ufm-starred {
 }
 label.ufm-status {
     opacity: 0.7;
-    font-size: 9pt;
+    font-size: 0.9em;
 }
 box.ufm-sidebar {
     background-color: alpha(currentColor, 0.04);
@@ -143,7 +144,10 @@ box.ufm-open-with button {
    stylesheets have no `max-width` property at all — the ceiling is the text
    pane's own `max-width-chars`, which is where the width is actually decided. */
 box.ufm-preview {
-    min-width: 320px;
+    min-width: 260px;
+}
+.ufm-inspector box.ufm-preview {
+    min-width: 0;
 }
 /* The desktop we paint ourselves. The surface has to be transparent or the
    wallpaper sits behind an opaque grey rectangle, which is a worse desktop than the

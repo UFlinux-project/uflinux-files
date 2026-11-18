@@ -168,6 +168,9 @@ struct Inner {
     /// emits is not read as a keystroke.
     quiet: Cell<bool>,
     generation: Cell<u64>,
+    page: Cell<usize>,
+    accumulated: RefCell<Vec<Entry>>,
+    more: gtk::Button,
     /// Lives as long as the bar: a subscription unsubscribes when it is dropped.
     subscriptions: RefCell<Vec<gio::SignalSubscription>>,
     handlers: Handlers,
@@ -184,24 +187,22 @@ impl Search {
         let entry = gtk::SearchEntry::new();
         entry.set_placeholder_text(Some("Search files and apps"));
         entry.set_hexpand(true);
-        let target =
-            gtk::DropDown::from_strings(&["This folder", "Home", "Everywhere", "Applications"]);
+        let target = gtk::DropDown::from_strings(&[
+            "Folder and Subfolders",
+            "Home",
+            "Everywhere",
+            "Applications",
+        ]);
         target.set_tooltip_text(Some("Where to look"));
         let status = gtk::Label::new(None);
         status.add_css_class("ufm-meta");
         status.set_ellipsize(gtk::pango::EllipsizeMode::End);
         bar.append(&entry);
-        let options = gtk::MenuButton::builder()
-            .icon_name("view-more-symbolic")
-            .build();
-        options.set_tooltip_text(Some("Search options"));
-        let popover = gtk::Popover::new();
-        let controls = gtk::Box::new(gtk::Orientation::Vertical, 6);
-        controls.append(&target);
-        controls.append(&status);
-        popover.set_child(Some(&controls));
-        options.set_popover(Some(&popover));
-        bar.append(&options);
+        bar.append(&target);
+        bar.append(&status);
+        let more = gtk::Button::with_label("Load More");
+        more.set_visible(false);
+        bar.append(&more);
 
         let wanted = Target::from_scope(scope);
         target.set_selected(wanted.index());
@@ -223,6 +224,9 @@ impl Search {
             timer: RefCell::new(None),
             quiet: Cell::new(false),
             generation: Cell::new(0),
+            page: Cell::new(0),
+            accumulated: RefCell::new(Vec::new()),
+            more,
             subscriptions: RefCell::new(Vec::new()),
             handlers: RefCell::new(Vec::new()),
         });
@@ -318,6 +322,13 @@ impl Search {
 /// React to the bar. Every handler here is owned by a widget that outlives the
 /// window's own widgets, so each holds the shared state rather than borrowing it.
 fn wire(inner: &Rc<Inner>) {
+    inner.more.connect_clicked({
+        let inner = Rc::clone(inner);
+        move |_| {
+            inner.page.set(inner.page.get() + 1);
+            run_page(&inner);
+        }
+    });
     inner.entry.connect_search_changed({
         let inner = Rc::clone(inner);
         move |_| arm(&inner)
@@ -370,6 +381,13 @@ fn arm(inner: &Rc<Inner>) {
 
 /// Send whatever is in the bar now, skipping the wait.
 fn run_now(inner: &Rc<Inner>) {
+    inner.page.set(0);
+    inner.accumulated.borrow_mut().clear();
+    run_page(inner);
+}
+
+fn run_page(inner: &Rc<Inner>) {
+    inner.more.set_sensitive(false);
     stop_timer(inner);
     let text = inner.entry.text().to_string();
     if text.is_empty() {
@@ -377,12 +395,18 @@ fn run_now(inner: &Rc<Inner>) {
         return;
     }
     let here = inner.here.borrow().clone();
-    let request = request_for(
+    let mut request = request_for(
         &text,
         inner.wanted.get(),
         inner.tuning.get(),
         here.as_deref(),
     );
+    match &mut request {
+        Request::SearchFiles { query } => query.page = inner.page.get(),
+        Request::SearchApps { page, .. } => *page = inner.page.get(),
+        _ => {}
+    }
+    inner.status.set_text("Searching…");
     dispatch(inner, request, next_generation(inner));
 }
 
@@ -395,6 +419,9 @@ fn clear(inner: &Rc<Inner>) {
 /// Put the bar away and say nothing.
 fn reset(inner: &Rc<Inner>) {
     next_generation(inner);
+    inner.page.set(0);
+    inner.accumulated.borrow_mut().clear();
+    inner.more.set_visible(false);
     stop_timer(inner);
     inner.waiting.borrow_mut().take();
     inner.quiet.set(true);
@@ -565,9 +592,34 @@ where
 }
 
 /// Report one query, unless a newer one has already replaced it.
-fn deliver(inner: &Rc<Inner>, generation: u64, outcome: Outcome) {
+fn deliver(inner: &Rc<Inner>, generation: u64, mut outcome: Outcome) {
     if generation != inner.generation.get() {
         return;
+    }
+    inner.more.set_sensitive(true);
+    if let Outcome::Found(found) = &mut outcome {
+        let page_nonempty = !found.entries.is_empty();
+        let mut accumulated = inner.accumulated.borrow_mut();
+        if inner.page.get() == 0 {
+            accumulated.clear();
+        }
+        for entry in &found.entries {
+            if !accumulated
+                .iter()
+                .any(|held| held.location == entry.location)
+            {
+                accumulated.push(entry.clone());
+            }
+        }
+        found.entries = accumulated.clone();
+        inner
+            .more
+            .set_visible(page_nonempty && found.entries.len() < found.total);
+        if inner.page.get() > 0 {
+            found.status = format!("Showing {} of {} matches", found.entries.len(), found.total);
+        }
+    } else if matches!(outcome, Outcome::Failed(_)) && inner.page.get() > 0 {
+        inner.page.set(inner.page.get() - 1);
     }
     let status = match &outcome {
         Outcome::Cleared => String::new(),
@@ -821,6 +873,39 @@ mod tests {
     use super::*;
     use crate::ui::tk;
     use ufm_search::Snippet;
+
+    #[test]
+    fn loading_more_accumulates_matches_and_reset_clears_pages() {
+        tk::ui(|| {
+            let search = Search::new(&SearchScope::Home, false, false);
+            let generation = next_generation(&search.inner);
+            deliver(
+                &search.inner,
+                generation,
+                Outcome::Found(Found {
+                    entries: vec![entry_for(&hit("/tmp/first"))],
+                    total: 2,
+                    status: "1 of 2".into(),
+                }),
+            );
+            assert!(search.inner.more.get_visible());
+            search.inner.page.set(1);
+            deliver(
+                &search.inner,
+                generation,
+                Outcome::Found(Found {
+                    entries: vec![entry_for(&hit("/tmp/second"))],
+                    total: 2,
+                    status: "1 of 2".into(),
+                }),
+            );
+            assert_eq!(search.inner.accumulated.borrow().len(), 2);
+            assert!(!search.inner.more.get_visible());
+            search.reset();
+            assert_eq!(search.inner.page.get(), 0);
+            assert!(search.inner.accumulated.borrow().is_empty());
+        });
+    }
 
     fn hit(path: &str) -> Hit {
         Hit {

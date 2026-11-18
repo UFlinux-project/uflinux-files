@@ -314,6 +314,12 @@ fn back_from_trash(
             undoing.failed(&name, "not in the trash");
             continue;
         };
+        if let Some(parent) = row.home.as_path().and_then(Path::parent)
+            && let Err(error) = fs::create_dir_all(parent)
+        {
+            undoing.failed(&name, error.to_string());
+            continue;
+        }
         let place = ops::accept(&row.home, ops::exists);
         match carry(entry, &place, brake) {
             Ok(()) => {
@@ -820,6 +826,39 @@ mod tests {
         assert!(
             outcome.changed.contains(&Location::file(root.path())),
             "the folder that lost the row is the one needing a re-read"
+        );
+    }
+
+    #[test]
+    fn restoring_recreates_parents_and_preserves_an_existing_original() {
+        let root = tempfile::tempdir().unwrap();
+        let trash = root.path().join("Trash");
+        fs::create_dir_all(trash.join("files")).unwrap();
+        fs::create_dir_all(trash.join("info")).unwrap();
+        let home = root.path().join("missing/deep/file.txt");
+        for (name, contents) in [("first", "first version"), ("second", "second version")] {
+            let stored = trash.join("files").join(name);
+            fs::write(&stored, contents).unwrap();
+            let info = trash.join("info").join(format!("{name}.trashinfo"));
+            fs::write(&info, format!("[Trash Info]\nPath={}\n", home.display())).unwrap();
+            let record = Record {
+                effect: Effect::Trashed(vec![Trashed {
+                    home: Location::file(&home),
+                    entry: Some(Location::file(&stored)),
+                }]),
+                replaced: Vec::new(),
+                stash: None,
+            };
+            let (_queue, brake, mut reporter) = worker();
+            let outcome = record.apply(&brake, &mut reporter);
+            assert!(outcome.ok, "{}", outcome.message);
+            assert!(!stored.exists());
+            assert!(!info.exists());
+        }
+        assert_eq!(fs::read_to_string(&home).unwrap(), "first version");
+        assert_eq!(
+            fs::read_to_string(home.with_file_name("file (2).txt")).unwrap(),
+            "second version"
         );
     }
 

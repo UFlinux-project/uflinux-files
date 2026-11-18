@@ -521,6 +521,26 @@ impl Inspector {
             return;
         };
         self.content.append(&body(window, handle, thumbs, entry));
+        if super::trash::is_stored(&entry.location) {
+            let details = gtk::Label::new(None);
+            details.set_wrap(true);
+            details.set_selectable(true);
+            details.set_xalign(0.0);
+            self.content.append(&details);
+            let location = entry.location.clone();
+            let details = details.downgrade();
+            glib::spawn_future_local(async move {
+                let item = gio::spawn_blocking(move || super::trash::find(&location)).await;
+                if let (Some(details), Ok(Some(item))) = (details.upgrade(), item) {
+                    details.set_text(&format!(
+                        "Original location: {}\nDeleted: {}",
+                        item.original.display(),
+                        item.deleted
+                    ));
+                }
+            });
+        }
+
         let is_media = entry
             .mime
             .as_deref()

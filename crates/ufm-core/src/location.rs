@@ -41,6 +41,7 @@ pub enum VirtualDir {
     Recent,
     /// User-starred locations.
     Starred,
+    Trash,
 }
 
 impl VirtualDir {
@@ -51,6 +52,7 @@ impl VirtualDir {
             Self::Network => "network",
             Self::Recent => "recent",
             Self::Starred => "starred",
+            Self::Trash => "trash",
         }
     }
 
@@ -61,6 +63,7 @@ impl VirtualDir {
             Self::Network => "Network",
             Self::Recent => "Recent",
             Self::Starred => "Starred",
+            Self::Trash => "Trash",
         }
     }
 }
@@ -120,6 +123,7 @@ impl Location {
             "network" => Ok(Self::Virtual(VirtualDir::Network)),
             "recent" => Ok(Self::Virtual(VirtualDir::Recent)),
             "starred" => Ok(Self::Virtual(VirtualDir::Starred)),
+            "trash" => Ok(Self::Virtual(VirtualDir::Trash)),
             "search" => {
                 let id = rest.trim_end_matches('/');
                 if id.is_empty() {

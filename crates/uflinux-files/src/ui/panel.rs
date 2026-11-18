@@ -225,7 +225,7 @@ impl Place {
             // error rather than the Recent folder.
             Self::Recent => Location::parse("recent://").expect("recent is a location"),
             Self::Starred => Location::parse("starred://").expect("starred is a location"),
-            Self::Trash => Location::file(paths::trash_dir()),
+            Self::Trash => Location::Virtual(ufm_core::location::VirtualDir::Trash),
             Self::Folder(path) => Location::file(path.clone()),
             Self::Bookmark(bookmark) => bookmark.location.clone(),
             Self::Mount { id, .. } => Location::file(paths::mount_root().join(id)),
@@ -475,6 +475,9 @@ impl Panel {
     /// Rebuild the list. The order is the caller's, so bookmarks stay where the
     /// user put them; a heading is inserted wherever the group changes.
     pub fn set_places(&self, places: Vec<Place>) {
+        if *self.shared.places.borrow() == places {
+            return;
+        }
         self.list.unselect_all();
         for child in child_widgets(&self.list) {
             self.list.remove(&child);
@@ -579,6 +582,7 @@ impl Panel {
         // rows. A class on the box would be invisible to both.
         row.add_css_class("ufm-place");
         row.set_child(Some(&box_));
+        super::dnd::place(&row, place.location());
         row.set_activatable(true);
         // The row is what a screen reader reaches and activates, so the
         // place's name has to live on the row itself. A name carried only by

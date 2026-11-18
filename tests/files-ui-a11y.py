@@ -163,13 +163,26 @@ def first_entry(frame=None):
     root = frame_named(frame) if frame else None
     if frame and root is None:
         return None
+    candidates = []
     for role_wanted in ("entry", "text"):
         stack = [root] if root else list(apps())
         while stack:
             acc = stack.pop(0)
             if role(acc) == role_wanted:
-                return acc
+                try:
+                    if Atspi.Accessible.get_editable_text_iface(acc) is not None:
+                        candidates.append(acc)
+                except Exception:
+                    pass
             stack = children(acc) + stack
+    for acc in candidates:
+        try:
+            if Atspi.Accessible.get_state_set(acc).contains(Atspi.StateType.FOCUSED):
+                return acc
+        except Exception:
+            pass
+    if candidates:
+        return candidates[0]
     return None
 
 
@@ -299,6 +312,12 @@ def submit_node(acc):
         # win.location already focuses its editor. GtkText does not implement
         # AT-SPI grab_focus on every GTK version.
         return keyboard(["-k", "Return"])
+    try:
+        component = Atspi.Accessible.get_component_iface(acc)
+        if component is not None and component.grab_focus():
+            return keyboard(["-k", "Return"])
+    except Exception:
+        pass
     parent = Atspi.Accessible.get_parent(acc)
     rows = [row for row in children(parent)
             if Atspi.Accessible.get_state_set(row).contains(Atspi.StateType.FOCUSABLE)]

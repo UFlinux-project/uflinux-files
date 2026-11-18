@@ -354,8 +354,13 @@ impl Columns {
     /// the view.
     pub fn rebind(&self) {
         for pane in self.inner.panes.borrow().iter() {
-            let rows: Vec<Row> = pane.store.iter::<Row>().filter_map(Result::ok).collect();
-            pane.store.splice(0, pane.store.n_items(), &rows);
+            let entries: Vec<_> = pane
+                .store
+                .iter::<Row>()
+                .filter_map(Result::ok)
+                .map(|row| row.entry())
+                .collect();
+            paint(pane, &entries);
         }
     }
 
@@ -739,8 +744,19 @@ fn start(inner: &Rc<Inner>, pane: &Pane) {
 /// Replace a pane's rows. The store is spliced whole rather than patched, which
 /// is one model change for GTK to react to instead of one per row.
 fn paint(pane: &Pane, entries: &[Entry]) {
+    let selected: std::collections::HashSet<_> = (0..pane.store.n_items())
+        .filter(|position| pane.selection.is_selected(*position))
+        .filter_map(|position| pane.store.item(position).and_downcast::<Row>())
+        .map(|row| row.entry().location)
+        .collect();
     let rows = Row::rows(entries.to_vec());
     pane.store.splice(0, pane.store.n_items(), &rows);
+    pane.selection.unselect_all();
+    for (position, entry) in (0_u32..).zip(entries) {
+        if selected.contains(&entry.location) {
+            pane.selection.select_item(position, false);
+        }
+    }
 }
 
 fn position_of(panes: &[Rc<Pane>], location: &Location) -> Option<usize> {

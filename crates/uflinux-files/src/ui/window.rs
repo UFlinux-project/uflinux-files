@@ -37,10 +37,11 @@ use ufm_core::config::{Bookmark, Bookmarks, Preferences, ViewMode};
 use ufm_core::entry::{Entry, EntryFlags};
 use ufm_core::location::VirtualDir;
 use ufm_core::paths;
-use ufm_core::sort::SortKey;
+use ufm_core::sort::{SortField, SortKey};
 use ufm_mount::table::MountRecord;
 use ufm_vfs::{Cancel, FsHints, Readers};
 
+use super::clipboard;
 use super::columns::Columns;
 use super::computer::{self, Card, CardId, ComputerView};
 use super::conflict;
@@ -59,9 +60,9 @@ use super::recent;
 use super::row::{Row, format_items};
 use super::search::{Found, Outcome, Search};
 use super::thumb::Pipeline;
-use super::undo;
 use super::view::View;
 use super::watch::Live;
+use super::{trash, undo};
 use crate::runner::{Layout, Report, Runner};
 
 // The windows this process has open. A window leaves the list when it is
@@ -373,7 +374,7 @@ pub fn open(app: &gtk::Application, urls: &[String]) {
         prefs.show_hidden,
         thumbs.clone(),
     ));
-    let (banner, banner_label) = banner_bar();
+    let (banner, banner_label, banner_undo) = banner_bar();
     let path = path_label(&start);
     // The bar starts out knowing the same folder the window will open on and
     // with the same rule about dotfiles, so that its first query cannot return a
@@ -402,6 +403,8 @@ pub fn open(app: &gtk::Application, urls: &[String]) {
         crumbs: gtk::Box::new(gtk::Orientation::Horizontal, 0),
         banner,
         banner_label,
+        banner_undo,
+        trash_actions: gtk::Box::new(gtk::Orientation::Horizontal, 8),
         search: Rc::new(RefCell::new(None)),
         find,
         shared: Rc::clone(&shared),
@@ -443,14 +446,55 @@ pub fn open(app: &gtk::Application, urls: &[String]) {
 
     let content = build_content(&ctx, &panel, &view);
     window.set_child(Some(&content));
-    window.set_titlebar(Some(&header(&ctx, &menu())));
+    window.set_titlebar(Some(&header(&ctx, &menu(&ctx))));
 
     panel.set_places(places(&shared));
     panel.set_usage(usages(&shared));
     wire_handlers(&panel, &view, &columns, &ctx);
+    for widget in [
+        view.widget().upcast_ref::<gtk::Widget>(),
+        columns.widget().upcast_ref::<gtk::Widget>(),
+    ] {
+        super::dnd::source(widget, {
+            let ctx = ctx.clone();
+            move || {
+                if ctx
+                    .shared
+                    .state
+                    .borrow()
+                    .current
+                    .as_ref()
+                    .is_some_and(|here| here.virtual_dir() == Some(VirtualDir::Trash))
+                {
+                    Vec::new()
+                } else {
+                    targets(&ctx)
+                }
+            }
+        });
+        super::dnd::target(widget, {
+            let ctx = ctx.clone();
+            move || target_folder(&ctx).map(|_| String::new())
+        });
+    }
 
     wire_actions(app, &window, &ctx);
     wire_jobs(&ctx);
+    window.clipboard().connect_changed({
+        let window = window.downgrade();
+        move |clipboard| {
+            clipboard::changed(clipboard);
+            if window.upgrade().is_some() {
+                for ctx in living() {
+                    sync_paste(&ctx);
+                    if let Some(view) = ctx.view.upgrade() {
+                        view.rebind();
+                    }
+                    ctx.columns.rebind();
+                }
+            }
+        }
+    });
     wire_close(&window);
     glib::timeout_add_local(Duration::from_secs(2), {
         let ctx = ctx.clone();
@@ -570,7 +614,11 @@ fn wire_find(ctx: &Ctx) {
 /// window chose.
 fn wire_jobs(ctx: &Ctx) {
     let window = ctx.window.clone();
+    let undo = ctx.banner_undo.downgrade();
     ctx.jobs.on_change(move |status| {
+        if let Some(undo) = undo.upgrade() {
+            undo.set_visible(status.undoable);
+        }
         if let Some(window) = window.upgrade() {
             enable(&window, "cancel", status.running);
             enable(&window, "undo", status.undoable);
@@ -583,6 +631,20 @@ fn wire_jobs(ctx: &Ctx) {
 fn build_content(ctx: &Ctx, panel: &Panel, view: &View) -> gtk::Box {
     let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
     content.append(&ctx.banner);
+    content.append(ctx.find.widget());
+    for (label, action) in [
+        ("Restore Selected", "win.restore-trash"),
+        ("Empty Trash…", "win.empty-trash"),
+    ] {
+        let button = gtk::Button::with_label(label);
+        button.set_action_name(Some(action));
+        ctx.trash_actions.append(&button);
+    }
+    ctx.trash_actions.set_margin_top(6);
+    ctx.trash_actions.set_margin_bottom(6);
+    ctx.trash_actions.set_margin_start(12);
+    ctx.trash_actions.set_visible(false);
+    content.append(&ctx.trash_actions);
     // Directly under the error strip, above everything that moves: a job that
     // takes long enough to need reporting takes long enough that the user is
     // looking at the folder it is working on, and a strip that pushed the
@@ -716,6 +778,43 @@ fn build_content(ctx: &Ctx, panel: &Panel, view: &View) -> gtk::Box {
             }
         }
     });
+    let escape = gtk::EventControllerKey::new();
+    escape.connect_key_pressed({
+        let ctx = ctx.clone();
+        let root = root.downgrade();
+        move |_, key, _, _| {
+            if key != gtk::gdk::Key::Escape {
+                return Propagation::Proceed;
+            }
+            let Some(root) = root.upgrade() else {
+                return Propagation::Proceed;
+            };
+            let mut closed = false;
+            if root.width() < 700
+                && let Some(panel) = ctx.panel.upgrade()
+                && panel.widget().is_visible()
+            {
+                panel.widget().set_visible(false);
+                closed = true;
+            }
+            if root.width() < 960 && ctx.preview.widget().is_visible() {
+                ctx.preview.widget().set_visible(false);
+                if let Some(window) = ctx.window.upgrade() {
+                    ctx.preview.clear(&window);
+                }
+                closed = true;
+            }
+            if closed {
+                if let Some(view) = ctx.view.upgrade() {
+                    view.widget().child_focus(gtk::DirectionType::TabForward);
+                }
+                Propagation::Stop
+            } else {
+                Propagation::Proceed
+            }
+        }
+    });
+    root.add_controller(escape);
     content.append(&root);
     content.append(&status_bar(view));
     content
@@ -744,6 +843,8 @@ struct Ctx {
     crumbs: gtk::Box,
     banner: gtk::Box,
     banner_label: gtk::Label,
+    banner_undo: gtk::Button,
+    trash_actions: gtk::Box,
     search: Rc<RefCell<Option<gtk::SearchEntry>>>,
     /// Previews for this window's rows. The window answers for it because a
     /// reply arrives on the listing queue, and the queue reports here.
@@ -1041,6 +1142,8 @@ fn navigate(ctx: &Ctx, location: Location, record: bool) {
             state.runner.touch(&id);
         }
     }
+    ctx.trash_actions
+        .set_visible(location.virtual_dir() == Some(VirtualDir::Trash));
     ctx.preview.widget().set_visible(
         !matches!(
             location.virtual_dir(),
@@ -1083,6 +1186,7 @@ fn navigate(ctx: &Ctx, location: Location, record: bool) {
     // than the folder being left. For a virtual location this also clears the
     // override the cards left in the status bar.
     view.set_entries(Vec::new());
+    view.set_status(Some("Loading…"));
     // A synthesized collection has no reader, and a worker that cannot answer a
     // location reports that as a failure — which is how `computer://` used to
     // arrive with a banner saying it was not a local path. The two that are
@@ -1193,7 +1297,7 @@ fn paint_cards(ctx: &Ctx, cards: &[Card]) {
 /// because a collection is one presentation and not a choice the user makes per
 /// folder: the cards are the only way to show a set of capacities, and a list of
 /// files is a list of files.
-fn show_virtual(ctx: &Ctx, dir: VirtualDir, view: &View) {
+fn show_virtual(ctx: &Ctx, dir: VirtualDir, _view: &View) {
     match dir {
         VirtualDir::Computer => {
             ctx.modes.set_visible_child_name("computer");
@@ -1203,17 +1307,7 @@ fn show_virtual(ctx: &Ctx, dir: VirtualDir, view: &View) {
             ctx.modes.set_visible_child_name("network");
             paint_cards(ctx, &card_data(&ctx.shared));
         }
-        VirtualDir::Recent => {
-            let readers = Arc::clone(&ctx.shared.readers);
-            let entries: Vec<Entry> = recent::load()
-                .iter()
-                .filter_map(|record| readers.metadata(&Location::file(record.path.clone())).ok())
-                .collect();
-            ctx.shared.state.borrow_mut().shown.clone_from(&entries);
-            ctx.modes.set_visible_child_name("view");
-            view.set_entries(entries);
-        }
-        VirtualDir::Starred => show_starred(ctx, view),
+        VirtualDir::Recent | VirtualDir::Starred | VirtualDir::Trash => load_collection(ctx, dir),
     }
 }
 
@@ -1225,44 +1319,63 @@ fn show_virtual(ctx: &Ctx, dir: VirtualDir, view: &View) {
 /// The rows are kept rather than dropped when they cannot be read, and the
 /// count of them goes in the bar: a collection that quietly shrinks is worse
 /// than one that says how much of it it could not show.
-fn show_starred(ctx: &Ctx, view: &View) {
-    let readers = Arc::clone(&ctx.shared.readers);
-    let starred = ctx.shared.starred.borrow();
-    let mut entries = Vec::with_capacity(starred.len());
-    let mut missing = 0_usize;
-    for star in starred.stars() {
-        match readers.metadata(&star.location) {
-            Ok(entry) => entries.push(entry),
-            Err(_) => missing += 1,
-        }
-    }
-    drop(starred);
-    if entries.is_empty() && missing == 0 {
-        ctx.modes.set_visible_child_name("view");
-        show_banner(ctx, "Nothing starred yet");
-        return;
-    }
-    // The rows come from the filesystem, which knows nothing about stars, so
-    // they are stamped like any other listing. Every row here ends up with a
-    // badge, which is repetitive and honest: the flag is what the menu reads to
-    // decide between "Star" and "Unstar", and a collection that left it out
-    // would offer a row called "Star" that takes a star away.
-    ctx.shared.starred.borrow().stamp(&mut entries);
-    // The count is what a collection owes its reader.
-    let total = u64::try_from(entries.len()).unwrap_or(u64::MAX);
-    let status = if missing > 0 {
-        let gone = u64::try_from(missing).unwrap_or(u64::MAX);
-        format!("{} · {gone} not available", format_items(total))
-    } else {
-        format_items(total)
-    };
-    ctx.shared.state.borrow_mut().shown.clone_from(&entries);
+fn show_starred(ctx: &Ctx, _view: &View) {
+    load_collection(ctx, VirtualDir::Starred);
+}
+
+fn load_collection(ctx: &Ctx, dir: VirtualDir) {
     ctx.modes.set_visible_child_name("view");
-    // The empty-collection banner has to go, or the collection would arrive with
-    // a strip saying there was nothing in it.
-    ctx.banner.set_visible(false);
-    view.set_entries(entries);
-    view.set_status(Some(&status));
+    let read = ReadId::new();
+    ctx.shared.state.borrow_mut().read = Some(read);
+    let readers = ctx.shared.readers.clone();
+    let cancel = ctx.shared.state.borrow().cancel.clone().unwrap_or_default();
+    let stars: Vec<_> = ctx
+        .shared
+        .starred
+        .borrow()
+        .stars()
+        .iter()
+        .map(|star| star.location.clone())
+        .collect();
+    let Some(handle) = ctx.handle.borrow().clone() else {
+        return;
+    };
+    let worker = handle.clone();
+    let spawned = thread::Builder::new()
+        .stack_size(256 * 1024)
+        .spawn(move || {
+            let entries = match dir {
+                VirtualDir::Trash => trash::listing(&readers, &cancel),
+                VirtualDir::Recent => recent::load()
+                    .iter()
+                    .take_while(|_| !cancel.is_cancelled())
+                    .filter_map(|record| {
+                        readers.metadata(&Location::file(record.path.clone())).ok()
+                    })
+                    .collect(),
+                VirtualDir::Starred => stars
+                    .iter()
+                    .take_while(|_| !cancel.is_cancelled())
+                    .filter_map(|location| readers.metadata(location).ok())
+                    .collect(),
+                _ => Vec::new(),
+            };
+            if !cancel.is_cancelled() {
+                worker.send(Event::Finished {
+                    read,
+                    location: Location::Virtual(dir),
+                    entries,
+                    hints: None,
+                });
+            }
+        });
+    if spawned.is_err() {
+        handle.send(Event::Failed {
+            read,
+            location: Location::Virtual(dir),
+            message: "Could not start loading this collection.".into(),
+        });
+    }
 }
 
 /// The cards for the My Computer view, read from the window's own mount table and
@@ -1511,7 +1624,22 @@ fn apply(ctx: &Ctx, mut event: Event) {
                 settled(ctx);
                 return;
             }
+            let empty = filtered.is_empty();
             view.set_entries(filtered);
+            match location.virtual_dir() {
+                Some(VirtualDir::Trash) if empty => view.set_status(Some("Trash is empty")),
+                Some(VirtualDir::Recent) if empty => view.set_status(Some("No recent files")),
+                Some(VirtualDir::Starred) => {
+                    let shown = ctx.shared.state.borrow().shown.len();
+                    let missing = ctx.shared.starred.borrow().len().saturating_sub(shown);
+                    if shown == 0 && missing == 0 {
+                        view.set_status(Some("Nothing starred yet"));
+                    } else if missing > 0 {
+                        view.set_status(Some(&format!("{shown} items · {missing} not available")));
+                    }
+                }
+                _ => {}
+            }
             settled(ctx);
         }
         Event::Failed {
@@ -1526,6 +1654,7 @@ fn apply(ctx: &Ctx, mut event: Event) {
             // The failure replaces any operation message: it is the newer fact
             // about this folder, and a strip holding both would have to choose.
             *ctx.shared.spoken.borrow_mut() = None;
+            view.set_status(Some("Could not load this location. Press F5 to retry."));
             show_banner(ctx, &format!("{}: {message}", location.display()));
         }
         Event::Mounted { report } => mounted(ctx, report),
@@ -1735,6 +1864,22 @@ fn changed(shared: &Rc<Shared>, ctx: &Ctx, paths: &[PathBuf], overflowed: bool) 
 /// deepest, so this is the same pair the reload button runs, and the two never
 /// read one folder twice.
 fn operated(ctx: &Ctx, outcome: ops::Outcome) {
+    for other in living() {
+        if other.window != ctx.window
+            && other
+                .shared
+                .state
+                .borrow()
+                .current
+                .as_ref()
+                .is_some_and(|location| location.virtual_dir() == Some(VirtualDir::Trash))
+        {
+            load_collection(&other, VirtualDir::Trash);
+        }
+    }
+    if let Some(window) = ctx.window.upgrade() {
+        clipboard::prune_moved(window.clipboard());
+    }
     // The record goes to the table before anything else, so that the Undo
     // button is sensitive by the time the message that offers it has been read.
     // An operation that changed nothing carries no record, which is what stops a
@@ -1761,7 +1906,8 @@ fn operated(ctx: &Ctx, outcome: ops::Outcome) {
     let here = current.as_ref();
     // The folder in the title bar changed, so its rows and its count are both
     // wrong and only a re-read fixes either.
-    let changed_here = outcome.changed.iter().any(|folder| here == Some(folder));
+    let changed_here = outcome.changed.iter().any(|folder| here == Some(folder))
+        || here.is_some_and(|location| location.virtual_dir() == Some(VirtualDir::Trash));
     // A change one column to the left does not touch the rows on screen, but it
     // does touch the column that shows them, and a pane holding a row that has
     // been moved is a pane lying about the folder it names.
@@ -1878,6 +2024,7 @@ fn found(ctx: &Ctx, page: Found) {
     ctx.columns.forget();
     ctx.modes.set_visible_child_name("view");
     view.set_entries(filtered);
+    view.set_status(Some(&page.status));
     ctx.path.set_label(&page.status);
 }
 
@@ -2011,6 +2158,17 @@ fn activate(ctx: &Ctx, row: &Row) {
 /// Open one entry. Takes an [`Entry`] rather than a row so that the column
 /// panes, whose rows are their own widgets, can share the path.
 fn activate_entry(ctx: &Ctx, entry: &Entry) {
+    if ctx
+        .shared
+        .state
+        .borrow()
+        .current
+        .as_ref()
+        .is_some_and(|here| here.virtual_dir() == Some(VirtualDir::Trash))
+    {
+        show_banner(ctx, "Restore this item from Trash before opening it.");
+        return;
+    }
     if entry.navigable() {
         let target =
             if entry.kind == ufm_core::entry::EntryKind::Archive && entry.location.is_real() {
@@ -2176,6 +2334,8 @@ fn place_for(bookmarks: &[Bookmark], mounts: &[Place], location: &Location) -> O
 }
 
 fn show_banner(ctx: &Ctx, message: &str) {
+    ctx.banner_label.set_text(message);
+    ctx.banner.set_visible(true);
     if message == "Nothing starred yet" {
         if let Some(view) = ctx.view.upgrade() {
             view.set_status(Some(message));
@@ -2257,26 +2417,70 @@ fn header(ctx: &Ctx, menu: &gio::Menu) -> gtk::HeaderBar {
         let button = gtk::Button::from_icon_name(icon);
         button.set_action_name(Some(&format!("win.{name}")));
         button.set_tooltip_text(Some(tip));
+        button.update_property(&[gtk::accessible::Property::Label(tip)]);
         bar.pack_start(&button);
     }
 
+    let sidebar = gtk::Button::from_icon_name("sidebar-show-symbolic");
+    sidebar.set_tooltip_text(Some("Show or hide sidebar"));
+    sidebar.connect_clicked({
+        let panel = ctx.panel.clone();
+        move |_| {
+            if let Some(panel) = panel.upgrade() {
+                panel.widget().set_visible(!panel.widget().is_visible());
+            }
+        }
+    });
+    bar.pack_start(&sidebar);
+    let preview = gtk::Button::from_icon_name("view-reveal-symbolic");
+    preview.set_tooltip_text(Some("Show or hide preview pane (Space)"));
+    preview.set_action_name(Some("win.preview"));
+    bar.pack_end(&preview);
+    let new_folder = gtk::Button::from_icon_name("folder-new-symbolic");
+    new_folder.set_action_name(Some("win.new-folder"));
+    new_folder.set_tooltip_text(Some("New Folder (Ctrl+Shift+N)"));
+    bar.pack_start(&new_folder);
     let search = folder_filter(ctx);
     *ctx.search.borrow_mut() = Some(search.clone());
     let modes = gtk::MenuButton::builder()
         .icon_name("open-menu-symbolic")
         .menu_model(menu)
         .build();
+    if let Some(popover) = modes.popover() {
+        popover.connect_show({
+            let model = menu.clone();
+            let ctx = ctx.clone();
+            move |_| {
+                let updated = self::menu(&ctx);
+                model.remove_all();
+                for index in 0..updated.n_items() {
+                    model.append_item(&gio::MenuItem::from_model(&updated, index));
+                }
+            }
+        });
+    }
+    modes.set_tooltip_text(Some("Main menu"));
+    modes.update_property(&[gtk::accessible::Property::Label("Main menu")]);
     bar.pack_end(&modes);
     let views = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     views.add_css_class("linked");
     for mode in [ViewMode::Grid, ViewMode::List, ViewMode::Columns] {
-        let button = gtk::Button::from_icon_name(mode.icon_name());
+        let button = gtk::ToggleButton::new();
+        button.set_icon_name(mode.icon_name());
         button.set_action_name(Some("win.mode"));
         button.set_action_target_value(Some(&mode_name(mode).to_variant()));
         button.set_tooltip_text(Some(mode.label()));
         views.append(&button);
     }
     bar.pack_end(&views);
+    bar.connect_notify_local(Some("width"), {
+        let views = views.downgrade();
+        move |bar, _| {
+            if let Some(views) = views.upgrade() {
+                views.set_visible(bar.width() >= 900);
+            }
+        }
+    });
 
     let search_button = gtk::Button::from_icon_name("system-search-symbolic");
     search_button.set_tooltip_text(Some("Search files"));
@@ -2307,18 +2511,25 @@ fn header(ctx: &Ctx, menu: &gio::Menu) -> gtk::HeaderBar {
     entry.set_hexpand(true);
     title.add_named(&address, Some("address"));
     title.add_named(&entry, Some("entry"));
-    title.add_named(&search, Some("filter"));
+    if let Some(content) = ctx
+        .window
+        .upgrade()
+        .and_then(|window| window.child())
+        .and_downcast::<gtk::Box>()
+    {
+        content.insert_child_after(&search, Some(ctx.find.widget()));
+    }
     search.connect_visible_notify({
         let title = title.clone();
         move |filter| {
             title.set_visible_child_name(if filter.is_visible() {
-                "filter"
+                "address"
             } else {
                 "address"
             })
         }
     });
-    title.add_named(ctx.find.widget(), Some("search"));
+
     let edit = gio::SimpleAction::new("location", None);
     edit.connect_activate({
         let ctx = ctx.clone();
@@ -2326,6 +2537,11 @@ fn header(ctx: &Ctx, menu: &gio::Menu) -> gtk::HeaderBar {
         let title = title.clone();
         move |_, _| {
             ctx.find.clear();
+            if let Some(filter) = ctx.search.borrow().as_ref()
+                && filter.get_visible()
+            {
+                filter.emit_by_name::<()>("stop-search", &[]);
+            }
             if let Some(location) = ctx.shared.state.borrow().current.as_ref() {
                 let value = location
                     .as_path()
@@ -2333,6 +2549,9 @@ fn header(ctx: &Ctx, menu: &gio::Menu) -> gtk::HeaderBar {
                 entry.set_text(&value);
             }
             title.set_visible_child_name("entry");
+            if let Some(window) = ctx.window.upgrade() {
+                window.present();
+            }
             entry.grab_focus();
             entry.select_region(0, -1);
         }
@@ -2356,6 +2575,7 @@ fn header(ctx: &Ctx, menu: &gio::Menu) -> gtk::HeaderBar {
             match Location::parse(&input) {
                 Ok(location) => {
                     entry.remove_css_class("error");
+                    entry.set_tooltip_text(None);
                     title.set_visible_child_name("address");
                     navigate(&ctx, location, true);
                 }
@@ -2383,7 +2603,7 @@ fn header(ctx: &Ctx, menu: &gio::Menu) -> gtk::HeaderBar {
         let title = title.clone();
         move |search| {
             title.set_visible_child_name(if search.is_visible() {
-                "search"
+                "address"
             } else {
                 "address"
             })
@@ -2398,19 +2618,25 @@ fn header(ctx: &Ctx, menu: &gio::Menu) -> gtk::HeaderBar {
 /// and a folder that took a second to read does not take a second per keystroke.
 fn folder_filter(ctx: &Ctx) -> gtk::SearchEntry {
     let search = gtk::SearchEntry::new();
-    search.set_placeholder_text(Some("Search this folder"));
+    search.set_placeholder_text(Some("Filter names in this folder"));
     search.set_visible(false);
     search.connect_search_changed({
         let ctx = ctx.clone();
         move |entry| {
+            if !entry.get_visible() {
+                return;
+            }
             let text = entry.text().to_string();
             let filtered = {
                 let state = ctx.shared.state.borrow();
                 filter(state.base(), &text)
             };
-            ctx.shared.state.borrow_mut().query = text;
+            ctx.shared.state.borrow_mut().query = text.clone();
             if let Some(view) = ctx.view.upgrade() {
                 view.set_entries(filtered.clone());
+                if filtered.is_empty() && !text.is_empty() {
+                    view.set_status(Some("No matches. Clear the search to show all items."));
+                }
             }
             let current = ctx.shared.state.borrow().current.clone();
             if let Some(location) = current {
@@ -2421,6 +2647,7 @@ fn folder_filter(ctx: &Ctx) -> gtk::SearchEntry {
     search.connect_stop_search({
         let ctx = ctx.clone();
         move |entry| {
+            entry.set_text("");
             entry.set_visible(false);
             let shown = ctx.shared.state.borrow().base().to_vec();
             ctx.shared.state.borrow_mut().query.clear();
@@ -2438,7 +2665,7 @@ fn folder_filter(ctx: &Ctx) -> gtk::SearchEntry {
 
 /// The primary menu. The three modes are one action with a string parameter so
 /// GTK can draw a radio group without three separate actions.
-fn menu() -> gio::Menu {
+fn menu(ctx: &Ctx) -> gio::Menu {
     let menu = gio::Menu::new();
     let view = gio::Menu::new();
     for mode in [ViewMode::Grid, ViewMode::List, ViewMode::Columns] {
@@ -2462,6 +2689,8 @@ fn menu() -> gio::Menu {
     // list, not the middle. Disabled until there is something to undo, so the row
     // is honest about a folder nothing has touched yet.
     files.append(Some("Undo"), Some("win.undo"));
+    files.append(Some("Restore from Trash"), Some("win.restore-trash"));
+    files.append(Some("Empty Trash…"), Some("win.empty-trash"));
     // First among the commands that act on a row, because it is the one a user
     // reaches for before anything else: the folder opened by double-click and the
     // default handler disagree, or there is no default handler, and this is where
@@ -2470,15 +2699,23 @@ fn menu() -> gio::Menu {
     // row", and a second name for one command is a chord wasted.
     files.append(Some("Open With\u{2026}"), Some("win.open-with"));
     files.append(Some("New Folder"), Some("win.new-folder"));
-    // One row for both directions of the toggle, which is what a menu built once
-    // can offer: the label cannot follow the selection, because the model is
-    // built before there is one. The context menu has the rows on hand and says
-    // "Star" or "Unstar" properly — see [`popup::Command`].
-    files.append(Some("Star"), Some("win.star"));
-    // The same compromise one row down: the header menu cannot know which way the
-    // toggle goes, so it names the direction that adds. The context menu and
-    // <kbd>Ctrl</kbd>D do not have the problem — the folder is known by then.
-    files.append(Some("Bookmark This Folder"), Some("win.bookmark"));
+    // Rebuilt when opened, so the labels describe the current selection.
+    files.append(
+        Some(if all_starred(&targets(ctx)) {
+            "Unstar"
+        } else {
+            "Star"
+        }),
+        Some("win.star"),
+    );
+    files.append(
+        Some(if current_bookmarked(ctx) {
+            "Remove Folder Bookmark"
+        } else {
+            "Bookmark This Folder"
+        }),
+        Some("win.bookmark"),
+    );
     files.append(Some("Rename"), Some("win.rename"));
     files.append(Some("Move to Trash"), Some("win.trash"));
     files.append(Some("Delete Permanently"), Some("win.delete"));
@@ -2496,11 +2733,22 @@ fn menu() -> gio::Menu {
     let network = gio::Menu::new();
     network.append(Some("Connect to Server…"), Some("win.connect"));
     let window = gio::Menu::new();
-    window.append(Some("Search this folder"), Some("win.search"));
+    window.append(Some("Filter names in this folder"), Some("win.search"));
     window.append(Some("Search files and apps"), Some("win.find"));
     window.append(Some("New window"), Some("win.new-window"));
-    menu.append_section(None, &view);
-    menu.append_section(None, &files);
+    let sorting = gio::Menu::new();
+    for (label, value) in [
+        ("Name", "name"),
+        ("Size", "size"),
+        ("Type", "type"),
+        ("Date modified", "modified"),
+        ("Reverse order", "reverse"),
+    ] {
+        sorting.append(Some(label), Some(&format!("win.sort('{value}')")));
+    }
+    view.append_submenu(Some("Sort By"), &sorting);
+    menu.append_submenu(Some("View"), &view);
+    menu.append_submenu(Some("File Actions"), &files);
     menu.append_section(None, &show);
     menu.append_section(None, &network);
     menu.append_section(None, &window);
@@ -3103,6 +3351,126 @@ fn nav_actions(ctx: &Ctx) -> Vec<Rc<gio::SimpleAction>> {
 /// is in [`mode_action`] and the two search commands in [`search_actions`].
 fn view_actions(app: &gtk::Application, ctx: &Ctx) -> Vec<Rc<gio::SimpleAction>> {
     let mut actions = vec![mode_action(ctx)];
+    let drop_files = gio::SimpleAction::new(
+        "drop-files",
+        Some(glib::VariantTy::new("(sasb)").expect("drop argument type")),
+    );
+    drop_files.connect_activate({
+        let ctx = ctx.clone();
+        move |_, value| {
+            let Some((destination, uris, moving)) =
+                value.and_then(|value| value.get::<(String, Vec<String>, bool)>())
+            else {
+                return;
+            };
+            let folder = if destination.is_empty() {
+                target_folder(&ctx)
+            } else {
+                Location::parse(&destination).ok().filter(Location::is_real)
+            };
+            let (Some(folder), Some(window), Some(handle)) =
+                (folder, ctx.window.upgrade(), ctx.handle.borrow().clone())
+            else {
+                return;
+            };
+            let readers = ctx.shared.readers.clone();
+            let ctx = ctx.clone();
+            glib::spawn_future_local(async move {
+                let entries = gio::spawn_blocking(move || {
+                    uris.iter()
+                        .map(|uri| {
+                            let file = gio::File::for_uri(uri);
+                            let path = file.path().ok_or_else(|| {
+                                "Only local files and mounted shares can be dropped.".to_string()
+                            })?;
+                            readers
+                                .metadata(&Location::file(path))
+                                .map_err(|error| error.to_string())
+                        })
+                        .collect::<Result<Vec<_>, String>>()
+                })
+                .await;
+                match entries {
+                    Ok(Ok(entries)) => {
+                        let transfer = if moving {
+                            ops::Transfer::Move
+                        } else {
+                            ops::Transfer::Copy
+                        };
+                        let plan = ops::plan(&entries, &folder, transfer);
+                        glib::idle_add_local_once(move || {
+                            conflict::paste(&window, &handle, &ctx.jobs, plan, transfer)
+                        });
+                    }
+                    Ok(Err(message)) => show_banner(&ctx, &message),
+                    Err(_) => show_banner(&ctx, "Could not read the dropped files."),
+                }
+            });
+        }
+    });
+    actions.push(Rc::new(drop_files));
+
+    let restore = gio::SimpleAction::new("restore-trash", None);
+    restore.connect_activate({
+        let ctx = ctx.clone();
+        move |_, _| {
+            let Some(handle) = ctx.handle.borrow().clone() else {
+                return;
+            };
+            let picked = targets(&ctx);
+            ops::spawn_job(
+                &handle,
+                &ctx.jobs,
+                super::jobs::Kind::Undo,
+                "Restoring from Trash",
+                Some(picked.len() as u64),
+                super::jobs::Unit::Rows,
+                move |brake, reporter| {
+                    let rows = picked
+                        .iter()
+                        .filter_map(|entry| trash::find(&entry.location))
+                        .map(|item| undo::Trashed {
+                            home: Location::file(item.original),
+                            entry: Some(item.stored),
+                        })
+                        .collect();
+                    let record = undo::Record {
+                        effect: undo::Effect::Trashed(rows),
+                        replaced: Vec::new(),
+                        stash: None,
+                    };
+                    let mut outcome = record.apply(brake, reporter);
+                    outcome.changed.push(Location::Virtual(VirtualDir::Trash));
+                    outcome
+                },
+            );
+        }
+    });
+    actions.push(Rc::new(restore));
+    actions.push(discard_action("empty-trash", true, ctx));
+    let sort = gio::SimpleAction::new("sort", Some(glib::VariantTy::STRING));
+    sort.connect_activate({
+        let ctx = ctx.clone();
+        move |_, parameter| {
+            let Some(field) = parameter.and_then(|value| value.get::<String>()) else {
+                return;
+            };
+            let Some(view) = ctx.view.upgrade() else {
+                return;
+            };
+            let mut key = view.sort_key();
+            match field.as_str() {
+                "name" => key.field = SortField::Name,
+                "size" => key.field = SortField::Size,
+                "type" => key.field = SortField::Kind,
+                "modified" => key.field = SortField::Modified,
+                "reverse" => key.descending = !key.descending,
+                _ => return,
+            }
+            resort(&ctx, key);
+        }
+    });
+    actions.push(Rc::new(sort));
     actions.extend(search_actions(ctx));
 
     let hidden = gio::SimpleAction::new_stateful(
@@ -3280,12 +3648,24 @@ fn search_actions(ctx: &Ctx) -> Vec<Rc<gio::SimpleAction>> {
         move |_action, _parameter| {
             ctx.find.show_here();
             if let Some(entry) = ctx.search.borrow().as_ref() {
-                entry.set_visible(false);
+                if entry.get_visible() {
+                    entry.emit_by_name::<()>("stop-search", &[]);
+                }
             }
         }
     });
 
-    vec![Rc::new(filter), Rc::new(find)]
+    let clear = gio::SimpleAction::new("clear-search", None);
+    clear.connect_activate({
+        let ctx = ctx.clone();
+        move |_, _| {
+            ctx.find.clear();
+            if let Some(entry) = ctx.search.borrow().as_ref() {
+                entry.emit_by_name::<()>("stop-search", &[]);
+            }
+        }
+    });
+    vec![Rc::new(filter), Rc::new(find), Rc::new(clear)]
 }
 
 /// The file operations: create, rename, throw away, and move between folders.
@@ -3325,17 +3705,23 @@ fn op_actions(ctx: &Ctx) -> Vec<Rc<gio::SimpleAction>> {
             let Some(folder) = target_folder(&ctx) else {
                 return;
             };
-            // The plan is built while the state is borrowed, and the worker takes
-            // it by value: nothing about the operation depends on the clipboard
-            // afterwards, which is what lets one cut feed two folders.
-            let (plan, transfer) = {
-                let state = ctx.shared.state.borrow();
-                (state.clipboard.plan(&folder), state.clipboard.transfer())
-            };
-            // Not `ops::paste`: a plan that ran into a name the folder already
-            // has has to ask before it writes anything, and the window is the
-            // only thing here that can show the question.
-            conflict::paste(&window, &handle, &ctx.jobs, plan, transfer);
+            let clipboard = window.clipboard();
+            let readers = ctx.shared.readers.clone();
+            let ctx = ctx.clone();
+            glib::spawn_future_local(async move {
+                match clipboard::read(clipboard, readers).await {
+                    Ok((entries, transfer)) => {
+                        let plan = ops::plan(&entries, &folder, transfer);
+                        // The conflict chooser runs a nested main loop. Dispatch it
+                        // after the clipboard future has returned to avoid polling
+                        // the same GLib future recursively while a dialog is open.
+                        glib::idle_add_local_once(move || {
+                            conflict::paste(&window, &handle, &ctx.jobs, plan, transfer);
+                        });
+                    }
+                    Err(message) => show_banner(&ctx, &message),
+                }
+            });
         }
     });
 
@@ -3358,6 +3744,15 @@ fn op_actions(ctx: &Ctx) -> Vec<Rc<gio::SimpleAction>> {
     // there a job to stop?" changes while the window sits still, because a worker
     // finishes whenever it finishes. See [`cancel_action`].
     let cancel = cancel_action(ctx);
+    let cancel_job = gio::SimpleAction::new("cancel-job", Some(glib::VariantTy::UINT64));
+    cancel_job.connect_activate({
+        let jobs = ctx.jobs.clone();
+        move |_, value| {
+            if let Some(id) = value.and_then(|value| value.get::<u64>()) {
+                jobs.pull(id);
+            }
+        }
+    });
     // The same treatment for the same reason: an operation becomes available to
     // undo when its worker reports, and stops being available when it is spent.
     // See [`undo_action`].
@@ -3583,7 +3978,49 @@ fn extract_target(ctx: &Ctx) -> Option<Location> {
 /// rather than on the folder or the clipboard. Both are synced from navigation
 /// and from every change of selection, which is the only moment their answer can
 /// change without a navigation.
+fn in_trash(ctx: &Ctx) -> bool {
+    ctx.shared
+        .state
+        .borrow()
+        .current
+        .as_ref()
+        .is_some_and(|location| location.virtual_dir() == Some(VirtualDir::Trash))
+}
+
 fn sync_ops(ctx: &Ctx) {
+    if let Some(window) = ctx.window.upgrade() {
+        let in_trash = ctx
+            .shared
+            .state
+            .borrow()
+            .current
+            .as_ref()
+            .is_some_and(|here| here.virtual_dir() == Some(VirtualDir::Trash));
+        let picked = targets(ctx);
+        let local_selection =
+            !picked.is_empty() && picked.iter().all(|entry| entry.location.is_real());
+        enable(&window, "restore-trash", in_trash && !picked.is_empty());
+        enable(
+            &window,
+            "empty-trash",
+            in_trash && !ctx.shared.state.borrow().shown.is_empty(),
+        );
+        enable(
+            &window,
+            "rename",
+            !in_trash && local_selection && picked.len() == 1,
+        );
+        enable(&window, "trash", !in_trash && local_selection);
+        enable(&window, "delete", local_selection);
+        enable(&window, "cut", !in_trash && local_selection);
+        enable(&window, "copy", local_selection);
+        enable(
+            &window,
+            "new-folder",
+            !in_trash && target_folder(ctx).is_some(),
+        );
+        enable(&window, "drop-files", !in_trash);
+    }
     sync_extract(ctx);
     sync_open_with(ctx);
     sync_properties(ctx);
@@ -3831,7 +4268,7 @@ fn sync_star(ctx: &Ctx) {
     let Some(window) = ctx.window.upgrade() else {
         return;
     };
-    enable(&window, "star", !targets(ctx).is_empty());
+    enable(&window, "star", !targets(ctx).is_empty() && !in_trash(ctx));
 }
 
 /// The Computer overview has no selected file to inspect; other views can show
@@ -3875,7 +4312,11 @@ fn sync_open_with(ctx: &Ctx) {
     let Some(window) = ctx.window.upgrade() else {
         return;
     };
-    enable(&window, "open-with", open_with_target(ctx).is_some());
+    enable(
+        &window,
+        "open-with",
+        open_with_target(ctx).is_some() && !in_trash(ctx),
+    );
 }
 
 /// Enable or disable extract to match the row under the keyboard. The one file
@@ -3885,7 +4326,11 @@ fn sync_extract(ctx: &Ctx) {
     let Some(window) = ctx.window.upgrade() else {
         return;
     };
-    enable(&window, "extract", extract_target(ctx).is_some());
+    enable(
+        &window,
+        "extract",
+        extract_target(ctx).is_some() && !in_trash(ctx),
+    );
 }
 
 /// Enable or disable properties: exactly one row, whatever it is. Every row has
@@ -3908,11 +4353,35 @@ fn discard_action(name: &'static str, permanent: bool, ctx: &Ctx) -> Rc<gio::Sim
             let Some(handle) = ctx.handle.borrow().clone() else {
                 return;
             };
-            let picked = targets(&ctx);
+            let picked = if name == "empty-trash" {
+                ctx.shared.state.borrow().shown.clone()
+            } else {
+                targets(&ctx)
+            };
             if picked.is_empty() {
                 return;
             }
-            ops::discard(&handle, &ctx.jobs, &picked, permanent);
+            if permanent {
+                let Some(parent) = ctx.window.upgrade() else {
+                    return;
+                };
+                let dialog = gtk::AlertDialog::builder()
+                    .modal(true)
+                    .message(format!("Permanently delete {} item(s)?", picked.len()))
+                    .detail("These items cannot be recovered from Trash.")
+                    .buttons(["Cancel", "Delete Permanently"])
+                    .cancel_button(0)
+                    .default_button(0)
+                    .build();
+                let jobs = ctx.jobs.clone();
+                dialog.choose(Some(&parent), None::<&gio::Cancellable>, move |response| {
+                    if response == Ok(1) {
+                        ops::discard(&handle, &jobs, &picked, true);
+                    }
+                });
+            } else {
+                ops::discard(&handle, &ctx.jobs, &picked, false);
+            }
         }
     });
     Rc::new(action)
@@ -3933,11 +4402,11 @@ fn pickup_action(name: &'static str, transfer: ops::Transfer, ctx: &Ctx) -> Rc<g
             if picked.is_empty() {
                 return;
             }
-            ctx.shared
-                .state
-                .borrow_mut()
-                .clipboard
-                .set(&picked, transfer);
+            if let Some(window) = ctx.window.upgrade() {
+                if let Err(error) = clipboard::publish(&window.clipboard(), &picked, transfer) {
+                    show_banner(&ctx, &format!("Could not copy files: {error}"));
+                }
+            }
             sync_paste(&ctx);
         }
     });
@@ -3958,8 +4427,16 @@ fn sync_paste(ctx: &Ctx) {
 /// real folder to put it in. One answer for the action's sensitivity and for
 /// whether the context menu offers the row at all.
 fn can_paste(ctx: &Ctx) -> bool {
-    let state = ctx.shared.state.borrow();
-    !state.clipboard.is_empty() && state.current.as_ref().is_some_and(Location::is_real)
+    ctx.shared
+        .state
+        .borrow()
+        .current
+        .as_ref()
+        .is_some_and(Location::is_real)
+        && ctx
+            .window
+            .upgrade()
+            .is_some_and(|window| clipboard::available(&window.clipboard()))
 }
 
 /// The two commands the context menu needs that nothing else had reason to have.
@@ -4096,7 +4573,8 @@ fn install_accels(app: &gtk::Application) {
     app.set_accels_for_action("win.close", &["<Ctrl>W"]);
     app.set_accels_for_action("win.hidden", &["<Ctrl>H"]);
     app.set_accels_for_action("win.location", &["<Ctrl>L"]);
-    app.set_accels_for_action("win.find", &["<Ctrl>F", "<Ctrl><Shift>F"]);
+    app.set_accels_for_action("win.search", &["<Ctrl>F"]);
+    app.set_accels_for_action("win.find", &["<Ctrl><Shift>F"]);
     // The star. `<Ctrl>T` rather than a letter with a tradition elsewhere: `T` is
     // the initial of the only word the command has, and the chord is free.
     app.set_accels_for_action("win.star", &["<Ctrl>T"]);
@@ -4247,7 +4725,7 @@ fn update_crumbs(ctx: &Ctx, location: &Location) {
 
 /// The error strip. A banner rather than a dialog because a failed folder is
 /// normal: a disconnected share, a container another program is writing.
-fn banner_bar() -> (gtk::Box, gtk::Label) {
+fn banner_bar() -> (gtk::Box, gtk::Label, gtk::Button) {
     let box_ = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     box_.add_css_class("ufm-banner");
     box_.set_visible(false);
@@ -4266,8 +4744,13 @@ fn banner_bar() -> (gtk::Box, gtk::Label) {
     }
     box_.append(&image);
     box_.append(&label);
+    let undo = gtk::Button::with_label("Undo");
+    undo.set_action_name(Some("win.undo"));
+    undo.set_visible(false);
+    box_.append(&undo);
+    close.set_tooltip_text(Some("Dismiss message"));
     box_.append(&close);
-    (box_, label)
+    (box_, label, undo)
 }
 
 /// The status bar: the view's own item count, the only number that can agree
@@ -4308,6 +4791,27 @@ mod tests {
             child_count: None,
             icon_key: "text/plain".to_string(),
         }
+    }
+
+    #[test]
+    fn hidden_filter_does_not_replace_collection_status() {
+        super::super::tk::ui(|| {
+            with_navigation_window(|ctx, view| {
+                navigate(ctx, Location::computer(), true);
+                let before = view.status_label().text();
+                let filter = ctx.search.borrow().as_ref().unwrap().clone();
+                assert!(!filter.get_visible());
+                filter.emit_by_name::<()>("search-changed", &[]);
+                assert_eq!(view.status_label().text(), before);
+                filter.set_visible(true);
+                filter.set_text("query");
+                filter.emit_by_name::<()>("search-changed", &[]);
+                let window = ctx.window.upgrade().unwrap();
+                gio::prelude::ActionGroupExt::activate_action(&window, "location", None);
+                assert!(!filter.get_visible());
+                assert!(ctx.shared.state.borrow().query.is_empty());
+            })
+        });
     }
 
     fn with_navigation_window(body: impl FnOnce(&Ctx, &View)) {

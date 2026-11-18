@@ -824,19 +824,11 @@ pub(crate) fn remove_all(file: &gio::File, brake: &Brake) -> Result<(), glib::Er
     file.delete(Some(brake.gio()))
 }
 
-/// Throw one row away, preferring the trash.
-///
-/// A filesystem with no trash directory answers `g_file_trash` with
-/// `NotSupported`. That is not a failure to report — the row is gone either way —
-/// so it is deleted instead and the difference shows up in the count the banner
-/// reports.
+/// Move a row to trash. Failure must never imply permission to delete it.
 fn discard_one(file: &gio::File, brake: &Brake) -> Result<Gone, String> {
-    match file.trash(Some(brake.gio())) {
-        Ok(()) => Ok(Gone::Trashed),
-        Err(trash_error) => remove_all(file, brake)
-            .map(|()| Gone::Deleted)
-            .map_err(|error| format!("{trash_error}: {error}")),
-    }
+    file.trash(Some(brake.gio()))
+        .map(|()| Gone::Trashed)
+        .map_err(|error| format!("Could not move to Trash; the item was left in place: {error}"))
 }
 
 /// Hand work to a worker and report its outcome through the queue.
@@ -912,6 +904,15 @@ pub fn discard(handle: &Handle, jobs: &Jobs, entries: &[Entry], permanent: bool)
         total,
         Unit::Rows,
         move |brake, reporter| {
+            let trash_items = if permanent
+                && picked
+                    .iter()
+                    .any(|entry| super::trash::is_stored(&entry.location))
+            {
+                super::trash::items(brake.vfs())
+            } else {
+                Vec::new()
+            };
             let mut trashed = 0_usize;
             let mut deleted = 0_usize;
             let mut failures: Vec<String> = Vec::new();
@@ -942,6 +943,12 @@ pub fn discard(handle: &Handle, jobs: &Jobs, entries: &[Entry], permanent: bool)
                     }
                     Ok(Gone::Deleted) => {
                         deleted += 1;
+                        if let Some(item) = trash_items
+                            .iter()
+                            .find(|item| item.stored == entry.location)
+                        {
+                            let _ = std::fs::remove_file(&item.info);
+                        }
                         // The rows that went to the trash are left out of this
                         // list on purpose: a trashed row comes back under undo,
                         // and a star list that forgets a row the user can still
@@ -1432,6 +1439,10 @@ fn compose(
 
     let entry = gtk::Entry::new();
     entry.set_widget_name("ufm-prompt-text");
+    hint_label.set_mnemonic_widget(Some(&entry));
+    entry.update_relation(&[gtk::accessible::Relation::LabelledBy(&[
+        hint_label.upcast_ref()
+    ])]);
     entry.set_text(initial);
     entry.set_activates_default(true);
     entry.set_width_chars(36);
@@ -1843,18 +1854,20 @@ mod tests {
     }
 
     #[test]
-    fn a_row_is_thrown_whichever_way_the_filesystem_allows() {
-        let root = tempfile::tempdir().expect("a folder to throw from");
+    fn trash_failure_leaves_the_source_intact() {
+        let root = tempfile::tempdir().expect("a source folder");
         tree(root.path());
-        let dir = gio::File::for_path(root.path().join("deep"));
-        // Whether this filesystem has a trash directory depends on where the
-        // temporary folder is; either answer is a success, and the row must be
-        // gone for both.
-        discard_one(&dir, &Brake::new()).expect("a folder should be discardable");
-        assert!(!root.path().join("deep").exists());
-        let plain = gio::File::for_path(root.path().join("notes.txt"));
-        discard_one(&plain, &Brake::new()).expect("a file should be discardable");
-        assert!(!root.path().join("notes.txt").exists());
+        for name in ["deep", "notes.txt"] {
+            let path = root.path().join(name);
+            match discard_one(&gio::File::for_path(&path), &Brake::new()) {
+                Ok(Gone::Trashed) => assert!(!path.exists()),
+                Ok(Gone::Deleted) => panic!("Trash must never permanently delete"),
+                Err(message) => {
+                    assert!(path.exists(), "a failed trash must leave the source intact");
+                    assert!(message.contains("left in place"));
+                }
+            }
+        }
     }
 
     #[test]

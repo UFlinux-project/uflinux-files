@@ -32,7 +32,8 @@ pub struct FsHints {
 }
 
 /// Filesystems that have a real `.Trash-$UID` we can create. Anything else,
-/// including FUSE mounts whose owner is unknown, deletes permanently.
+/// including FUSE mounts whose owner is unknown, may refuse trashing. Such a refusal
+/// must leave the source intact; permanent deletion is a separate operation.
 const TRASH_TYPES: &[&str] = &[
     "ext2", "ext3", "ext4", "btrfs", "xfs", "f2fs", "jfs", "reiserfs", "tmpfs",
 ];

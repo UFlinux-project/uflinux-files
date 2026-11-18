@@ -533,8 +533,8 @@ locally. `g_file_copy` refuses a directory, so copying a folder walks it and
 rebuilds it, recreating each directory before filling it so an interrupted copy
 leaves a partial tree rather than a flat one. `g_file_delete` refuses a non-empty
 one, so deleting a folder recurses first. Trash is tried before deleting, and a
-filesystem that has no trash falls back to deleting rather than reporting a
-failure for something the user asked to be removed.
+filesystem that has no trash reports a failure and leaves the source intact.
+Only explicitly confirmed permanent deletion bypasses Trash.
 
 Naming is decided before anything touches the disk. A paste builds a plan — a
 list of `(from, to)` pairs plus a reason for each row it dropped — and the

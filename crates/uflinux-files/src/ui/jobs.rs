@@ -275,6 +275,8 @@ struct Strip {
     root: gtk::Box,
     label: gtk::Label,
     bar: gtk::ProgressBar,
+    details: gtk::Box,
+    rows: RefCell<std::collections::HashMap<u64, (gtk::Box, gtk::Label, gtk::ProgressBar)>>,
 }
 
 /// What the table can answer about itself at the moment something changed: is
@@ -355,14 +357,48 @@ impl Jobs {
         let bar = gtk::ProgressBar::new();
         bar.add_css_class("ufm-usage");
         bar.set_size_request(120, -1);
-        let cancel = gtk::Button::with_label("Cancel");
+        let cancel = gtk::Button::with_label("Cancel All");
         cancel.set_valign(gtk::Align::Center);
         cancel.set_action_name(Some("win.cancel"));
         root.append(&label);
         root.append(&bar);
+        glib::timeout_add_local(Duration::from_millis(100), {
+            let bar = bar.downgrade();
+            move || {
+                let Some(bar) = bar.upgrade() else {
+                    return glib::ControlFlow::Break;
+                };
+                if bar.is_mapped() && !bar.shows_text() {
+                    bar.pulse();
+                }
+                glib::ControlFlow::Continue
+            }
+        });
         root.append(&cancel);
+        let details = gtk::Box::new(gtk::Orientation::Vertical, 8);
+        details.set_margin_top(8);
+        details.set_margin_bottom(8);
+        details.set_margin_start(8);
+        details.set_margin_end(8);
+        let scroll = gtk::ScrolledWindow::new();
+        scroll.set_max_content_height(320);
+        scroll.set_propagate_natural_height(true);
+        scroll.set_child(Some(&details));
+        let popover = gtk::Popover::new();
+        popover.set_child(Some(&scroll));
+        let button = gtk::MenuButton::builder()
+            .label("Operations")
+            .popover(&popover)
+            .build();
+        root.append(&button);
         parent.append(&root);
-        *self.strip.borrow_mut() = Some(Strip { root, label, bar });
+        *self.strip.borrow_mut() = Some(Strip {
+            root,
+            label,
+            bar,
+            details,
+            rows: RefCell::new(std::collections::HashMap::new()),
+        });
         self.paint();
     }
 
@@ -436,6 +472,14 @@ impl Jobs {
     /// honest about its name: one button stops everything this window started,
     /// because a strip that shows one job while another runs behind it would
     /// have to say which one the button means.
+    pub fn pull(&self, id: u64) {
+        for job in self.runs.borrow().iter().filter(|job| job.id.0 == id) {
+            for brake in &job.brakes {
+                brake.pull();
+            }
+        }
+    }
+
     pub fn pull_all(&self) {
         for job in self.runs.borrow().iter() {
             for brake in &job.brakes {
@@ -531,11 +575,52 @@ impl Jobs {
     fn paint(&self) {
         let runs = self.runs.borrow();
         if let (Some(strip), Some(job)) = (self.strip.borrow().as_ref(), runs.first()) {
-            strip.label.set_label(&job.label());
+            strip.label.set_label(&if runs.len() > 1 {
+                format!("{} · {} operations running", job.label(), runs.len())
+            } else {
+                job.label()
+            });
             strip.bar.set_fraction(job.fraction());
             let tally = job.tally();
             strip.bar.set_text(tally.as_deref());
             strip.bar.set_show_text(tally.is_some());
+        }
+        if let Some(strip) = self.strip.borrow().as_ref() {
+            let mut rows = strip.rows.borrow_mut();
+            rows.retain(|id, (row, _, _)| {
+                let keep = runs.iter().any(|job| job.id.0 == *id);
+                if !keep {
+                    strip.details.remove(row);
+                }
+                keep
+            });
+            for job in runs.iter() {
+                let (_, label, bar) = rows.entry(job.id.0).or_insert_with(|| {
+                    let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+                    let label = gtk::Label::new(None);
+                    label.set_max_width_chars(40);
+                    label.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
+                    label.set_hexpand(true);
+                    let bar = gtk::ProgressBar::new();
+                    bar.set_width_request(100);
+                    let cancel = gtk::Button::with_label("Cancel");
+                    cancel.set_action_name(Some("win.cancel-job"));
+                    cancel.set_action_target_value(Some(&job.id.0.to_variant()));
+                    row.append(&label);
+                    row.append(&bar);
+                    row.append(&cancel);
+                    strip.details.append(&row);
+                    (row, label, bar)
+                });
+                label.set_text(&job.label());
+                if job.total.is_some() {
+                    bar.set_fraction(job.fraction());
+                } else {
+                    bar.pulse();
+                }
+                bar.set_text(job.tally().as_deref());
+                bar.set_show_text(job.total.is_some());
+            }
         }
         let status = Status {
             running: !runs.is_empty(),
@@ -582,6 +667,18 @@ mod tests {
         let parent = gtk::Box::new(gtk::Orientation::Vertical, 0);
         jobs.install(&parent);
         (jobs, parent)
+    }
+
+    #[test]
+    fn cancelling_one_job_leaves_the_other_running() {
+        let jobs = Jobs::new();
+        let (first, brake) = jobs.begin(Kind::Copy, "first", None, Unit::Rows);
+        jobs.add_brake(first, &brake);
+        let (second, other) = jobs.begin(Kind::Copy, "second", None, Unit::Rows);
+        jobs.add_brake(second, &other);
+        jobs.pull(first.0);
+        assert!(brake.pulled());
+        assert!(!other.pulled());
     }
 
     #[test]

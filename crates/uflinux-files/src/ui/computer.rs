@@ -693,7 +693,7 @@ mod tests {
     #[test]
     fn the_three_local_places_are_always_there() {
         let _guard = env();
-        unset_env("UFLINUX_FILES_DESKTOP_DIR");
+        set_env("UFLINUX_FILES_DESKTOP_DIR", "/nonexistent/ufm-test-desktop");
         let cards = cards(Vec::<&MountRecord>::new(), |_| MountState::Mounted, empty);
         // Home first, the system drive next, and nothing else: a machine with no
         // shares still has a My Computer view worth showing.
@@ -715,7 +715,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let with = cards(Vec::<&MountRecord>::new(), |_| MountState::Mounted, empty);
         std::fs::remove_dir_all(&dir).unwrap();
-        unset_env("UFLINUX_FILES_DESKTOP_DIR");
+        set_env("UFLINUX_FILES_DESKTOP_DIR", "/nonexistent/ufm-test-desktop");
         assert_eq!(labels(&without), ["Home", "System"]);
         // Between Home and System, which is where the sidebar keeps it too.
         assert_eq!(labels(&with), ["Home", "Desktop", "System"]);
@@ -725,7 +725,7 @@ mod tests {
     #[test]
     fn a_connected_share_says_so_and_opens() {
         let _guard = env();
-        unset_env("UFLINUX_FILES_DESKTOP_DIR");
+        set_env("UFLINUX_FILES_DESKTOP_DIR", "/nonexistent/ufm-test-desktop");
         let record = record("smb://nas/filmy", "/run/user/1000/ufm");
         let cards = cards(vec![&record], |_| MountState::Mounted, full);
         assert_eq!(labels(&cards), ["Home", "System", "filmy"]);
@@ -753,7 +753,7 @@ mod tests {
     #[test]
     fn a_share_the_kernel_lost_is_listed_but_not_walked_into() {
         let _guard = env();
-        unset_env("UFLINUX_FILES_DESKTOP_DIR");
+        set_env("UFLINUX_FILES_DESKTOP_DIR", "/nonexistent/ufm-test-desktop");
         let record = record("nfs://host/export", "/m");
         let cards = cards(vec![&record], |_| MountState::Stale, empty);
         let card = &cards[2];
@@ -772,7 +772,7 @@ mod tests {
     #[test]
     fn each_protocol_picks_its_own_icon() {
         let _guard = env();
-        unset_env("UFLINUX_FILES_DESKTOP_DIR");
+        set_env("UFLINUX_FILES_DESKTOP_DIR", "/nonexistent/ufm-test-desktop");
         let records = vec![
             record("sftp://host/home", "/m"),
             record("webdav://host/dav", "/m"),
@@ -789,7 +789,7 @@ mod tests {
     #[test]
     fn a_share_label_beats_the_last_path_component() {
         let _guard = env();
-        unset_env("UFLINUX_FILES_DESKTOP_DIR");
+        set_env("UFLINUX_FILES_DESKTOP_DIR", "/nonexistent/ufm-test-desktop");
         let records = vec![record("smb://nas/filmy?label=Filmy%202024", "/m")];
         let cards = cards(&records, |_| MountState::Mounted, empty);
         assert_eq!(labels(&cards)[2], "Filmy 2024");
@@ -798,7 +798,7 @@ mod tests {
     #[test]
     fn a_filesystem_with_no_size_gets_no_bar() {
         let _guard = env();
-        unset_env("UFLINUX_FILES_DESKTOP_DIR");
+        set_env("UFLINUX_FILES_DESKTOP_DIR", "/nonexistent/ufm-test-desktop");
         let cards = cards(Vec::<&MountRecord>::new(), |_| MountState::Mounted, empty);
         assert_eq!(cards[0].fraction, None);
         // The path is the only honest thing left to say under the name.

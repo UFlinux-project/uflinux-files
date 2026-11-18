@@ -40,6 +40,15 @@ the model over D-Bus and never opens a window.
   `starred://` is assembled from it, most recent first. A star whose folder is
   deleted goes with it; one whose share is simply unmounted is listed as
   unavailable rather than dropped.
+- **Trash and Restore**: `trash://` shows deleted items from the home trash and
+  supported trash folders on mounted volumes. Restore recreates missing parent
+  folders and keeps an existing original by choosing a numbered name. Empty Trash
+  and permanent deletion require confirmation. A failed Move to Trash leaves the
+  source intact.
+- **Desktop clipboard and drops**: file copy/cut uses the desktop clipboard, so it
+  works across windows and compatible file applications. Cut items are marked and
+  completed moves clear their pending clipboard entries. Drag files onto a folder,
+  the listing background, or a sidebar folder to copy; hold Shift to move.
 - **Sidebar bookmarks**: `<Ctrl>D` puts the folder the window is standing in in the
   sidebar, and takes it out again if it is already there. Bookmarks are spliced into
   the Folders group rather than listed below the system rows, so the sidebar says
@@ -121,7 +130,7 @@ the model over D-Bus and never opens a window.
 - **Progress you can watch and stop**: a copy, move, delete or extract puts a strip
   above the listing naming the item it is on and how far along it is — bytes when every
   source reported a size, rows when one did not — and reports at most ten times a
-  second however many files are moving. One `Cancel` stops everything running, in the
+  second however many files are moving. The Operations menu offers a Cancel button for each job, while `Cancel All` stops everything running, in the
   middle of a `GIO` call and in the middle of an archive alike, and a cancelled extract
   leaves no half-built folder behind.
 
@@ -238,5 +247,6 @@ when available. Supported unencrypted USB volumes mount automatically while File
 is running, including volumes present at startup, without replacing the current
 folder. Failed or cancelled attempts can be retried by clicking the volume.
 Mount support requires the `uflinux-files-mount-helper` package, installed with
-Files. Operation results use desktop notifications; progress and Cancel stay in
-the window.
+Files. Operation results appear in the window and are also sent as desktop notifications.
+Progress, individual cancellation, and Cancel All stay in the window. Indexed
+search offers Load More for further results while keeping breadcrumbs visible.

@@ -262,3 +262,10 @@ fn serde_uses_the_uri_form() {
     assert_eq!(serde_json::from_str::<Location>(&json).unwrap(), loc);
     assert!(serde_json::from_str::<Location>("\"smb://h/s\"").is_err());
 }
+
+#[test]
+fn trash_location_round_trips() {
+    let location = Location::Virtual(VirtualDir::Trash);
+    assert_eq!(parse("trash://"), location);
+    assert_eq!(location.to_string(), "trash://");
+}

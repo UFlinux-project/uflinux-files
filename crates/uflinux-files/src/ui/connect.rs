@@ -12,10 +12,8 @@
 //! queue (see [`super::job`]), the same pipe that carries directory listings,
 //! because a worker cannot touch a widget and no widget is `Send`.
 //!
-//! The dialog closes as soon as it has handed the mount over. A share that takes
-//! a while to connect should not hold a modal window in front of the folder the
-//! user might want to work in meanwhile; the window's banner reports the
-//! outcome, and the sidebar grows a row when it succeeds.
+//! The dialog remains open while a mount is pending, prevents duplicate attempts,
+//! and retains connection details when the worker reports a failure.
 
 use std::thread;
 
@@ -223,10 +221,11 @@ fn wire(form: &Form, handle: Option<Handle>) {
         let host = form.host.clone();
         let share = form.share.clone();
         let user = form.user.clone();
+        let password = form.password.clone();
         let tls = form.tls.clone();
         let remember = form.remember.clone();
         let status = form.status.clone();
-        move |_| {
+        move |button| {
             let Some(protocol) = selected(&protocols) else {
                 return;
             };
@@ -252,8 +251,41 @@ fn wire(form: &Form, handle: Option<Handle>) {
             // "Do not remember" is carried to the worker as a flag rather than
             // applied here: `Runner::mount` caches whatever it is handed, and a
             // password that failed to mount was never stored in the first place.
-            mount(handle, parsed.share, parsed.password, remember.is_active());
-            window.close();
+            let secret = if protocol.uses_password() && !password.text().is_empty() {
+                Some(Secret::from(password.text().to_string()))
+            } else {
+                parsed.password
+            };
+            password.set_text("");
+            let result = mount(handle, parsed.share, secret, remember.is_active());
+            button.set_sensitive(false);
+            status.set_text("Connecting…");
+            status.set_visible(true);
+            let window = window.downgrade();
+            let status = status.clone();
+            let button = button.clone();
+            glib::timeout_add_local(std::time::Duration::from_millis(100), move || {
+                let Some(window) = window.upgrade() else {
+                    return glib::ControlFlow::Break;
+                };
+                match result.try_recv() {
+                    Ok(report) => {
+                        button.set_sensitive(true);
+                        if report.ok {
+                            window.close();
+                        } else {
+                            status.set_text(&report.message);
+                        }
+                        glib::ControlFlow::Break
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        button.set_sensitive(true);
+                        status.set_text("The connection worker stopped. Try again.");
+                        glib::ControlFlow::Break
+                    }
+                }
+            });
         }
     });
 }
@@ -270,6 +302,21 @@ fn apply_protocol(
         return;
     };
     share.set_visible(true);
+    if let Some(grid) = password.parent().and_downcast::<gtk::Grid>() {
+        if let Some(label) = grid.child_at(0, 4) {
+            label.set_visible(protocol.uses_password());
+        }
+        if let Some(remember) = grid.child_at(1, 6) {
+            remember.set_visible(protocol.uses_password());
+        }
+        if let Some(label) = grid.child_at(0, 2).and_downcast::<gtk::Label>() {
+            label.set_text(if protocol == Protocol::Smb {
+                "Share"
+            } else {
+                "Path"
+            });
+        }
+    }
     password.set_visible(protocol.uses_password());
     tls.set_visible(protocol.supports_tls());
     share.set_placeholder_text(Some(if protocol == Protocol::Smb {
@@ -324,7 +371,13 @@ fn build_uri(protocol: Protocol, host: &str, share: &str, user: &str, tls: bool)
 /// window's lives behind the shared state's `RefCell`, and mounting mutates it
 /// anyway. What the two share is the file on disk, which is why the window
 /// re-reads it when the report arrives — see [`Runner::reload`].
-fn mount(handle: &Handle, share: Share, password: Option<Secret>, keep: bool) {
+fn mount(
+    handle: &Handle,
+    share: Share,
+    password: Option<Secret>,
+    keep: bool,
+) -> std::sync::mpsc::Receiver<Report> {
+    let (tx, rx) = std::sync::mpsc::channel();
     // Both ends of the message are needed on either path out of here: the worker
     // owns its copies, and the fallback below reports the share by name.
     let worker = handle.clone();
@@ -341,6 +394,7 @@ fn mount(handle: &Handle, share: Share, password: Option<Secret>, keep: bool) {
                 // for one entered in this dialog.
                 let _ = runner.forget(&share);
             }
+            let _ = tx.send(report.clone());
             worker.send(Event::Mounted { report });
         });
     if spawned.is_err() {
@@ -354,11 +408,17 @@ fn mount(handle: &Handle, share: Share, password: Option<Secret>, keep: bool) {
             },
         });
     }
+    rx
 }
 
 /// One labelled row of the form field.
 fn attach<W: IsA<gtk::Widget>>(grid: &gtk::Grid, row: i32, text: &str, widget: &W) {
-    grid.attach(&row_label(text), 0, row, 1, 1);
+    let label = row_label(text);
+    label.set_mnemonic_widget(Some(widget));
+    widget
+        .as_ref()
+        .update_relation(&[gtk::accessible::Relation::LabelledBy(&[label.upcast_ref()])]);
+    grid.attach(&label, 0, row, 1, 1);
     grid.attach(widget, 1, row, 1, 1);
 }
 

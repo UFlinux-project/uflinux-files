@@ -52,8 +52,12 @@ python3 -c 'import gi; gi.require_version("Atspi", "2.0")' 2>/dev/null || {
 # name attached to a running session. Re-exec under a private bus when there is none,
 # before anything is created: `dbus-run-session` sets its own `XDG_RUNTIME_DIR`, and the
 # one this script makes for the Wayland socket has to be the one that survives.
-if [ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ]; then
-    exec dbus-run-session "$0" "$BIN"
+if [ "${UFLINUX_FILES_UI_PRIVATE_BUS:-}" != 1 ]; then
+    UFM_TEST_CACHE_ROOT=$(mktemp -d)
+    trap 'rm -rf "$UFM_TEST_CACHE_ROOT"' EXIT INT TERM
+    UFLINUX_FILES_UI_PRIVATE_BUS=1 XDG_CACHE_HOME=$UFM_TEST_CACHE_ROOT \
+        dbus-run-session "$0" "$BIN"
+    exit "$?"
 fi
 
 ROOT=$(mktemp -d)
@@ -68,7 +72,8 @@ export XDG_RUNTIME_DIR
 WAYLAND_DISPLAY=wayland-0
 WLR_BACKENDS=headless
 WLR_RENDERER=pixman
-export WAYLAND_DISPLAY WLR_BACKENDS WLR_RENDERER
+GDK_BACKEND=wayland
+export WAYLAND_DISPLAY WLR_BACKENDS WLR_RENDERER GDK_BACKEND
 
 # A home of our own, so the sidebar and the indexer see a fixture rather than the
 # machine's real files. The tree under it is what the window is pointed at.
@@ -567,18 +572,17 @@ fi
 # reports the action enabled whether or not anything is selected: sensitivity cannot
 # be the assertion here, and the effect has to be.
 #
-# The second is that activating `paste` does not return while the prompt is open; the
-# prompt runs its own main-context loop, which is how a dialog used to work and what
-# keeps the rest of the interface repainting. So the activation is backgrounded and
-# the prompt is answered from here. The job's pid is kept rather than waiting for
-# every background job, because `labwc` and the application are background jobs too
-# and outlive this section.
+# Clipboard reading and paste preparation are asynchronous. Submit the action,
+# wait for its actual prompt, and then wait for the resulting operation separately.
+# The job pid belongs only to the activation call, not to the file operation.
 if SELECT_RESULT=$(python3 "$A11Y" select one 2>&1); then
     ok "a row can be selected through the accessibility tree"
 else
     fail "a row can be selected through the accessibility tree ($SELECT_RESULT)"
 fi
-act copy "[]" "[]"
+# Wayland clipboard ownership requires an input serial. Exercise Ctrl+C through
+# the compositor rather than synthesizing a copy action over D-Bus.
+wtype -s 100 -M ctrl -k c -m ctrl -s 100
 act up "[]" "[]"
 sleep 1
 # Skip first, so the tree the replace run then changes is still the untouched one.
@@ -598,12 +602,26 @@ if [ ! -e "$ROOT/tree/one/arrived.txt" ]; then
 else
     fail "answering Skip leaves the folder already there alone (it merged anyway)"
 fi
-refresh
+i=0
+while [ "$i" -lt 50 ]; do
+    refresh
+    printf '%s\n' "$DUMP" | grep -qF "$(printf 'frame\tReplace this folder?\t')" || break
+    i=$((i + 1))
+    sleep 0.1
+done
 if printf '%s\n' "$DUMP" | grep -qF "$(printf 'frame\tReplace this folder?\t')"; then
     fail "answering the collision prompt closes it"
 else
     ok "answering the collision prompt closes it"
 fi
+
+# Clipboard reads and paste preparation are asynchronous. Wait for the skipped
+# operation's result before submitting another paste into the same window.
+i=0
+while [ "$i" -lt 50 ] && ! grep -qF "not pasted" "$NOTIFICATIONS"; do
+    sleep 0.1
+    i=$((i + 1))
+done
 
 # The same question again, this time answered the other way. The clipboard survives a
 # skipped paste for the same reason it survives a completed one: a copy can be pasted
@@ -726,7 +744,7 @@ else
     i=0
     cached=
     while [ "$i" -lt 100 ] && [ -z "$cached" ]; do
-        cached=$(find "$HOME/.cache/thumbnails" -name '*.png' -size +0 2>/dev/null |
+        cached=$(find "$XDG_CACHE_HOME/thumbnails" -name '*.png' -size +0 2>/dev/null |
             head -1)
         [ -n "$cached" ] || {
             i=$((i + 1))
@@ -1149,7 +1167,7 @@ else
     i=0
     big=
     while [ "$i" -lt 100 ] && [ -z "$big" ]; do
-        big=$(find "$HOME/.cache/thumbnails/large" -name '*.png' -size +0 2>/dev/null |
+        big=$(find "$XDG_CACHE_HOME/thumbnails/large" -name '*.png' -size +0 2>/dev/null |
             head -1)
         [ -n "$big" ] || {
             i=$((i + 1))
@@ -1859,6 +1877,47 @@ if printf '%s\n' "$CFRAME" | grep -qF "$(printf '\t2 items\t')"; then
 else
     fail "the other window's status line counts the cards it has left"
 fi
+
+# --- Trash collection and file drop operations --------------------------------------
+navigate_to "$TARGET"
+printf recoverable >"$TARGET/trash-proof.txt"
+has_named trash-proof.txt "a file for Trash appears"
+python3 "$A11Y" select trash-proof.txt >/dev/null || fail "the Trash fixture can be selected"
+act trash "[]" "[]"
+i=0
+while [ "$i" -lt 50 ] && [ -e "$TARGET/trash-proof.txt" ]; do
+    sleep 0.1
+    i=$((i + 1))
+done
+navigate_to trash://
+has_frame Trash "Trash opens as a collection"
+has_named trash-proof.txt "Trash shows the deleted filename"
+python3 "$A11Y" select trash-proof.txt >/dev/null || fail "a deleted item can be selected"
+act restore-trash "[]" "[]"
+i=0
+while [ "$i" -lt 50 ] && [ ! -e "$TARGET/trash-proof.txt" ]; do
+    sleep 0.1
+    i=$((i + 1))
+done
+if [ "$(cat "$TARGET/trash-proof.txt" 2>/dev/null || true)" = recoverable ]; then
+    ok "Restore returns the original bytes from Trash"
+else
+    fail "Restore returns the original bytes from Trash"
+fi
+navigate_to "$TARGET"
+printf dropped >"$ROOT/drop-proof.txt"
+act drop-files "[<('$TARGET', ['file://$ROOT/drop-proof.txt'], false)>]" "[]"
+i=0
+while [ "$i" -lt 50 ] && [ ! -e "$TARGET/drop-proof.txt" ]; do
+    sleep 0.1
+    i=$((i + 1))
+done
+if [ "$(cat "$TARGET/drop-proof.txt" 2>/dev/null || true)" = dropped ] && [ -e "$ROOT/drop-proof.txt" ]; then
+    ok "a file drop copies bytes through the operation pipeline"
+else
+    fail "a file drop copies bytes through the operation pipeline"
+fi
+navigate_to "$TARGET"
 
 # --- --new-window really is a separate process --------------------------------------
 # Before: however many frames the primary has. After: one more, from a process that gave

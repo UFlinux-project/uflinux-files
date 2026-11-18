@@ -95,6 +95,7 @@ struct Status {
     /// A line to say instead of the count, for the presentation beside this one
     /// that has no rows of its own. See [`View::set_status`].
     said: RefCell<Option<String>>,
+    empty: RefCell<Option<(gtk::Box, gtk::Label, gtk::Button)>>,
 }
 
 impl Status {
@@ -104,6 +105,7 @@ impl Status {
             shown: Cell::new(0),
             selected: Cell::new(0),
             said: RefCell::new(None),
+            empty: RefCell::new(None),
         }
     }
 
@@ -111,7 +113,7 @@ impl Status {
         let text = self.said.borrow().clone().unwrap_or_else(|| {
             let shown = self.shown.get();
             let selected = self.selected.get();
-            if selected > 0 && selected != shown {
+            if selected > 0 {
                 format!("{selected} of {shown} selected")
             } else if shown == 0 {
                 "Empty folder".to_string()
@@ -119,6 +121,24 @@ impl Status {
                 format_items(u64::try_from(shown).unwrap_or(u64::MAX))
             }
         });
+        if let Some((box_, label, button)) = self.empty.borrow().as_ref() {
+            box_.set_visible(self.shown.get() == 0);
+            label.set_text(&text);
+            let action = if text == "Empty folder" {
+                Some(("New Folder", "win.new-folder"))
+            } else if text.starts_with("No matches") {
+                Some(("Clear Search", "win.clear-search"))
+            } else if text.starts_with("Could not load") {
+                Some(("Retry", "win.refresh"))
+            } else {
+                None
+            };
+            button.set_visible(action.is_some());
+            if let Some((label, action)) = action {
+                button.set_label(label);
+                button.set_action_name(Some(action));
+            }
+        }
         for label in self.labels.borrow().iter() {
             label.set_text(&text);
         }
@@ -131,6 +151,7 @@ type Selections = Rc<RefCell<Vec<Rc<dyn Fn()>>>>;
 
 /// The widget that shows one folder, in whichever mode is active.
 pub struct View {
+    root: gtk::Overlay,
     stack: gtk::Stack,
     store: gio::ListStore,
     selection: gtk::MultiSelection,
@@ -183,9 +204,9 @@ impl View {
         );
         grid.set_single_click_activate(false);
         grid.set_enable_rubberband(true);
-        // The width decides the column count; GTK's "no ceiling" is its largest
-        // number, and 0 is rejected outright.
-        grid.set_max_columns(u32::MAX);
+        // Bound the natural-width calculation: u32::MAX overflows GTK's
+        // measurement through a scrolled window. 64 cells covers an 8K display.
+        grid.set_max_columns(64);
         grid.add_css_class("ufm-grid");
 
         let list = gtk::ColumnView::new(Some(selection.clone()));
@@ -213,12 +234,37 @@ impl View {
         }
 
         let stack = gtk::Stack::new();
-        stack.add_named(&grid, Some("grid"));
-        stack.add_named(&list, Some("list"));
+        let grid_scroll = gtk::ScrolledWindow::new();
+        grid_scroll.set_child(Some(&grid));
+        let list_scroll = gtk::ScrolledWindow::new();
+        list_scroll.set_child(Some(&list));
+        stack.add_named(&grid_scroll, Some("grid"));
+        stack.add_named(&list_scroll, Some("list"));
         stack.set_hexpand(true);
         stack.set_vexpand(true);
 
+        let root = gtk::Overlay::new();
+        root.set_child(Some(&stack));
+        let empty = gtk::Box::new(gtk::Orientation::Vertical, 12);
+        empty.set_halign(gtk::Align::Center);
+        empty.set_valign(gtk::Align::Center);
+        let icon = gtk::Image::from_icon_name("folder-symbolic");
+        icon.set_pixel_size(48);
+        icon.add_css_class("dim-label");
+        empty.append(&icon);
+        let empty_text = gtk::Label::new(Some("Loading…"));
+        empty_text.set_wrap(true);
+        empty_text.set_max_width_chars(42);
+        empty_text.set_justify(gtk::Justification::Center);
+        empty.append(&empty_text);
+        let empty_button = gtk::Button::new();
+        empty_button.set_visible(false);
+        empty.append(&empty_button);
+        root.add_overlay(&empty);
+        let status = Rc::new(Status::new());
+        *status.empty.borrow_mut() = Some((empty, empty_text, empty_button));
         let view = Self {
+            root,
             stack,
             store,
             selection,
@@ -228,7 +274,7 @@ impl View {
             mode: Cell::new(ViewMode::Grid),
             key: RefCell::new(key),
             activators: Rc::new(RefCell::new(Vec::new())),
-            status: Rc::new(Status::new()),
+            status,
             headers: Rc::new(RefCell::new(Vec::new())),
             selections: Rc::new(RefCell::new(Vec::new())),
             contexts,
@@ -247,8 +293,8 @@ impl View {
 
     /// The widget to put in the window's content area.
     #[must_use]
-    pub fn widget(&self) -> &gtk::Stack {
-        &self.stack
+    pub fn widget(&self) -> &gtk::Overlay {
+        &self.root
     }
 
     /// React to the user opening a folder or activating a file.
@@ -277,6 +323,7 @@ impl View {
     /// watch event says the folder changed. The entries arrive sorted; sorting
     /// here as well would be a second pass over a list that can be large.
     pub fn set_entries(&self, entries: Vec<Entry>) {
+        let selected = self.selected();
         let rows = Row::rows(entries);
         self.status.shown.set(rows.len());
         self.status.selected.set(0);
@@ -285,6 +332,7 @@ impl View {
         // long as that presentation is on screen.
         *self.status.said.borrow_mut() = None;
         self.store.splice(0, self.store.n_items(), &rows);
+        self.restore_selection(&selected);
         self.status.report();
         // Replacing the rows can change what the selection means without any
         // signal saying so: a splice that leaves a selected position in place
@@ -316,6 +364,7 @@ impl View {
 
     /// Re-order the rows already on screen without touching the disk.
     pub fn resort(&self, key: SortKey) {
+        let selected = self.selected();
         *self.key.borrow_mut() = key;
         let mut entries: Vec<Entry> = self
             .store
@@ -326,7 +375,22 @@ impl View {
         sort_entries(&mut entries, key);
         let rows = Row::rows(entries);
         self.store.splice(0, self.store.n_items(), &rows);
+        self.restore_selection(&selected);
         self.paint_headers();
+    }
+
+    fn restore_selection(&self, entries: &[Entry]) {
+        let selected: std::collections::HashSet<_> =
+            entries.iter().map(|entry| &entry.location).collect();
+        self.selection.unselect_all();
+        for position in 0..self.store.n_items() {
+            if self
+                .row_at(position)
+                .is_some_and(|row| selected.contains(&row.entry().location))
+            {
+                self.selection.select_item(position, false);
+            }
+        }
     }
 
     #[must_use]
@@ -371,8 +435,10 @@ impl View {
         // Splicing the same rows back in place is the only way to ask for a
         // re-bind while keeping the selection, which a position-based update
         // would have to rebuild by hand.
+        let selected = self.selected();
         let rows: Vec<Row> = self.store.iter::<Row>().filter_map(Result::ok).collect();
         self.store.splice(0, self.store.n_items(), &rows);
+        self.restore_selection(&selected);
     }
 
     /// Re-apply the star list to the rows already on screen and draw them again.
@@ -441,6 +507,7 @@ impl View {
     pub fn status_label(&self) -> gtk::Label {
         let label = gtk::Label::new(None);
         label.add_css_class("ufm-status");
+        label.set_accessible_role(gtk::AccessibleRole::Status);
         self.status.labels.borrow_mut().push(label.clone());
         self.status.report();
         label
@@ -475,7 +542,7 @@ impl View {
             };
             let button = gtk::Button::with_label(column.title());
             button.add_css_class("ufm-header");
-            button.set_can_focus(false);
+            button.set_can_focus(true);
             let headers = Rc::clone(&headers);
             let key = key.clone();
             let on_sort = Rc::clone(&on_sort);
@@ -621,6 +688,7 @@ pub(super) fn grid_factory(
         cell.append(&label);
         item.set_child(Some(&cell));
         popup::attach(&cell, item, true, &on_press);
+        super::dnd::cell(&cell, item);
     });
     factory.connect_bind(move |_factory, object| {
         let Some(item) = object.downcast_ref::<gtk::ListItem>() else {
@@ -639,6 +707,13 @@ pub(super) fn grid_factory(
             label.set_text(&row.name());
         }
         paint_badge(found.star.as_ref(), &row, icon_size.get());
+        if let Some(cell) = item.child() {
+            if super::clipboard::is_cut(&row.entry().location) {
+                cell.add_css_class("ufm-cut");
+            } else {
+                cell.remove_css_class("ufm-cut");
+            }
+        }
     });
     factory
 }
@@ -763,6 +838,7 @@ fn list_factory(
         };
         item.set_child(Some(&cell));
         popup::attach(&cell, item, true, &on_press);
+        super::dnd::cell(&cell, item);
     });
     factory.connect_bind(move |_factory, object| {
         let Some(item) = object.downcast_ref::<gtk::ListItem>() else {
@@ -787,6 +863,13 @@ fn list_factory(
             label.set_text(&text);
         }
         paint_badge(found.star.as_ref(), &row, icon_size.get());
+        if let Some(cell) = item.child() {
+            if super::clipboard::is_cut(&row.entry().location) {
+                cell.add_css_class("ufm-cut");
+            } else {
+                cell.remove_css_class("ufm-cut");
+            }
+        }
     });
     factory
 }
@@ -938,6 +1021,31 @@ mod tests {
             ]);
             assert_eq!(view.len(), 2);
             assert_eq!(view.row_at(0).expect("row").name(), "zebra");
+        });
+    }
+
+    #[test]
+    fn selection_tracks_identity_after_refresh_sort_and_removal() {
+        tk::ui(|| {
+            let view = View::new(SortKey::default(), Pipeline::new());
+            view.set_entries(vec![
+                entry("a", EntryKind::File),
+                entry("b", EntryKind::File),
+            ]);
+            view.selection.select_item(1, true);
+            view.set_entries(vec![
+                entry("new", EntryKind::File),
+                entry("a", EntryKind::File),
+                entry("b", EntryKind::File),
+            ]);
+            assert_eq!(view.selected()[0].name, "b");
+            view.resort(SortKey {
+                descending: true,
+                ..SortKey::default()
+            });
+            assert_eq!(view.selected()[0].name, "b");
+            view.set_entries(vec![entry("a", EntryKind::File)]);
+            assert!(view.selected().is_empty());
         });
     }
 
