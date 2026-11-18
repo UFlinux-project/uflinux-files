@@ -544,8 +544,7 @@ impl Panel {
     fn row(&self, place: &Place) -> gtk::ListBoxRow {
         let box_ = gtk::Box::new(gtk::Orientation::Vertical, 2);
         let line = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-        let image = gtk::Image::from_icon_name(place.icon_name());
-        super::view::regular_icon(&image, place.icon_name(), 24);
+        let image = super::symbolic_image(place.icon_name(), "folder-symbolic", 24);
         let label = gtk::Label::new(Some(&place.label()));
         label.set_ellipsize(pango_ellipsize());
         label.set_xalign(0.0);

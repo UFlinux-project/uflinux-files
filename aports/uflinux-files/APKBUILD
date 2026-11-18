@@ -1,7 +1,7 @@
 # Maintainer: UFLinux contributors <noreply@example.invalid>
 pkgname=uflinux-files
 pkgver=0.1.0
-pkgrel=2
+pkgrel=13
 pkgdesc="UFLinux file manager: GTK4 browsing, archives, mounts and search"
 url="${UFLINUX_PROJECT_URL:-https://github.com}"
 arch="x86 x86_64 aarch64 armv7 ppc64le s390x riscv64"

@@ -102,9 +102,6 @@ box.ufm-computer {
 progressbar.ufm-usage {
     min-height: 6px;
 }
-box.ufm-crumb {
-    padding: 2px 8px;
-}
 label.ufm-banner {
     padding: 6px 10px;
 }
@@ -114,10 +111,13 @@ box.ufm-pane {
 box.ufm-columns {
     background-color: alpha(currentColor, 0.02);
 }
-box.ufm-find {
-    padding: 6px 10px;
-    border-bottom: 1px solid alpha(currentColor, 0.12);
-    background-color: alpha(currentColor, 0.03);
+headerbar.ufm-archive-header {
+    background-image: none;
+    background-color: mix(@theme_bg_color, #e5a50a, 0.34);
+}
+headerbar.ufm-remote-header {
+    background-image: none;
+    background-color: mix(@theme_bg_color, #9141ac, 0.34);
 }
 /* The job strip. Drawn like the search bar because it is the same kind of thing:
    a strip of chrome that appears above the listing for as long as it has
@@ -220,11 +220,11 @@ mod tests {
             "ufm-place",
             "ufm-computer",
             "ufm-usage",
-            "ufm-crumb",
             "ufm-banner",
             "ufm-pane",
             "ufm-columns",
-            "ufm-find",
+            "ufm-archive-header",
+            "ufm-remote-header",
             "ufm-jobs",
             "ufm-mono",
             "ufm-open-with",

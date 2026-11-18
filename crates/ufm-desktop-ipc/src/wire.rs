@@ -32,6 +32,9 @@ pub const PROTOCOL_VERSION: u32 = 1;
 /// D-Bus name claimed by the file manager in provider mode.
 pub const SESSION_NAME: &str = "org.uflinux.FileManager.Desktop1";
 
+/// Name held by the process drawing the desktop icons.
+pub const RENDERER_NAME: &str = "org.uflinux.FileManager.Desktop.Renderer";
+
 /// Object path the interface is exported on.
 pub const OBJECT_PATH: &str = "/org/uflinux/FileManager/Desktop";
 

@@ -220,7 +220,7 @@ fn header(entry: &Entry) -> gtk::Box {
     box_.set_margin_start(18);
     box_.set_margin_end(18);
 
-    let icon = gtk::Image::from_icon_name(entry.kind.icon_name());
+    let icon = super::symbolic_image(entry.kind.icon_name(), "text-x-generic-symbolic", 32);
     icon.set_widget_name("ufm-props-icon");
     icon.set_pixel_size(48);
     icon.set_valign(gtk::Align::Start);
@@ -474,7 +474,7 @@ mod tests {
     fn a_folder_total_names_the_files_behind_it() {
         assert_eq!(
             folder_words(&tally(1024, 3, 2)),
-            "1.0 KiB in 3 files, 2 folders"
+            "1.0 kB in 3 files, 2 folders"
         );
         assert_eq!(folder_words(&tally(10, 1, 0)), "10 B in 1 file");
     }
@@ -485,7 +485,7 @@ mod tests {
         walked.partial = true;
         assert_eq!(
             folder_words(&walked),
-            "at least 1.0 KiB in 4 files, 1 folder"
+            "at least 1.0 kB in 4 files, 1 folder"
         );
     }
 
@@ -508,7 +508,7 @@ mod tests {
         walked.unreadable = 1;
         assert_eq!(
             folder_words(&walked),
-            "1.0 KiB in 2 files; 1 entry unreadable"
+            "1.0 kB in 2 files; 1 entry unreadable"
         );
     }
 
@@ -555,11 +555,11 @@ mod tests {
             let (window, live) = build(&file());
             assert!(live.is_none(), "a file's size is already exact");
             let size = find(&window, "ufm-props-size").expect("a size row");
-            assert_eq!(size.downcast_ref::<gtk::Label>().unwrap().text(), "2.0 KiB");
+            assert_eq!(size.downcast_ref::<gtk::Label>().unwrap().text(), "2.0 kB");
             let allocated = find(&window, "ufm-props-allocated").expect("an on-disk row");
             assert_eq!(
                 allocated.downcast_ref::<gtk::Label>().unwrap().text(),
-                "4.0 KiB"
+                "4.1 kB"
             );
             let permissions = find(&window, "ufm-props-permissions").expect("a mode row");
             let permissions = permissions.downcast_ref::<gtk::Label>().unwrap();
@@ -609,11 +609,11 @@ mod tests {
                 });
             });
             deliver(&path, &tally(3_072, 5, 1));
-            assert_eq!(live.text(), "3.0 KiB in 5 files, 1 folder");
+            assert_eq!(live.text(), "3.1 kB in 5 files, 1 folder");
             // An answer for a folder nobody asked about leaves the row alone —
             // this is what dropping the reply to a closed dialog looks like.
             deliver(Path::new("/elsewhere"), &tally(1, 1, 0));
-            assert_eq!(live.text(), "3.0 KiB in 5 files, 1 folder");
+            assert_eq!(live.text(), "3.1 kB in 5 files, 1 folder");
             OPEN.with(|open| open.borrow_mut().clear());
         });
     }

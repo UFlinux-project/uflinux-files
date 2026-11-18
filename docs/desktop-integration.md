@@ -22,7 +22,7 @@ speaks one of the three speaks all of them.
 
 | Method | Why it is shaped this way |
 | --- | --- |
-| `Status` | version, directory, item count, and whether a renderer has claimed the interface |
+| `Status` | version, directory, item count, and whether a renderer owns the renderer name |
 | `GetModel` | the whole model; the desktop is tens of items, so there is no paging |
 | `SetGeometry` | replaces the set of grids wholesale — a monitor that stopped being mentioned is a monitor that was unplugged |
 | `Place` | id + three integers, flat, so a drag ends in a small message rather than a nested struct |
@@ -118,15 +118,15 @@ appears when a session ends.
 
 ## The renderer patch in `uflinux-desktop`
 
-`uflinux-desktop` claims `org.uflinux.FileManager.Desktop.Renderer` and, on
-`Status` answering `renderer: false` for itself, does:
+`uflinux-desktop` claims `org.uflinux.FileManager.Desktop.Renderer` and uses
+the wallpaper surfaces already mapped on each output:
 
-1. `SetGeometry` with one grid per monitor, recomputed on `monitors-changed`;
-2. `GetModel`, then paint an icon grid in a `gtk4-layer-shell` background layer —
-   the layer the shell already uses for the panel, so no new surface type;
-3. forward `Place` on drag-end, `Launch` on double-click or Enter, `ContextMenu` on
-   a right-click, `RequestThumbnail` lazily for visible cells only;
-4. re-`GetModel` on `Changed`, ignoring any generation it has already drawn.
+1. Send `SetGeometry` for the allocated space above the panel, updating it as screens change.
+2. Fetch `GetModel` and render the icons above the wallpaper.
+3. Forward `Place` after a drag within the same monitor, `Launch` on double-click
+   or Enter, and `ContextMenu` on a right-click. The provider currently opens the
+   Desktop folder for `ContextMenu`. Request thumbnails for displayed icons only.
+4. Fetch the model again on `Changed`. Re-register geometry when the provider restarts.
 
 Thumbnails are **off by default on targets with 512 MiB or less**, where the model
 answers `thumbnails: false` and every icon uses its fallback name. A thumbnail cache
@@ -134,12 +134,6 @@ is the largest single thing this feature could add, and an icon grid is still us
 without it. The edge a renderer is told to ask for is the saved size clamped into
 128..=512 px, so a layout written by another version cannot ask this process for a
 thumbnail it would not decode.
-
-`uflinux-desktop` pins `gtk4` 0.10.1 and `gtk4-layer-shell` 0.6.3; this workspace
-uses gtk4 0.10 with gtk4-layer-shell 0.7. The two must resolve to one copy of each in
-the image — the reason the dependency is optional here and behind the
-`desktop-icons` feature, so the common package does not link it at all. The provider
-never links it either way: it has no window to place on a layer.
 
 ## Fallback without a renderer
 
@@ -151,14 +145,11 @@ feature works on any compositor while the default install pays nothing for it. R
 `uflinux-files --desktop-icons`; a build without the feature refuses the flag by name and
 exits `2` rather than opening an ordinary window and looking like it worked.
 
-It is a fallback and not a second shell, so it implements the four steps above and
-deliberately stops there. One `gtk::Window` per monitor, at `Layer::Background` with all
-four anchors and `KeyboardMode::None` — the same layer the panel already uses, so no new
-surface type appears. `Status` is asked **once** per session, because the provider's
-answer means only "has anything been asked of me yet": asking twice would tell the second
-question yes. If the answer is that a renderer is there, this process exits; if it is
-that nobody is, it waits two seconds and asks to take over, so a shell that is still
-starting wins without anything having to poll. Grids are reported from each surface's own
+The fallback opens one background window per monitor with all four anchors and
+`KeyboardMode::None`. It checks the provider version and waits two seconds
+before trying to claim the renderer name. It exits if the resident desktop
+already owns the name or takes it over while the fallback is running.
+Grids are reported from each surface's own
 allocation once it is mapped rather than from the monitor geometry, which is what makes a
 panel's exclusive zone subtract itself for free, and they are recomputed on
 `monitors-changed`. Columns are capped by the protocol's column cap and rows by its row
@@ -194,5 +185,4 @@ GTK4 process with a GL driver loaded, which is exactly what the provider was mov
 (see `docs/memory-budget.md`), and the provider alongside it measures 3.1 MiB. With the GL
 renderer instead of Cairo the same process is 156 MiB, the same multiple the window costs
 for the same reason. That number is why the fallback is a flag and not the default: on a
-machine where `uflinux-desktop` is running, which is every UFlinux session, it asks once,
-sees a renderer, and exits without ever mapping a surface.
+machine where `uflinux-desktop` is running, which is every UFlinux session, the ownership request is declined and it exits without mapping a surface.

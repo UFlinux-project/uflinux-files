@@ -26,11 +26,7 @@
 //! one thread that owns the connection, so the lock is never actually contended. It
 //! is there for the shape of the code, not for throughput.
 //!
-//! There is no per-client bookkeeping, and there could not be: GIO 0.21 does not
-//! bind `g_bus_watch_name`, so the provider cannot ask the bus whether a renderer
-//! owns its half of the interface. `Status.renderer` is therefore answered from the
-//! only thing that is observable — has anything been asked of us at all — which is
-//! the question the `--desktop-icons` fallback actually wants to ask.
+//! Renderer presence follows ownership of the renderer name on the session bus.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -165,9 +161,7 @@ struct State {
     /// Anything else worth telling a person: a layout file that did not parse, a
     /// launch the operating system refused.
     note: Option<String>,
-    /// Whether anything has ever asked a question. `Status.renderer` is the
-    /// provider's only answer to "is anyone listening".
-    asked: bool,
+    renderer: bool,
 }
 
 impl Core {
@@ -254,7 +248,7 @@ impl State {
             thumbnail_size: DEFAULT_THUMBNAIL,
             unreadable: false,
             note: None,
-            asked: false,
+            renderer: false,
         }
     }
 
@@ -303,7 +297,7 @@ impl State {
             items: self.model.items.len(),
             monitors: self.model.monitors.len(),
             writable: self.model.writable,
-            renderer: self.asked,
+            renderer: self.renderer,
             note: self.explain(),
         }
     }
@@ -413,13 +407,7 @@ fn handle(core: &Core, method: &str, parameters: glib::Variant) -> Outcome {
     if bus_method(&request) != method {
         return Outcome::Refuse(WireError::Invalid);
     }
-    let mut state = core.state();
-    let outcome = dispatch(core, &mut state, request);
-    // After the dispatch, not before: the answer to "is anyone listening" has to
-    // describe the state of the session as it was when the question was asked, or the
-    // first `Status` of a session would report a renderer because a renderer asked.
-    state.asked = true;
-    outcome
+    dispatch(core, &mut core.state(), request)
 }
 
 /// One request, against the state it acts on.
@@ -644,6 +632,7 @@ pub struct Service {
     /// name stayed claimed, which is a service that answers every call with
     /// `UnknownObject`. Released in [`Drop`], where the connection is at hand.
     registration: Option<gio::RegistrationId>,
+    _renderer_signal: gio::SignalSubscription,
 }
 
 /// Ask for the bus name, with no callback for either outcome.
@@ -751,7 +740,7 @@ impl Service {
             layout,
             unreadable: false,
             note: join_notes(broken, note),
-            asked: false,
+            renderer: false,
         };
         let core = Arc::new(Core {
             connection: Some(connection.clone()),
@@ -770,6 +759,41 @@ impl Service {
                 .map_err(|e| format!("cannot serve {OBJECT_PATH}: {e}"))?
         };
 
+        let dbus = "org.freedesktop.DBus";
+        let dbus_path = "/org/freedesktop/DBus";
+        let renderer = ufm_desktop_ipc::RENDERER_NAME;
+        let weak = Arc::downgrade(&core);
+        let renderer_signal = connection.subscribe_to_signal(
+            Some(dbus),
+            Some(dbus),
+            Some("NameOwnerChanged"),
+            Some(dbus_path),
+            Some(renderer),
+            gio::DBusSignalFlags::NONE,
+            move |signal| {
+                if let (Some(core), Some((_, _, owner))) = (
+                    weak.upgrade(),
+                    signal.parameters.get::<(String, String, String)>(),
+                ) {
+                    core.state().renderer = !owner.is_empty();
+                }
+            },
+        );
+        core.state().renderer = connection
+            .call_sync(
+                Some(dbus),
+                dbus_path,
+                dbus,
+                "NameHasOwner",
+                Some(&(renderer,).to_variant()),
+                None,
+                gio::DBusCallFlags::NONE,
+                2000,
+                gio::Cancellable::NONE,
+            )
+            .ok()
+            .and_then(|reply| reply.get::<(bool,)>())
+            == Some((true,));
         let owner = own_name(&connection);
 
         let _ = core.state().rescan(&core.file);
@@ -777,6 +801,7 @@ impl Service {
             core,
             owner,
             registration: Some(registration),
+            _renderer_signal: renderer_signal,
         })
     }
 
@@ -1050,7 +1075,7 @@ mod tests {
     }
 
     #[test]
-    fn the_first_status_says_nobody_has_listened_yet() {
+    fn status_queries_do_not_claim_the_renderer() {
         // The fallback renderer decides whether to draw a layer of its own from this
         // flag, so the answer has to describe the session, not the request.
         let core = Core::alone(
@@ -1066,7 +1091,7 @@ mod tests {
         let Reply::Status(second) = ok(ask(&core, Request::Status)) else {
             panic!("Status does not answer with a status");
         };
-        assert!(second.renderer, "by the second call, someone is");
+        assert!(!second.renderer);
     }
 
     #[test]

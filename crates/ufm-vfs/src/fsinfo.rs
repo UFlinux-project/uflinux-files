@@ -49,6 +49,10 @@ const REMOTE_TYPES: &[&str] = &[
     "sshfs",
     "fuse.sshfs",
     "davfs",
+    "fuse.davfs",
+    "fuse.davfs2",
+    "fuse.lftp",
+    "fuse.curlftpfs",
     "webdav",
     "rclone",
     "fuse.rclone",
@@ -171,6 +175,12 @@ fn probe(path: &Path) -> FsHints {
         }
     }
     hints
+}
+
+/// Check the mount table without accessing the target filesystem.
+#[must_use]
+pub fn is_remote_mount(path: &Path) -> bool {
+    deepest(mounts(), path).is_some_and(|mount| REMOTE_TYPES.contains(&mount.fstype.as_str()))
 }
 
 /// The longest mount point that is a prefix of `path`, so a nested bind mount or

@@ -16,14 +16,8 @@
 //! a desktop directory is, no second copy of the model. Whatever it does not have
 //! to know, it does not.
 //!
-//! # One question, asked once
-//!
-//! `Status.renderer` is answered by the provider from the only thing it can
-//! observe — has anything been asked of it at all (see
-//! `uflinux-files-provider/src/service.rs`). So this module asks exactly once per
-//! session, from the first activation, and never again. A second `Status` would
-//! answer `true` because of the first one, and the fallback would stop painting
-//! its own desktop because it had drawn one.
+//! The fallback claims the renderer name after a short startup grace period.
+//! The resident shell can take the name over when it starts.
 //!
 //! # Cost, and why the shape is what it is
 //!
@@ -271,6 +265,8 @@ struct Inner {
     stale: StdCell<bool>,
     /// We have stopped drawing, so a signal that arrives on the way out is noise.
     dead: StdCell<bool>,
+    claimed: StdCell<bool>,
+    owner_signal: RefCell<Option<gio::SignalSubscription>>,
     /// Subscriptions live here. Dropping one unsubscribes, which would leave a
     /// desktop that never notices a file landing on it.
     signals: RefCell<Vec<gio::SignalSubscription>>,
@@ -307,9 +303,6 @@ pub fn run() -> ExitCode {
 /// The first activation: find out whether anyone else is drawing this, and if
 /// not, start.
 fn start(app: &gtk::Application) {
-    // A second activation of the same process must not ask again. See the note on
-    // [`GRACE`] and on `Status.renderer`: the provider's answer means "has
-    // anything been asked", so asking twice reports a renderer because we asked.
     static ASKED: std::sync::Once = std::sync::Once::new();
     ASKED.call_once(|| {
         css::install();
@@ -347,6 +340,8 @@ fn start(app: &gtk::Application) {
             fetching: StdCell::new(false),
             stale: StdCell::new(false),
             dead: StdCell::new(false),
+            claimed: StdCell::new(false),
+            owner_signal: RefCell::new(None),
             signals: RefCell::new(Vec::new()),
         });
         // A screen plugged in after login has to be told about: the provider
@@ -397,36 +392,65 @@ fn ask(inner: &Rc<Inner>) {
         quit(inner);
         return;
     };
-    if !should_paint(&status) {
-        // Someone else paints this. Leaving is the whole point of the flag.
+    if status.version != ipc::PROTOCOL_VERSION {
         quit(inner);
         return;
     }
-    retry(inner);
+    claim_after_grace(inner);
 }
 
-/// Wait out the grace period, then take the desktop if it is still unclaimed.
-///
-/// Re-armed rather than given up on when there is no screen to draw on yet: a
-/// session starter can run before the compositor has finished enumerating outputs,
-/// and a desktop that exited at that moment would leave a blank screen for the
-/// rest of the session. The provider goes on answering for the model either way,
-/// so nothing is lost by waiting.
-fn retry(inner: &Rc<Inner>) {
-    let later = Rc::clone(inner);
+/// Give the resident shell a chance to start before claiming the background.
+fn claim_after_grace(inner: &Rc<Inner>) {
+    let inner = Rc::clone(inner);
     glib::timeout_add_local_once(GRACE, move || {
-        if !take_over(&later) {
-            retry(&later);
+        let dbus = "org.freedesktop.DBus";
+        let path = "/org/freedesktop/DBus";
+        let name = ipc::RENDERER_NAME;
+        let weak = Rc::downgrade(&inner);
+        let lost = inner.connection.subscribe_to_signal(
+            Some(dbus),
+            Some(dbus),
+            Some("NameOwnerChanged"),
+            Some(path),
+            Some(name),
+            gio::DBusSignalFlags::NONE,
+            move |signal| {
+                let Some(inner) = weak.upgrade() else { return };
+                let Some((_, previous, _)) = signal.parameters.get::<(String, String, String)>()
+                else {
+                    return;
+                };
+                if inner.claimed.get()
+                    && inner.connection.unique_name().as_deref() == Some(&previous)
+                {
+                    quit(&inner);
+                }
+            },
+        );
+        inner.owner_signal.replace(Some(lost));
+        // ALLOW_REPLACEMENT | DO_NOT_QUEUE. A running shell always wins.
+        let result = inner
+            .connection
+            .call_sync(
+                Some(dbus),
+                path,
+                dbus,
+                "RequestName",
+                Some(&(name, 5u32).to_variant()),
+                None,
+                gio::DBusCallFlags::NONE,
+                CALL,
+                gio::Cancellable::NONE,
+            )
+            .ok()
+            .and_then(|reply| reply.get::<(u32,)>());
+        if !matches!(result, Some((1 | 4,))) {
+            quit(&inner);
+            return;
         }
+        inner.claimed.set(true);
+        take_over(&inner);
     });
-}
-
-/// Whether we should draw the desktop, given what the provider says about itself.
-///
-/// Split out because it is the whole decision the feature makes, and a rule this
-/// short is worth stating as a rule rather than leaving inside a bus call.
-fn should_paint(status: &ipc::StatusReply) -> bool {
-    !status.renderer
 }
 
 /// The grace period is over and nobody claimed the renderer: build the windows,
@@ -437,7 +461,7 @@ fn should_paint(status: &ipc::StatusReply) -> bool {
 /// twice is a no-op, rebuilding the windows is skipped when the count has not
 /// changed, and reporting is always worth doing.
 fn take_over(inner: &Rc<Inner>) -> bool {
-    if !build(inner) {
+    if !inner.claimed.get() || inner.dead.get() || !build(inner) {
         return false;
     }
     subscribe(inner);
@@ -1058,6 +1082,11 @@ fn quit(inner: &Rc<Inner>) {
         return;
     }
     inner.signals.borrow_mut().clear();
+    inner.owner_signal.borrow_mut().take();
+    let screens = std::mem::take(&mut inner.view.borrow_mut().screens);
+    for screen in screens {
+        screen.window.destroy();
+    }
     inner.app.quit();
 }
 
@@ -1238,19 +1267,6 @@ mod tests {
             slot_of(&geometry, f64::NAN, 10.0),
             None,
             "a pointer that reported no position"
-        );
-    }
-
-    #[test]
-    fn a_renderer_that_already_exists_means_we_do_not_paint() {
-        let status = ipc::StatusReply {
-            renderer: true,
-            ..ipc::StatusReply::default()
-        };
-        assert!(!should_paint(&status), "someone else owns the desktop");
-        assert!(
-            should_paint(&ipc::StatusReply::default()),
-            "nobody has asked, so nobody is drawing"
         );
     }
 

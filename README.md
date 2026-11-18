@@ -20,8 +20,8 @@ the model over D-Bus and never opens a window.
 ## What it does
 
 - **Three views** of the same folder: icon grid, list with columns, and macOS
-  Miller columns. View mode, sort order and column widths are remembered per
-  folder, so a folder opened in columns stays in columns.
+  Miller columns. Each window keeps its view mode until it closes. Sort order is remembered per
+  folder.
 - **A Computer start screen** with shortcuts to Home, Recent, Starred and existing
   XDG folders, plus cards for the system filesystem and local volumes. The Network
   page lists configured network shares and offers a connection dialog. Device discovery runs off the UI thread. Common unencrypted local
@@ -117,14 +117,17 @@ the model over D-Bus and never opens a window.
   folder. Each row activates the window's own action, which is why it is sensitive
   exactly where the header menu and the keyboard are; `Menu` and `<Shift>F10` open
   the same menu over the focused row.
+- **New documents and archives**: right-click a folder background to create a
+  document from an XDG template. Select files or folders with the same parent
+  and use Compress to create a ZIP, 7z, RAR or tar archive beside them. RAR
+  creation requires the separately installed `rar` command.
 - **Open With…**: the list of programs is the desktop database's, not a second list
   kept here, so the chooser cannot disagree with what the system believes about a
   file — and a type nothing is registered for is named out loud rather than answered
   with an empty dialog. It works on a member of an archive too: the one member is
   written out to a cache that forgets what is a week old, and the program is handed
   that.
-- **A right preview pane** that follows the selected row and is toggled with `Space`
-  or the header button. It reuses the bounded image and text preview paths; audio
+- **A right preview pane** that follows the selected row and is toggled with `Space` from the file view. It reuses the bounded image and text preview paths; audio
   and video playback starts only after pressing Play. Its visibility and width are
   remembered, and multi-selection shows a count instead of loading every file.
 - **Progress you can watch and stop**: a copy, move, delete or extract puts a strip
@@ -233,10 +236,10 @@ the structure above.
 
 ## Navigation and removable drives
 
-Click an ancestor breadcrumb to navigate, or click the blank address area / press
-Ctrl+L to enter a path. Escape restores breadcrumbs. The search button and
-Ctrl+Shift+F open indexed search in the address area; Ctrl+F filters the current
-folder. Search options are available from its menu button.
+Type a path or URI into the header address field and press Enter to navigate.
+Ctrl+L selects the current address, Escape restores it, and Alt+Up goes to the
+parent folder. The search button and Ctrl+Shift+F open indexed search in the
+address field's place. Ctrl+F filters the current folder.
 
 Miller columns use compact rows, support multiple selection, and have draggable
 column dividers. Drag on empty space in any file view to select several items.
@@ -249,4 +252,4 @@ folder. Failed or cancelled attempts can be retried by clicking the volume.
 Mount support requires the `uflinux-files-mount-helper` package, installed with
 Files. Operation results appear in the window and are also sent as desktop notifications.
 Progress, individual cancellation, and Cancel All stay in the window. Indexed
-search offers Load More for further results while keeping breadcrumbs visible.
+search offers Load More for further results in the status bar.

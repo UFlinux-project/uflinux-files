@@ -375,8 +375,8 @@ has_named notes.txt "opening an archive reveals its members"
 python3 "$A11Y" select docs >/dev/null || fail "an archive directory can be selected"
 act open "[]" "[]"
 has_named readme.md "an archive directory opens with its own entries"
-python3 "$A11Y" press-role button bundle.tar >/dev/null || fail "the archive breadcrumb activates"
-has_named notes.txt "the archive breadcrumb restores the archive root"
+act up "[]" "[]"
+has_named notes.txt "Up restores the archive root"
 act back "[]" "[]"
 has_named readme.md "Back restores the archive subdirectory"
 act forward "[]" "[]"
@@ -1599,7 +1599,7 @@ fi
 # a card reports how full its filesystem is. The sidebar's Home row carries a
 # usage bar too, so the check counts: one line is the sidebar, two means a card
 # said it as well.
-if [ "$(printf '%s\n' "$CFRAME" | grep -cF "free of")" -ge 1 ]; then
+if [ "$(printf '%s\n' "$CFRAME" | grep -cE "(free|used) of")" -ge 1 ]; then
     ok "a card reports how full its filesystem is"
 else
     fail "a card reports how full its filesystem is"
@@ -1639,9 +1639,14 @@ if printf '%s\n' "$CFRAME" | grep -qF "not a valid location"; then
 else
     ok "Computer shows cards rather than a reader error"
 fi
-# The count in the bar counts cards. Left to the listing path it would have said
-# "Empty folder" about a window showing two drives: Desktop and System.
-if printf '%s\n' "$CFRAME" | grep -qF "$(printf '\t2 items\t')"; then
+# The count includes every visible storage card. Device inventory depends on
+# the host running this test, so derive the expected count from the card roles.
+CARDS=$(printf '%s\n' "$CFRAME" | awk -F '\t' '$1 == "table cell" { count++ } END { print count+0 }')
+case $CARDS in
+    1) STORAGE_COUNT="1 item" ;;
+    *) STORAGE_COUNT="$CARDS items" ;;
+esac
+if [ "$CARDS" -ge 1 ] && printf '%s\n' "$CFRAME" | grep -qF "$(printf '\t%s\t' "$STORAGE_COUNT")"; then
     ok "the status line counts the cards rather than entries read from disk"
 else
     fail "the status line counts the cards rather than entries read from disk"
@@ -1672,10 +1677,10 @@ else
 fi
 # A card is named after the thing it stands for. Without an explicit name GTK
 # collects the text of the whole subtree, which announced the drive as
-# "Home /tmp/h 0.86545 125 GiB free of 929 GiB" — the capacity read out twice,
+# "System / 0.86545 134 GB free of 998 GB" — the capacity read out twice,
 # the fraction read out as a number, and no way to tell two drives apart before
 # the sentence ended. An exact-name match is what says the label won.
-if printf '%s\n' "$PFRAME" | grep -qF "$(printf 'table cell\tHome\t')"; then
+if printf '%s\n' "$PFRAME" | grep -qF "$(printf 'table cell\tSystem\t')"; then
     ok "a card is named for its drive rather than for every label inside it"
 else
     fail "a card is named for its drive rather than for every label inside it"
@@ -1686,8 +1691,8 @@ fi
 # half by having nothing to find. The sidebar's usage bar renders the same
 # phrase, so what is ruled out here is the phrase inside a card's name rather
 # than the phrase anywhere in the window.
-if printf '%s\n' "$PFRAME" | grep -qE "$(printf '^label\t')[^\t]*free of" \
-    && ! printf '%s\n' "$PFRAME" | grep -qE "$(printf '^table cell\t')[^\t]*free of"; then
+if printf '%s\n' "$PFRAME" | grep -qE "$(printf '^label\t')[^\t]*(free|used) of" \
+    && ! printf '%s\n' "$PFRAME" | grep -qE "$(printf '^table cell\t')[^\t]*(free|used) of"; then
     ok "the capacity is a line of its own rather than part of a card's name"
 else
     fail "the capacity is a line of its own rather than part of a card's name"
@@ -1980,16 +1985,12 @@ fi
 # read about, and neither branch is allowed to open an ordinary window.
 PROVIDER=$(dirname "$BIN")/uflinux-files-provider
 if [ -x "$PROVIDER" ]; then
-    # The provider answers `renderer` from the single question it can ask itself — has
-    # anything been asked of me at all — so it has to be started first and left alone
-    # until the fallback speaks, or the fallback would be told a shell is drawing and
-    # correctly stand down.
     "$PROVIDER" >"$ROOT/provider.log" 2>&1 &
     PROV=$!
     i=0
     while [ "$i" -lt 100 ]; do
-        gdbus introspect --session --xml -d org.uflinux.Files.Desktop1 \
-            -o /org/uflinux/Files/Desktop >/dev/null 2>&1 && break
+        gdbus introspect --session --xml -d org.uflinux.FileManager.Desktop1 \
+            -o /org/uflinux/FileManager/Desktop >/dev/null 2>&1 && break
         i=$((i + 1))
         sleep 0.1
     done

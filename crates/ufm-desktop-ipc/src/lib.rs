@@ -54,5 +54,6 @@ pub use model::{
 };
 pub use wire::{
     CHANGED, Changed, Format, MAX_REPLY, MAX_REQUEST, OBJECT_PATH, PROGRESS, PROTOCOL_VERSION,
-    Phase, Progress, Reply, Request, SESSION_NAME, StatusReply, Thumbnail, WireError, error,
+    Phase, Progress, RENDERER_NAME, Reply, Request, SESSION_NAME, StatusReply, Thumbnail,
+    WireError, error,
 };

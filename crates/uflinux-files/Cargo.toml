@@ -49,8 +49,6 @@ percent-encoding.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 gtk4-layer-shell = { workspace = true, optional = true }
-
-[dev-dependencies]
 tempfile.workspace = true
 
 [lints]

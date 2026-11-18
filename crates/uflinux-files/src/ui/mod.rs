@@ -28,6 +28,7 @@ mod columns;
 mod computer;
 mod conflict;
 mod connect;
+mod create;
 mod devices;
 mod dnd;
 // The desktop we paint ourselves when no shell claims the renderer interface. Not
@@ -306,4 +307,17 @@ mod tests {
             "setting it to cairo still needs no change, and must not be treated as a no-op"
         );
     }
+}
+
+/// Use a symbolic variant for chrome and fall back to a themed generic symbol.
+fn symbolic_image(name: &str, fallback: &str, size: i32) -> gtk::Image {
+    let symbolic = if name.ends_with("-symbolic") {
+        name.to_owned()
+    } else {
+        format!("{name}-symbolic")
+    };
+    let icon = gtk::gio::ThemedIcon::from_names(&[&symbolic, fallback]);
+    let image = gtk::Image::from_gicon(&icon);
+    image.set_pixel_size(size);
+    image
 }

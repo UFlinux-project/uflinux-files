@@ -46,6 +46,7 @@ use super::columns::Columns;
 use super::computer::{self, Card, CardId, ComputerView};
 use super::conflict;
 use super::connect;
+use super::create;
 use super::devices;
 use super::extract;
 use super::job::{Event, Handle, Queue, ReadId};
@@ -300,6 +301,7 @@ fn tell_windows_about_mounts() {
         paint_cards(&other, &followed.cards);
         if let Some(location) = followed.current.as_ref() {
             select_place(&other, location);
+            tint_header(&other, location, None);
         }
         for path in &followed.lost {
             other.shared.readers.invalidate_around(path);
@@ -337,15 +339,14 @@ fn shared_state(prefs: Preferences, readers: Arc<Readers>, start: &Location) -> 
 
 /// Open a window showing `urls`, or the home folder when given none.
 ///
-/// Preferences are read here rather than passed in: a second window opened from
-/// the first should start in the mode the first one just saved.
+/// Each window starts with the configured default view mode.
 pub fn open(app: &gtk::Application, urls: &[String]) {
     let prefs = Preferences::read();
     let readers = Arc::new(Readers::with_archive(Box::new(
         ufm_archive::ArchiveReader::new(),
     )));
     let start = initial(urls, &prefs);
-    let mode = prefs.view_mode_for(&start);
+    let mode = prefs.view_mode;
     let key = prefs.sort_for(&start);
 
     let window = gtk::ApplicationWindow::new(app);
@@ -375,7 +376,8 @@ pub fn open(app: &gtk::Application, urls: &[String]) {
         thumbs.clone(),
     ));
     let (banner, banner_label, banner_undo) = banner_bar();
-    let path = path_label(&start);
+    let address = gtk::Entry::new();
+    address.set_text(&address_text(&start));
     // The bar starts out knowing the same folder the window will open on and
     // with the same rule about dotfiles, so that its first query cannot return a
     // dotfile the view would have hidden.
@@ -383,6 +385,7 @@ pub fn open(app: &gtk::Application, urls: &[String]) {
     // The cards for `computer://`, built empty. The window is what fills them in,
     // because the mount table and the capacities live in the window's state.
     let computer = Rc::new(ComputerView::new());
+    DEVICES.with(|devices| computer.set_devices(devices.borrow().clone()));
     let network = Rc::new(ComputerView::network());
 
     let shared = shared_state(prefs, readers, &start);
@@ -399,8 +402,8 @@ pub fn open(app: &gtk::Application, urls: &[String]) {
         network: Rc::clone(&network),
         devices_loading: Rc::new(Cell::new(false)),
         modes,
-        path,
-        crumbs: gtk::Box::new(gtk::Orientation::Horizontal, 0),
+        address,
+        mode: Rc::new(Cell::new(mode)),
         banner,
         banner_label,
         banner_undo,
@@ -446,7 +449,7 @@ pub fn open(app: &gtk::Application, urls: &[String]) {
 
     let content = build_content(&ctx, &panel, &view);
     window.set_child(Some(&content));
-    window.set_titlebar(Some(&header(&ctx, &menu(&ctx))));
+    window.set_titlebar(Some(&header(&ctx)));
 
     panel.set_places(places(&shared));
     panel.set_usage(usages(&shared));
@@ -626,12 +629,11 @@ fn wire_jobs(ctx: &Ctx) {
     });
 }
 
-/// The window's body: the error strip, the search bar, the sidebar beside the
+/// The window's body: the error strip, the sidebar beside the
 /// presentations, and the status line.
 fn build_content(ctx: &Ctx, panel: &Panel, view: &View) -> gtk::Box {
     let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
     content.append(&ctx.banner);
-    content.append(ctx.find.widget());
     for (label, action) in [
         ("Restore Selected", "win.restore-trash"),
         ("Empty Trash…", "win.empty-trash"),
@@ -651,9 +653,6 @@ fn build_content(ctx: &Ctx, panel: &Panel, view: &View) -> gtk::Box {
     // listing around as it appeared would be a worse interruption than the one it
     // reports. It is invisible until a job is registered, so it costs nothing.
     ctx.jobs.install(&content);
-    // Under the header rather than in it: the bar carries a scope selector and a
-    // status line, which is too wide for a header bar and too tall for a
-    // toolbar. It is hidden until asked for, so it costs nothing otherwise.
 
     let files = gtk::Paned::new(gtk::Orientation::Horizontal);
     files.set_start_child(Some(&ctx.modes));
@@ -717,7 +716,8 @@ fn build_content(ctx: &Ctx, panel: &Panel, view: &View) -> gtk::Box {
     root.set_child(Some(&split));
     root.set_hexpand(true);
     root.set_vexpand(true);
-    root.connect_notify_local(Some("width"), {
+    watch_width(ctx, {
+        let root = root.downgrade();
         let sidebar = panel.widget().clone();
         let inspector = ctx.preview.widget().clone();
         let shared = Rc::clone(&ctx.shared);
@@ -726,8 +726,10 @@ fn build_content(ctx: &Ctx, panel: &Panel, view: &View) -> gtk::Box {
         let split = split.clone();
         let sidebar_overlaid = Cell::new(false);
         let inspector_overlaid = Cell::new(false);
-        move |root, _| {
-            let width = root.width();
+        move |width| {
+            let Some(root) = root.upgrade() else {
+                return;
+            };
             if width == 0 {
                 return;
             }
@@ -816,7 +818,7 @@ fn build_content(ctx: &Ctx, panel: &Panel, view: &View) -> gtk::Box {
     });
     root.add_controller(escape);
     content.append(&root);
-    content.append(&status_bar(view));
+    content.append(&status_bar(ctx, view));
     content
 }
 
@@ -839,8 +841,8 @@ struct Ctx {
     /// Grid/list against columns against the cards. The view keeps its own stack
     /// inside this one.
     modes: gtk::Stack,
-    path: gtk::Label,
-    crumbs: gtk::Box,
+    address: gtk::Entry,
+    mode: Rc<Cell<ViewMode>>,
     banner: gtk::Box,
     banner_label: gtk::Label,
     banner_undo: gtk::Button,
@@ -1159,8 +1161,8 @@ fn navigate(ctx: &Ctx, location: Location, record: bool) {
     if let Some(window) = ctx.window.upgrade() {
         window.set_title(Some(&location.display()));
     }
-    ctx.path.set_label(&location.display());
-    update_crumbs(ctx, &location);
+    set_address(ctx, &location);
+    tint_header(ctx, &location, None);
     ctx.banner.set_visible(false);
     // A menu left open over the folder being left would offer rows for rows that
     // are about to be replaced, and points at a widget that may not survive the
@@ -1207,10 +1209,8 @@ fn navigate(ctx: &Ctx, location: Location, record: bool) {
 
 /// Apply the destination's presentation without recording history or reading it.
 fn show_location(ctx: &Ctx, location: &Location, view: &View) {
-    let (mode, key) = {
-        let prefs = ctx.shared.prefs.borrow();
-        (prefs.view_mode_for(location), prefs.sort_for(location))
-    };
+    let mode = ctx.mode.get();
+    let key = ctx.shared.prefs.borrow().sort_for(location);
     view.set_mode(mode);
     view.resort(key);
     ctx.columns.resort(key);
@@ -1272,6 +1272,10 @@ fn show_cards(ctx: &Ctx) {
 fn paint_cards(ctx: &Ctx, cards: &[Card]) {
     ctx.computer.set_cards(cards);
     ctx.network.set_cards(cards);
+    update_card_count(ctx);
+}
+
+fn update_card_count(ctx: &Ctx) {
     let mode = ctx.modes.visible_child_name();
     if mode.as_deref() == Some("network") {
         if let Some(view) = ctx.view.upgrade() {
@@ -1611,7 +1615,7 @@ fn apply(ctx: &Ctx, mut event: Event) {
                 Some(message) => show_banner(ctx, message),
                 None => ctx.banner.set_visible(false),
             }
-            let _ = hints;
+            tint_header(ctx, &location, hints.map(|hints| hints.remote));
             if let Some(panel) = ctx.panel.upgrade() {
                 panel.set_usage(usages(&ctx.shared));
             }
@@ -1734,7 +1738,8 @@ fn apply(ctx: &Ctx, mut event: Event) {
                 return;
             }
             for other in living() {
-                other.computer.set_devices(cards.iter().filter(|c| !matches!(&c.id, CardId::Device { mountpoint: Some(p), .. } if p == Path::new("/"))).cloned().collect());
+                other.computer.set_devices(cards.clone());
+                update_card_count(&other);
                 repaint_places(&other);
                 let current = other.shared.state.borrow().current.clone();
                 if current
@@ -2025,7 +2030,6 @@ fn found(ctx: &Ctx, page: Found) {
     ctx.modes.set_visible_child_name("view");
     view.set_entries(filtered);
     view.set_status(Some(&page.status));
-    ctx.path.set_label(&page.status);
 }
 
 /// The bar was dismissed, so the folder it was standing in front of comes back —
@@ -2047,7 +2051,6 @@ fn restored(ctx: &Ctx) {
     let Some(location) = current else {
         return;
     };
-    ctx.path.set_label(&location.display());
     show_location(ctx, &location, &view);
     if let Some(dir) = location.virtual_dir() {
         show_virtual(ctx, dir, &view);
@@ -2169,7 +2172,10 @@ fn activate_entry(ctx: &Ctx, entry: &Entry) {
         show_banner(ctx, "Restore this item from Trash before opening it.");
         return;
     }
-    if entry.navigable() {
+    if entry.navigable()
+        && !(entry.kind == ufm_core::EntryKind::Archive
+            && entry.location.as_path().is_some_and(create::is_rar))
+    {
         let target =
             if entry.kind == ufm_core::entry::EntryKind::Archive && entry.location.is_real() {
                 Location::archive(
@@ -2241,6 +2247,12 @@ fn places(shared: &Rc<Shared>) -> Vec<Place> {
     DEVICES.with(|devices| {
         places.extend(devices.borrow().iter().filter_map(|card| {
             if let CardId::Device { path, mountpoint } = &card.id {
+                if matches!(
+                    card.state,
+                    Some("No disc" | "No readable disc" | "Unformatted")
+                ) {
+                    return None;
+                }
                 Some(Place::Device {
                     path: path.clone(),
                     mountpoint: mountpoint.clone(),
@@ -2358,7 +2370,7 @@ fn show_banner(ctx: &Ctx, message: &str) {
     if let Some(app) = ctx.window.upgrade().and_then(|w| w.application()) {
         let notification = gio::Notification::new("Files");
         notification.set_body(Some(message));
-        notification.set_icon(&gio::ThemedIcon::new("org.uflinux.Files"));
+        notification.set_icon(&gio::ThemedIcon::new("folder-symbolic"));
         if let Some(location) = ctx.shared.state.borrow().current.as_ref() {
             notification.set_default_action_and_target_value(
                 "app.open-location",
@@ -2407,7 +2419,7 @@ fn enable(window: &gtk::ApplicationWindow, name: &str, on: bool) {
 }
 
 /// The header bar: navigation, the path, and the menu.
-fn header(ctx: &Ctx, menu: &gio::Menu) -> gtk::HeaderBar {
+fn header(ctx: &Ctx) -> gtk::HeaderBar {
     let bar = gtk::HeaderBar::new();
     bar.set_show_title_buttons(true);
     for (name, icon, tip) in [
@@ -2421,47 +2433,22 @@ fn header(ctx: &Ctx, menu: &gio::Menu) -> gtk::HeaderBar {
         bar.pack_start(&button);
     }
 
-    let sidebar = gtk::Button::from_icon_name("sidebar-show-symbolic");
-    sidebar.set_tooltip_text(Some("Show or hide sidebar"));
-    sidebar.connect_clicked({
-        let panel = ctx.panel.clone();
-        move |_| {
-            if let Some(panel) = panel.upgrade() {
-                panel.widget().set_visible(!panel.widget().is_visible());
-            }
-        }
-    });
-    bar.pack_start(&sidebar);
-    let preview = gtk::Button::from_icon_name("view-reveal-symbolic");
-    preview.set_tooltip_text(Some("Show or hide preview pane (Space)"));
-    preview.set_action_name(Some("win.preview"));
-    bar.pack_end(&preview);
-    let new_folder = gtk::Button::from_icon_name("folder-new-symbolic");
-    new_folder.set_action_name(Some("win.new-folder"));
-    new_folder.set_tooltip_text(Some("New Folder (Ctrl+Shift+N)"));
-    bar.pack_start(&new_folder);
     let search = folder_filter(ctx);
     *ctx.search.borrow_mut() = Some(search.clone());
-    let modes = gtk::MenuButton::builder()
+    let main_menu = gtk::MenuButton::builder()
         .icon_name("open-menu-symbolic")
-        .menu_model(menu)
+        .menu_model(&menu())
+        .tooltip_text("Main menu")
         .build();
-    if let Some(popover) = modes.popover() {
-        popover.connect_show({
-            let model = menu.clone();
-            let ctx = ctx.clone();
-            move |_| {
-                let updated = self::menu(&ctx);
-                model.remove_all();
-                for index in 0..updated.n_items() {
-                    model.append_item(&gio::MenuItem::from_model(&updated, index));
-                }
-            }
-        });
-    }
-    modes.set_tooltip_text(Some("Main menu"));
-    modes.update_property(&[gtk::accessible::Property::Label("Main menu")]);
-    bar.pack_end(&modes);
+    main_menu.update_property(&[gtk::accessible::Property::Label("Main menu")]);
+    bar.pack_end(&main_menu);
+    let view_menu = gtk::MenuButton::builder()
+        .icon_name("view-sort-ascending-symbolic")
+        .menu_model(&view_menu())
+        .tooltip_text("View and sort")
+        .build();
+    view_menu.update_property(&[gtk::accessible::Property::Label("View and sort")]);
+    bar.pack_end(&view_menu);
     let views = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     views.add_css_class("linked");
     for mode in [ViewMode::Grid, ViewMode::List, ViewMode::Columns] {
@@ -2473,62 +2460,54 @@ fn header(ctx: &Ctx, menu: &gio::Menu) -> gtk::HeaderBar {
         views.append(&button);
     }
     bar.pack_end(&views);
-    bar.connect_notify_local(Some("width"), {
+    watch_width(ctx, {
         let views = views.downgrade();
-        move |bar, _| {
+        move |width| {
             if let Some(views) = views.upgrade() {
-                views.set_visible(bar.width() >= 900);
+                views.set_visible(width >= 900);
             }
         }
     });
 
     let search_button = gtk::Button::from_icon_name("system-search-symbolic");
     search_button.set_tooltip_text(Some("Search files"));
-    search_button.connect_clicked({
-        let ctx = ctx.clone();
-        move |_| ctx.find.show_here()
-    });
+    search_button.set_action_name(Some("win.find"));
     bar.pack_end(&search_button);
     let title = gtk::Stack::new();
     title.set_hexpand(true);
-    title.set_hhomogeneous(false);
-    title.set_vhomogeneous(false);
-    let address = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-    address.add_css_class("linked");
-    address.set_hexpand(true);
-    let location_button = gtk::Button::new();
-    location_button.set_hexpand(true);
-    location_button.set_tooltip_text(Some("Edit location (Ctrl+L)"));
-    location_button.add_css_class("flat");
-    let crumb_scroll = gtk::ScrolledWindow::new();
-    crumb_scroll.set_policy(gtk::PolicyType::Automatic, gtk::PolicyType::Never);
-    crumb_scroll.set_hexpand(true);
-    crumb_scroll.set_min_content_width(100);
-    crumb_scroll.set_child(Some(&ctx.crumbs));
-    address.append(&crumb_scroll);
-    address.append(&location_button);
-    let entry = gtk::Entry::new();
+    let entry = ctx.address.clone();
     entry.set_hexpand(true);
-    title.add_named(&address, Some("address"));
-    title.add_named(&entry, Some("entry"));
-    if let Some(content) = ctx
-        .window
-        .upgrade()
-        .and_then(|window| window.child())
-        .and_downcast::<gtk::Box>()
-    {
-        content.insert_child_after(&search, Some(ctx.find.widget()));
+    entry.set_width_chars(12);
+    entry.set_max_width_chars(12);
+    entry.update_property(&[gtk::accessible::Property::Label("Address")]);
+    title.add_named(&entry, Some("address"));
+    title.add_named(&search, Some("filter"));
+    title.add_named(ctx.find.widget(), Some("find"));
+    // GTK ignores hidden pages when measuring a stack, even in homogeneous
+    // mode. Reserve room for the search controls before hiding those pages.
+    search.set_visible(true);
+    ctx.find.widget().set_visible(true);
+    let (min_width, _, _, _) = title.measure(gtk::Orientation::Horizontal, -1);
+    let (min_height, _, _, _) = title.measure(gtk::Orientation::Vertical, min_width);
+    title.set_size_request(min_width, min_height);
+    search.set_visible(false);
+    ctx.find.widget().set_visible(false);
+    title.set_visible_child_name("address");
+    for (widget, name) in [
+        (search.upcast::<gtk::Widget>(), "filter"),
+        (ctx.find.widget().clone().upcast::<gtk::Widget>(), "find"),
+    ] {
+        let title = title.downgrade();
+        widget.connect_visible_notify(move |widget| {
+            if let Some(title) = title.upgrade() {
+                if widget.get_visible() {
+                    title.set_visible_child_name(name);
+                } else if title.visible_child_name().as_deref() == Some(name) {
+                    title.set_visible_child_name("address");
+                }
+            }
+        });
     }
-    search.connect_visible_notify({
-        let title = title.clone();
-        move |filter| {
-            title.set_visible_child_name(if filter.is_visible() {
-                "address"
-            } else {
-                "address"
-            })
-        }
-    });
 
     let edit = gio::SimpleAction::new("location", None);
     edit.connect_activate({
@@ -2542,16 +2521,7 @@ fn header(ctx: &Ctx, menu: &gio::Menu) -> gtk::HeaderBar {
             {
                 filter.emit_by_name::<()>("stop-search", &[]);
             }
-            if let Some(location) = ctx.shared.state.borrow().current.as_ref() {
-                let value = location
-                    .as_path()
-                    .map_or_else(|| location.to_string(), |p| p.display().to_string());
-                entry.set_text(&value);
-            }
-            title.set_visible_child_name("entry");
-            if let Some(window) = ctx.window.upgrade() {
-                window.present();
-            }
+            title.set_visible_child_name("address");
             entry.grab_focus();
             entry.select_region(0, -1);
         }
@@ -2559,10 +2529,8 @@ fn header(ctx: &Ctx, menu: &gio::Menu) -> gtk::HeaderBar {
     if let Some(window) = ctx.window.upgrade() {
         window.add_action(&edit);
     }
-    location_button.set_action_name(Some("win.location"));
     entry.connect_activate({
         let ctx = ctx.clone();
-        let title = title.clone();
         move |entry| {
             let input = entry.text();
             let input = if input == "~" {
@@ -2576,8 +2544,8 @@ fn header(ctx: &Ctx, menu: &gio::Menu) -> gtk::HeaderBar {
                 Ok(location) => {
                     entry.remove_css_class("error");
                     entry.set_tooltip_text(None);
-                    title.set_visible_child_name("address");
                     navigate(&ctx, location, true);
+                    ctx.modes.child_focus(gtk::DirectionType::TabForward);
                 }
                 Err(error) => {
                     entry.add_css_class("error");
@@ -2588,10 +2556,12 @@ fn header(ctx: &Ctx, menu: &gio::Menu) -> gtk::HeaderBar {
     });
     let keys = gtk::EventControllerKey::new();
     keys.connect_key_pressed({
-        let title = title.clone();
+        let ctx = ctx.clone();
         move |_, key, _, _| {
             if key == gtk::gdk::Key::Escape {
-                title.set_visible_child_name("address");
+                if let Some(location) = ctx.shared.state.borrow().current.as_ref() {
+                    set_address(&ctx, location);
+                }
                 glib::Propagation::Stop
             } else {
                 glib::Propagation::Proceed
@@ -2599,16 +2569,6 @@ fn header(ctx: &Ctx, menu: &gio::Menu) -> gtk::HeaderBar {
         }
     });
     entry.add_controller(keys);
-    ctx.find.widget().connect_visible_notify({
-        let title = title.clone();
-        move |search| {
-            title.set_visible_child_name(if search.is_visible() {
-                "address"
-            } else {
-                "address"
-            })
-        }
-    });
     bar.set_title_widget(Some(&title));
     bar
 }
@@ -2620,6 +2580,8 @@ fn folder_filter(ctx: &Ctx) -> gtk::SearchEntry {
     let search = gtk::SearchEntry::new();
     search.set_placeholder_text(Some("Filter names in this folder"));
     search.set_visible(false);
+    search.set_width_chars(12);
+    search.set_max_width_chars(12);
     search.connect_search_changed({
         let ctx = ctx.clone();
         move |entry| {
@@ -2663,10 +2625,25 @@ fn folder_filter(ctx: &Ctx) -> gtk::SearchEntry {
     search
 }
 
-/// The primary menu. The three modes are one action with a string parameter so
-/// GTK can draw a radio group without three separate actions.
-fn menu(ctx: &Ctx) -> gio::Menu {
+fn menu() -> gio::Menu {
     let menu = gio::Menu::new();
+    let show = gio::Menu::new();
+    show.append(Some("Show hidden files"), Some("win.hidden"));
+    show.append(Some("Picture previews"), Some("win.thumbnails"));
+    let network = gio::Menu::new();
+    network.append(Some("Connect to Server…"), Some("win.connect"));
+    let window = gio::Menu::new();
+    window.append(Some("Filter names in this folder"), Some("win.search"));
+    window.append(Some("Search files and apps"), Some("win.find"));
+    window.append(Some("New window"), Some("win.new-window"));
+    menu.append_section(None, &show);
+    menu.append_section(None, &network);
+    menu.append_section(None, &window);
+    menu
+}
+
+/// Shared view and sort controls, including when the mode buttons are hidden.
+fn view_menu() -> gio::Menu {
     let view = gio::Menu::new();
     for mode in [ViewMode::Grid, ViewMode::List, ViewMode::Columns] {
         view.append(
@@ -2674,68 +2651,6 @@ fn menu(ctx: &Ctx) -> gio::Menu {
             Some(&format!("win.mode('{}')", mode_name(mode))),
         );
     }
-    let show = gio::Menu::new();
-    show.append(Some("Show hidden files"), Some("win.hidden"));
-    show.append(Some("Picture previews"), Some("win.thumbnails"));
-    show.append(Some("Preview pane"), Some("win.preview"));
-    // The file operations, in the order a user reaches for them: make something,
-    // name it, get rid of it, move it. `Delete Permanently` is spelled out rather
-    // than shortened to `Delete`, because a menu that offers both has to say which
-    // one can be undone.
-    let files = gio::Menu::new();
-    // First, and above the commands that act on a row: it is the only row here
-    // that acts on the last operation rather than on the selection, and a user
-    // who has just watched something they did go wrong looks at the top of the
-    // list, not the middle. Disabled until there is something to undo, so the row
-    // is honest about a folder nothing has touched yet.
-    files.append(Some("Undo"), Some("win.undo"));
-    files.append(Some("Restore from Trash"), Some("win.restore-trash"));
-    files.append(Some("Empty Trash…"), Some("win.empty-trash"));
-    // First among the commands that act on a row, because it is the one a user
-    // reaches for before anything else: the folder opened by double-click and the
-    // default handler disagree, or there is no default handler, and this is where
-    // the machine says what it actually has registered. No chord, for the reason
-    // the context menu's Open row has none — `Return` already means "take this
-    // row", and a second name for one command is a chord wasted.
-    files.append(Some("Open With\u{2026}"), Some("win.open-with"));
-    files.append(Some("New Folder"), Some("win.new-folder"));
-    // Rebuilt when opened, so the labels describe the current selection.
-    files.append(
-        Some(if all_starred(&targets(ctx)) {
-            "Unstar"
-        } else {
-            "Star"
-        }),
-        Some("win.star"),
-    );
-    files.append(
-        Some(if current_bookmarked(ctx) {
-            "Remove Folder Bookmark"
-        } else {
-            "Bookmark This Folder"
-        }),
-        Some("win.bookmark"),
-    );
-    files.append(Some("Rename"), Some("win.rename"));
-    files.append(Some("Move to Trash"), Some("win.trash"));
-    files.append(Some("Delete Permanently"), Some("win.delete"));
-    files.append(Some("Copy"), Some("win.copy"));
-    files.append(Some("Cut"), Some("win.cut"));
-    files.append(Some("Paste"), Some("win.paste"));
-    // Its own row rather than a submenu: extracting is the reason most people
-    // open an archive at all, and the label says what happens — a folder named
-    // after the container, appearing beside it, with no dialog in between.
-    files.append(Some("Extract to Folder"), Some("win.extract"));
-    // Last, because it is the one command here that changes nothing: a user
-    // reaches for it to find out what something is, not to make it become
-    // something else.
-    files.append(Some("Properties"), Some("win.properties"));
-    let network = gio::Menu::new();
-    network.append(Some("Connect to Server…"), Some("win.connect"));
-    let window = gio::Menu::new();
-    window.append(Some("Filter names in this folder"), Some("win.search"));
-    window.append(Some("Search files and apps"), Some("win.find"));
-    window.append(Some("New window"), Some("win.new-window"));
     let sorting = gio::Menu::new();
     for (label, value) in [
         ("Name", "name"),
@@ -2747,12 +2662,7 @@ fn menu(ctx: &Ctx) -> gio::Menu {
         sorting.append(Some(label), Some(&format!("win.sort('{value}')")));
     }
     view.append_submenu(Some("Sort By"), &sorting);
-    menu.append_submenu(Some("View"), &view);
-    menu.append_submenu(Some("File Actions"), &files);
-    menu.append_section(None, &show);
-    menu.append_section(None, &network);
-    menu.append_section(None, &window);
-    menu
+    view
 }
 
 fn mode_name(mode: ViewMode) -> &'static str {
@@ -3572,21 +3482,26 @@ fn mode_action(ctx: &Ctx) -> Rc<gio::SimpleAction> {
             let Some(mode) = mode_named(&name) else {
                 return;
             };
+            ctx.mode.set(mode);
             let columns = mode == ViewMode::Columns;
             let was_columns = columns_on(&ctx);
             if let Some(view) = ctx.view.upgrade() {
                 view.set_mode(mode);
             }
             let here = ctx.shared.state.borrow().current.clone();
-            // The cards stay under a mode change: the choice is between grid, list
-            // and columns, and a location with no rows behind it has none of the
-            // three to move to. The preference below still records the choice, so
-            // the next folder the user opens uses it.
             let child = here.as_ref().map_or_else(
                 || if columns { "columns" } else { "view" },
                 |location| presentation(location, mode),
             );
+            let child = if ctx.shared.state.borrow().results.is_some() {
+                "view"
+            } else {
+                child
+            };
             ctx.modes.set_visible_child_name(child);
+            if child != "columns" {
+                ctx.columns.forget();
+            }
             // Coming back to columns after a while, or arriving here for the
             // first time: the chain has to be built, and any pane that was
             // dropped while hidden has to come back.
@@ -3610,16 +3525,15 @@ fn mode_action(ctx: &Ctx) -> Rc<gio::SimpleAction> {
                         ctx.columns.expect_leaf(read);
                     } else {
                         ctx.columns.fill_leaf(&location, &shown);
+                        let query = ctx.shared.state.borrow().query.clone();
+                        if !query.is_empty() {
+                            ctx.columns.set_filter(&location, &filter(&shown, &query));
+                        }
                     }
                 }
             }
             action.set_state(&name.to_variant());
-            let current = ctx.shared.state.borrow().current.clone();
-            if let Some(location) = current {
-                edit_prefs(&ctx.shared, |prefs| {
-                    prefs.set_view_mode_for(&location, mode);
-                });
-            }
+            sync_watches(&ctx);
         }
     });
     Rc::new(mode)
@@ -3646,12 +3560,12 @@ fn search_actions(ctx: &Ctx) -> Vec<Rc<gio::SimpleAction>> {
     find.connect_activate({
         let ctx = ctx.clone();
         move |_action, _parameter| {
-            ctx.find.show_here();
             if let Some(entry) = ctx.search.borrow().as_ref() {
                 if entry.get_visible() {
                     entry.emit_by_name::<()>("stop-search", &[]);
                 }
             }
+            ctx.find.show_here();
         }
     });
 
@@ -4472,7 +4386,7 @@ fn context_actions(ctx: &Ctx) -> Vec<Rc<gio::SimpleAction>> {
             ctx.popup.hide();
             // Two popovers over one row answer one question, so the preview steps
             // aside rather than competing for the same corner of the screen.
-            ctx.popup.show(&window, &menu_rows(&ctx, true), None);
+            open_context(&ctx, &window, &targets(&ctx), true, None);
         }
     });
 
@@ -4484,7 +4398,7 @@ fn context_actions(ctx: &Ctx) -> Vec<Rc<gio::SimpleAction>> {
         move |_action, _parameter| {
             if let Some(window) = ctx.window.upgrade()
                 && gtk::prelude::GtkWindowExt::focus(&window)
-                    .is_some_and(|focus| focus.is::<gtk::Entry>() || focus.is::<gtk::SearchEntry>())
+                    .is_some_and(|focus| focus.is::<gtk::Editable>())
             {
                 return;
             }
@@ -4513,50 +4427,153 @@ fn context_actions(ctx: &Ctx) -> Vec<Rc<gio::SimpleAction>> {
         }
     });
 
-    vec![Rc::new(open), Rc::new(menu), Rc::new(preview)]
+    let sidebar = gio::SimpleAction::new("sidebar", None);
+    sidebar.connect_activate({
+        let panel = ctx.panel.clone();
+        let preview = ctx.preview.widget().downgrade();
+        move |_, _| {
+            if let Some(panel) = panel.upgrade() {
+                let show = !panel.widget().get_visible();
+                if show
+                    && panel
+                        .widget()
+                        .parent()
+                        .is_some_and(|parent| parent.is::<gtk::Overlay>())
+                    && let Some(preview) = preview.upgrade()
+                {
+                    preview.set_visible(false);
+                }
+                panel.widget().set_visible(show);
+            }
+        }
+    });
+    let document = gio::SimpleAction::new("new-document", Some(glib::VariantTy::STRING));
+    document.connect_activate({
+        let ctx = ctx.clone();
+        move |_, value| {
+            let Some(uri) = value.and_then(glib::Variant::str) else {
+                return;
+            };
+            let Some(source) = gio::File::for_uri(uri).path() else {
+                return;
+            };
+            let Some(folder) =
+                target_folder(&ctx).and_then(|location| location.as_path().map(Path::to_path_buf))
+            else {
+                return;
+            };
+            if let Some((_, handle)) = sink_for(&ctx) {
+                create::document(&handle, &ctx.jobs, source, folder);
+            }
+        }
+    });
+
+    let compress = gio::SimpleAction::new("compress", Some(glib::VariantTy::STRING));
+    compress.connect_activate({
+        let ctx = ctx.clone();
+        move |_, value| {
+            let Some(format) = value
+                .and_then(glib::Variant::str)
+                .and_then(create::format_for)
+            else {
+                return;
+            };
+            let picked = targets(&ctx);
+            if !in_trash(&ctx)
+                && let Some(folder) = create::source_folder(&picked)
+                && let Some((window, handle)) = sink_for(&ctx)
+            {
+                if format.extension == ".rar" && glib::find_program_in_path("rar").is_none() {
+                    show_banner(&ctx, "The rar command is required to create RAR archives.");
+                    return;
+                }
+                create::ask_archive(
+                    &window,
+                    &handle,
+                    Rc::clone(&ctx.jobs),
+                    folder,
+                    picked,
+                    format,
+                );
+            }
+        }
+    });
+    vec![
+        Rc::new(open),
+        Rc::new(menu),
+        Rc::new(preview),
+        Rc::new(sidebar),
+        Rc::new(document),
+        Rc::new(compress),
+    ]
 }
 
-/// The rows for a menu opened without a press, from the state the window is in.
-fn menu_rows(ctx: &Ctx, in_current: bool) -> Vec<popup::Command> {
-    let picked = targets(ctx);
-    let scope = popup::Scope {
-        in_current,
-        extracting: extract_target(ctx).is_some(),
-        openable: open_with_target(ctx).is_some(),
-        pastable: can_paste(ctx),
-        starred: all_starred(&picked),
-        bookmarked: current_bookmarked(ctx),
-    };
-    popup::rows_for(&picked, scope)
-}
-
-/// Open the menu over a press. `widget` and the coordinates are the press itself,
-/// so the menu appears under the pointer rather than at some default spot.
-///
-/// A press off the rows asks for the folder's menu even when rows are still
-/// selected: the user clicked the folder, and a menu of row commands there would
-/// answer a question that was not asked.
 fn show_context_menu(ctx: &Ctx, widget: &gtk::Widget, target: popup::Target, x: f64, y: f64) {
     let Some(window) = ctx.window.upgrade() else {
         return;
     };
     let picked = target.position().map_or_else(Vec::new, |_| targets(ctx));
+    open_context(
+        ctx,
+        &window,
+        &picked,
+        target.in_current(),
+        Some((widget, x, y)),
+    );
+}
+
+fn open_context(
+    ctx: &Ctx,
+    window: &gtk::ApplicationWindow,
+    picked: &[Entry],
+    in_current: bool,
+    spot: Option<(&gtk::Widget, f64, f64)>,
+) {
     let scope = popup::Scope {
-        in_current: target.in_current(),
-        // Asked of the window rather than of the rows: the answer is the same
-        // whenever the menu would have a row to unpack, and the action's own
-        // sensitivity is what stops a stale answer from doing anything.
+        in_current,
         extracting: extract_target(ctx).is_some(),
         openable: open_with_target(ctx).is_some(),
         pastable: can_paste(ctx),
-        starred: all_starred(&picked),
+        starred: all_starred(picked),
         bookmarked: current_bookmarked(ctx),
     };
-    ctx.popup.show(
-        &window,
-        &popup::rows_for(&picked, scope),
-        Some((widget, x, y)),
-    );
+    let model = popup::model(&popup::rows_for(picked, scope));
+    if !in_trash(ctx) && create::source_folder(picked).is_some() {
+        let section = gio::Menu::new();
+        section.append_submenu(Some("Compress"), &create::formats());
+        model.append_section(None, &section);
+    }
+    if picked.is_empty()
+        && in_current
+        && let Some(folder) =
+            target_folder(ctx).and_then(|location| location.as_path().map(Path::to_path_buf))
+    {
+        let show_hidden = ctx.shared.prefs.borrow().show_hidden;
+        let section = gio::Menu::new();
+        model.append_section(None, &section);
+        glib::spawn_future_local(async move {
+            let scanned = gio::spawn_blocking(move || {
+                let info = gio::File::for_path(folder).query_info(
+                    "access::can-write",
+                    gio::FileQueryInfoFlags::NONE,
+                    None::<&gio::Cancellable>,
+                );
+                if info.is_ok_and(|info| info.boolean("access::can-write")) {
+                    create::templates_root()
+                        .map_or_else(Vec::new, |root| create::templates(&root, show_hidden, 0))
+                } else {
+                    Vec::new()
+                }
+            })
+            .await;
+            if let Ok(templates) = scanned
+                && !templates.is_empty()
+            {
+                section.append_submenu(Some("New Document"), &create::template_menu(&templates));
+            }
+        });
+    }
+    ctx.popup.show_model(window, &model, spot);
 }
 
 /// The keyboard. Set on the application rather than the window, so a shortcut
@@ -4572,6 +4589,7 @@ fn install_accels(app: &gtk::Application) {
     // every window would be a claim about the others that nothing here keeps.
     app.set_accels_for_action("win.close", &["<Ctrl>W"]);
     app.set_accels_for_action("win.hidden", &["<Ctrl>H"]);
+    app.set_accels_for_action("win.sidebar", &["F9"]);
     app.set_accels_for_action("win.location", &["<Ctrl>L"]);
     app.set_accels_for_action("win.search", &["<Ctrl>F"]);
     app.set_accels_for_action("win.find", &["<Ctrl><Shift>F"]);
@@ -4672,54 +4690,34 @@ fn sweep_on_idle(shared: Weak<Shared>) {
 
 /// The path shown in place of a title: ellipsised in the middle, so a long path
 /// still shows the folder the user is in.
-fn path_label(location: &Location) -> gtk::Label {
-    let label = gtk::Label::new(Some(&location.display()));
-    label.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
-    label.set_max_width_chars(48);
-    label.set_selectable(true);
-    label
+fn address_text(location: &Location) -> String {
+    match location {
+        Location::File { path } if path.to_str().is_some_and(|text| text.trim() == text) => {
+            path.to_string_lossy().into_owned()
+        }
+        _ => location.to_string(),
+    }
 }
 
-fn breadcrumb_locations(location: &Location) -> Vec<Location> {
-    let mut chain = vec![location.clone()];
-    while let Some(parent) = chain.last().and_then(Location::parent) {
-        chain.push(parent);
-    }
-    chain.reverse();
-    chain
+fn set_address(ctx: &Ctx, location: &Location) {
+    ctx.address.set_text(&address_text(location));
+    ctx.address.remove_css_class("error");
+    ctx.address.set_tooltip_text(None);
 }
 
-fn update_crumbs(ctx: &Ctx, location: &Location) {
-    while let Some(child) = ctx.crumbs.first_child() {
-        ctx.crumbs.remove(&child);
-    }
-    for target in breadcrumb_locations(location) {
-        let label = match &target {
-            Location::Archive { archive, inner } => {
-                if inner.is_empty() {
-                    archive
-                        .file_name()
-                        .unwrap_or_default()
-                        .to_string_lossy()
-                        .into_owned()
-                } else {
-                    inner.rsplit('/').next().unwrap_or(inner).to_string()
-                }
-            }
-            Location::File { path } if *path == paths::home() => "Home".to_string(),
-            Location::File { path } => path.file_name().map_or_else(
-                || path.display().to_string(),
-                |name| name.to_string_lossy().into_owned(),
-            ),
-            _ => target.display(),
-        };
-        let button = gtk::Button::with_label(&label);
-        button.set_tooltip_text(Some(&target.display()));
-        button.connect_clicked({
-            let ctx = ctx.clone();
-            move |_| navigate(&ctx, target.clone(), true)
-        });
-        ctx.crumbs.append(&button);
+fn tint_header(ctx: &Ctx, location: &Location, remote: Option<bool>) {
+    let Some(bar) = ctx.window.upgrade().and_then(|window| window.titlebar()) else {
+        return;
+    };
+    bar.remove_css_class("ufm-archive-header");
+    bar.remove_css_class("ufm-remote-header");
+    if matches!(location, Location::Archive { .. }) {
+        bar.add_css_class("ufm-archive-header");
+    } else if location
+        .as_path()
+        .is_some_and(|path| remote.unwrap_or_else(|| ufm_vfs::fsinfo::is_remote_mount(path)))
+    {
+        bar.add_css_class("ufm-remote-header");
     }
 }
 
@@ -4753,13 +4751,58 @@ fn banner_bar() -> (gtk::Box, gtk::Label, gtk::Button) {
     (box_, label, undo)
 }
 
+fn watch_width(ctx: &Ctx, update: impl Fn(i32) + 'static) {
+    let Some(window) = ctx.window.upgrade() else {
+        return;
+    };
+    let update = Rc::new(update);
+    window.connect_realize(move |window| {
+        if let Some(surface) = window.surface() {
+            let update = Rc::clone(&update);
+            surface.connect_layout(move |_, width, _| update(width));
+        }
+    });
+}
+
 /// The status bar: the view's own item count, the only number that can agree
 /// with what the user sees selected.
-fn status_bar(view: &View) -> gtk::Box {
+fn status_bar(ctx: &Ctx, view: &View) -> gtk::Box {
     let box_ = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     box_.set_margin_start(6);
     box_.set_margin_end(6);
-    box_.append(&view.status_label());
+    let sidebar = gtk::Button::from_icon_name("sidebar-show-symbolic");
+    sidebar.set_action_name(Some("win.sidebar"));
+    sidebar.set_tooltip_text(Some("Show or hide sidebar (F9)"));
+    sidebar.set_visible(false);
+    watch_width(ctx, {
+        let sidebar = sidebar.downgrade();
+        move |width| {
+            if let Some(sidebar) = sidebar.upgrade() {
+                sidebar.set_visible(width < 700);
+            }
+        }
+    });
+    box_.append(&sidebar);
+    let status = view.status_label();
+    status.set_hexpand(true);
+    status.set_xalign(0.0);
+    box_.append(&status);
+    let more = ctx.find.more_button();
+    box_.append(more);
+    more.set_visible(true);
+    let (_, button_height, _, _) = more.measure(gtk::Orientation::Vertical, -1);
+    more.set_visible(false);
+    box_.set_size_request(-1, button_height);
+    let search_status = ctx.find.status_label();
+    search_status.set_hexpand(true);
+    search_status.set_xalign(0.0);
+    search_status.set_visible(false);
+    box_.insert_child_after(search_status, Some(&status));
+    search_status.connect_label_notify(move |label| {
+        let searching = !label.label().is_empty();
+        label.set_visible(searching);
+        status.set_visible(!searching);
+    });
     box_
 }
 
@@ -4849,10 +4892,12 @@ mod tests {
                     descending: true,
                     ..SortKey::default()
                 };
-                ctx.shared
-                    .prefs
-                    .borrow_mut()
-                    .set_view_mode_for(&folder, ViewMode::Columns);
+                gtk::prelude::WidgetExt::activate_action(
+                    &ctx.window.upgrade().unwrap(),
+                    "win.mode",
+                    Some(&"columns".to_variant()),
+                )
+                .unwrap();
                 ctx.shared.prefs.borrow_mut().set_sort_for(&folder, key);
                 navigate(ctx, folder.clone(), true);
                 assert!(columns_on(ctx));
@@ -4893,12 +4938,55 @@ mod tests {
                     .borrow_mut()
                     .set_view_mode_for(&list_folder, ViewMode::List);
                 navigate(ctx, list_folder, true);
-                assert_eq!(view.mode(), ViewMode::List);
-                assert_eq!(ctx.modes.visible_child_name().as_deref(), Some("view"));
-                assert!(ctx.columns.pane_locations().is_empty());
+                assert_eq!(view.mode(), ViewMode::Columns);
+                assert!(columns_on(ctx));
                 go_up(ctx);
                 assert_eq!(ctx.shared.state.borrow().current.as_ref(), Some(&folder));
                 assert!(columns_on(ctx));
+            })
+        });
+    }
+
+    #[test]
+    fn mode_changes_are_private_to_the_window() {
+        super::super::tk::ui(|| {
+            with_navigation_window(|ctx, _| {
+                let window = ctx.window.upgrade().unwrap();
+                let app = window.application().unwrap();
+                gtk::prelude::WidgetExt::activate_action(
+                    &window,
+                    "win.mode",
+                    Some(&"columns".to_variant()),
+                )
+                .unwrap();
+                open(&app, &["computer://".into()]);
+                let other = OPEN.with(|windows| windows.borrow().last().unwrap().ctx.clone());
+                assert_eq!(ctx.mode.get(), ViewMode::Columns);
+                assert_eq!(other.mode.get(), ViewMode::Grid);
+                other.window.upgrade().unwrap().close();
+                open(&app, &["computer://".into()]);
+                let reopened = OPEN.with(|windows| windows.borrow().last().unwrap().ctx.clone());
+                assert_eq!(reopened.mode.get(), ViewMode::Grid);
+                reopened.window.upgrade().unwrap().close();
+            })
+        });
+    }
+
+    #[test]
+    fn search_and_address_share_one_header_slot() {
+        super::super::tk::ui(|| {
+            with_navigation_window(|ctx, _| {
+                let window = ctx.window.upgrade().unwrap();
+                let title = ctx.address.parent().and_downcast::<gtk::Stack>().unwrap();
+                assert_eq!(title.visible_child_name().as_deref(), Some("address"));
+                for action in ["win.search", "win.find"] {
+                    gtk::prelude::WidgetExt::activate_action(&window, action, None).unwrap();
+                    assert_ne!(title.visible_child_name().as_deref(), Some("address"));
+                    gtk::prelude::WidgetExt::activate_action(&window, "win.location", None)
+                        .unwrap();
+                    assert_eq!(title.visible_child_name().as_deref(), Some("address"));
+                    assert_eq!(ctx.address.text(), "computer://");
+                }
             })
         });
     }
@@ -4963,10 +5051,12 @@ mod tests {
             with_navigation_window(|ctx, _view| {
                 let temp = tempfile::tempdir().unwrap();
                 let folder = Location::file(temp.path());
-                ctx.shared
-                    .prefs
-                    .borrow_mut()
-                    .set_view_mode_for(&folder, ViewMode::Columns);
+                gtk::prelude::WidgetExt::activate_action(
+                    &ctx.window.upgrade().unwrap(),
+                    "win.mode",
+                    Some(&"columns".to_variant()),
+                )
+                .unwrap();
                 navigate(ctx, folder.clone(), true);
                 let read = ctx.shared.state.borrow().read.unwrap();
                 ctx.find.show();
@@ -5000,7 +5090,7 @@ mod tests {
     }
 
     #[test]
-    fn activating_an_archive_enters_its_root_and_breadcrumbs_keep_inner_paths() {
+    fn address_field_navigates_archive_paths_and_tracks_history() {
         super::super::tk::ui(|| {
             with_navigation_window(|ctx, _view| {
                 let temp = tempfile::tempdir().unwrap();
@@ -5009,19 +5099,40 @@ mod tests {
                 let mut archive = entry("bundle.tar");
                 archive.kind = EntryKind::Archive;
                 archive.location = Location::file(&path);
+                let bar = ctx.window.upgrade().unwrap().titlebar().unwrap();
+                tint_header(ctx, &Location::file(temp.path()), Some(true));
+                assert!(bar.has_css_class("ufm-remote-header"));
                 activate_entry(ctx, &archive);
                 let root = Location::archive(&path, &[] as &[&str]).unwrap();
                 assert_eq!(ctx.shared.state.borrow().current.as_ref(), Some(&root));
                 let inner = root.join("docs").unwrap().join("deep").unwrap();
-                let crumbs = breadcrumb_locations(&inner);
-                assert_eq!(
-                    &crumbs[crumbs.len() - 3..],
-                    &[root.clone(), root.join("docs").unwrap(), inner]
+                assert_eq!(ctx.address.text(), address_text(&root));
+                assert!(
+                    ctx.window
+                        .upgrade()
+                        .unwrap()
+                        .titlebar()
+                        .unwrap()
+                        .has_css_class("ufm-archive-header")
                 );
+                ctx.address.set_text(&address_text(&inner));
+                ctx.address.emit_activate();
+                assert_eq!(ctx.shared.state.borrow().current.as_ref(), Some(&inner));
                 go_up(ctx);
-                assert_eq!(
-                    ctx.shared.state.borrow().current,
-                    Some(Location::file(temp.path()))
+                assert_eq!(ctx.address.text(), address_text(&inner.parent().unwrap()));
+                ctx.address.set_text("invalid path");
+                ctx.address.emit_activate();
+                assert!(ctx.address.has_css_class("error"));
+                navigate(ctx, Location::computer(), true);
+                assert_eq!(ctx.address.text(), "computer://");
+                assert!(!ctx.address.has_css_class("error"));
+                assert!(
+                    !ctx.window
+                        .upgrade()
+                        .unwrap()
+                        .titlebar()
+                        .unwrap()
+                        .has_css_class("ufm-archive-header")
                 );
             })
         });

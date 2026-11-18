@@ -228,10 +228,15 @@ fn device_dispatch(argv: &[String]) -> Result<u8, String> {
                 | "exfat"
                 | "ntfs"
                 | "ntfs3"
+                | "iso9660"
+                | "udf"
         ) {
             return Err(format!("{kind} is not a supported unencrypted filesystem"));
         }
         let mut options = "nosuid,nodev".to_string();
+        if matches!(kind.as_str(), "iso9660" | "udf") {
+            options.push_str(",ro,noexec");
+        }
         if matches!(kind.as_str(), "vfat" | "exfat" | "ntfs" | "ntfs3") {
             let group = std::fs::metadata(&allowed)
                 .map_err(|e| e.to_string())?

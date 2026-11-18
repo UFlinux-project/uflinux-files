@@ -122,8 +122,8 @@ pub enum SearchScope {
 pub struct Preferences {
     pub version: u32,
     pub view_mode: ViewMode,
-    /// Per-location overrides, keyed by the location URI. A folder opened in
-    /// Columns mode stays in Columns mode without changing the default.
+    /// Legacy per-location overrides retained for configuration compatibility.
+    /// Window mode is initialized from `view_mode`.
     pub view_modes: HashMap<String, ViewMode>,
     pub sort: SortKey,
     pub sorts: HashMap<String, SortKey>,

@@ -295,17 +295,17 @@ fn text_of(name: *const libc::c_char) -> Option<String> {
     text.to_str().ok().map(str::to_string)
 }
 
-/// Binary multiples, matching what the GNOME ecosystem shows: 1 KiB = 1024.
+/// Decimal SI units for byte sizes. One kilobyte is 1,000 bytes.
 #[must_use]
 pub fn human_size(bytes: u64) -> String {
-    const UNITS: [&str; 6] = ["B", "KiB", "MiB", "GiB", "TiB", "PiB"];
-    if bytes < 1024 {
+    const UNITS: [&str; 7] = ["B", "kB", "MB", "GB", "TB", "PB", "EB"];
+    if bytes < 1_000 {
         return format!("{bytes} B");
     }
     let mut value = bytes as f64;
     let mut unit = 0;
-    while value >= 1024.0 && unit < UNITS.len() - 1 {
-        value /= 1024.0;
+    while value >= 1_000.0 && unit < UNITS.len() - 1 {
+        value /= 1_000.0;
         unit += 1;
     }
     // Below 10 the extra digit is worth having, above that it is noise.
@@ -328,17 +328,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn sizes_use_binary_multiples() {
+    fn sizes_use_decimal_multiples() {
         assert_eq!(human_size(0), "0 B");
         assert_eq!(human_size(999), "999 B");
-        assert_eq!(human_size(1024), "1.0 KiB");
-        assert_eq!(human_size(1536), "1.5 KiB");
-        assert_eq!(human_size(1024 * 1024), "1.0 MiB");
-        assert_eq!(human_size(1024 * 1024 * 1024), "1.0 GiB");
-        // Below ten the decimal is informative; above it the extra digit is noise.
-        assert_eq!(human_size(1_610_612_736), "1.5 GiB");
-        assert_eq!(human_size(16 * 1024 * 1024 * 1024), "16 GiB");
-        assert_eq!(human_size(u64::MAX), "16384 PiB");
+        assert_eq!(human_size(1_000), "1.0 kB");
+        assert_eq!(human_size(1_500), "1.5 kB");
+        assert_eq!(human_size(1_000_000), "1.0 MB");
+        assert_eq!(human_size(1_000_000_000), "1.0 GB");
+        assert_eq!(human_size(1_610_612_736), "1.6 GB");
+        assert_eq!(human_size(16 * 1024 * 1024 * 1024), "17 GB");
+        assert_eq!(human_size(u64::MAX), "18 EB");
     }
 
     #[test]

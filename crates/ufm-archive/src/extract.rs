@@ -681,7 +681,7 @@ mod tests {
             bytes: 2048,
             skipped: Vec::new(),
         };
-        assert_eq!(report.summary(), "Extracted 3 items (2.0 KiB) into /tmp/o");
+        assert_eq!(report.summary(), "Extracted 3 items (2.0 kB) into /tmp/o");
     }
 
     #[test]

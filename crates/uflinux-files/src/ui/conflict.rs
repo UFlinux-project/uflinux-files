@@ -529,8 +529,8 @@ mod tests {
             assert!(text.starts_with("A file named"), "{text}");
             let details = details_of(&form.window);
             assert_eq!(details.len(), 2, "both sides are described");
-            assert!(details[0].contains("4.0 KiB"), "incoming: {}", details[0]);
-            assert!(details[1].contains("1.0 KiB"), "existing: {}", details[1]);
+            assert!(details[0].contains("4.1 kB"), "incoming: {}", details[0]);
+            assert!(details[1].contains("1.0 kB"), "existing: {}", details[1]);
         });
     }
 

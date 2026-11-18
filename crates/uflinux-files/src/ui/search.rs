@@ -182,11 +182,12 @@ impl Search {
     #[must_use]
     pub fn new(scope: &SearchScope, content: bool, include_hidden: bool) -> Self {
         let bar = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-        bar.add_css_class("ufm-find");
         bar.set_visible(false);
         let entry = gtk::SearchEntry::new();
         entry.set_placeholder_text(Some("Search files and apps"));
         entry.set_hexpand(true);
+        entry.set_width_chars(12);
+        entry.set_max_width_chars(12);
         let target = gtk::DropDown::from_strings(&[
             "Folder and Subfolders",
             "Home",
@@ -196,13 +197,20 @@ impl Search {
         target.set_tooltip_text(Some("Where to look"));
         let status = gtk::Label::new(None);
         status.add_css_class("ufm-meta");
+        status.set_accessible_role(gtk::AccessibleRole::Status);
         status.set_ellipsize(gtk::pango::EllipsizeMode::End);
         bar.append(&entry);
-        bar.append(&target);
-        bar.append(&status);
+        let scope_popover = gtk::Popover::new();
+        scope_popover.set_child(Some(&target));
+        let options = gtk::MenuButton::builder()
+            .icon_name("view-more-symbolic")
+            .tooltip_text("Search scope")
+            .popover(&scope_popover)
+            .build();
+        bar.append(&options);
         let more = gtk::Button::with_label("Load More");
         more.set_visible(false);
-        bar.append(&more);
+        more.add_css_class("flat");
 
         let wanted = Target::from_scope(scope);
         target.set_selected(wanted.index());
@@ -237,6 +245,14 @@ impl Search {
     #[must_use]
     pub fn widget(&self) -> &gtk::Box {
         &self.inner.bar
+    }
+
+    pub fn more_button(&self) -> &gtk::Button {
+        &self.inner.more
+    }
+
+    pub fn status_label(&self) -> &gtk::Label {
+        &self.inner.status
     }
 
     /// Whether the bar is on screen. The window uses this to tell a folder from

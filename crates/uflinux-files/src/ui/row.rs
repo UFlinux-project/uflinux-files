@@ -211,7 +211,7 @@ mod tests {
         assert_eq!(Row::new(dir3).size_label(), "");
         let mut file = entry("raw.bin", EntryKind::File);
         file.size = 1024;
-        assert_eq!(Row::new(file).size_label(), "1.0 KiB");
+        assert_eq!(Row::new(file).size_label(), "1.0 kB");
     }
 
     #[test]

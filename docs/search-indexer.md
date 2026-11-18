@@ -221,29 +221,12 @@ go in as body text, not as labels — "disk usage" has to find the entry whose
 comment merely mentions it, and a label is a filter, not free text. `Categories`
 and `Keywords` become the labels.
 
-The handoff contract, which is what lets a future start menu drop its own
-catalog:
-
-- A caller sends `SearchApps` with text and optionally a list of categories. There
-  is no `scope`: application entries all live in the same places, and a directory
-  filter there would only ever exclude things the caller wanted.
-- It gets back `Hit` rows whose `path` is the `.desktop` file, whose `name` is
-  `Name`, and whose `labels` are its categories and keywords. The stored `Exec` and
-  `Icon` are on the record.
-- **It never parses `Exec` and never launches a process itself.** It asks the
-  daemon, which expands the entry's field codes with `ufm_search::launch` — a
-  hand-written expander, since `gio::AppInfo` would put GLib in a pure-Rust crate —
-  and spawns the result. Quoting follows the desktop-entry rules and nothing else:
-  no globbing, no `$VAR`, no pipes, so a `.desktop` file written by a packager
-  cannot run arbitrary code as a side effect of a search result being clicked. A
-  field code with no value in the launch context is dropped rather than passed
-  through, and leading `NAME=value` assignments are separated from the command.
-- `Changed{kind:"apps"}` says when the list is stale. The app directories always
-  fit inside the 16-watch cap, so this is live rather than polled.
-
-`Exec`/`Icon` ride along on the record precisely so that the launcher needs nothing
-else; a start menu that renders a name and an icon and asks the daemon to start it
-needs no desktop-file parser of its own.
+The resident Start menu sends `SearchApps` and `SearchFiles` for the current
+query. It uses the returned desktop-entry paths to look up localized labels,
+icons and launch metadata in its GIO catalog. Local application matches
+supplement the ranked indexed matches. File and folder results are shown below
+applications and use the default URI handler. Start searches file names and
+refreshes the affected result group when the daemon emits `Changed`.
 
 `SearchApps` answers with body matching forced on and hidden-exclusion forced off:
 body text is the point of an application search, and entries under
@@ -289,6 +272,4 @@ discarded, so putting the bar away restores the window without re-reading it.
 Application results arrive as `kind: file` on a `.desktop` path, and the row turns
 that into an application: the mimetype is supplied as `application/x-desktop`
 whatever the record says, so a desktop entry opens through the desktop's own rules
-rather than in a text editor. Launching goes through the daemon, which is the only
-component that expands `Exec`; a start menu replacing this window's app grid needs
-the same two calls and no desktop-file parser of its own.
+rather than in a text editor. Application activation uses desktop-entry handling for the selected path.

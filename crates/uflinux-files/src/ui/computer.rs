@@ -3,7 +3,7 @@
 //! `computer://` is not a directory. What is behind it is a set of capacities —
 //! the home folder, the system drive, a desktop folder that may or may not exist,
 //! and whatever the user has mounted — and a directory listing has no way to say
-//! "46.2 GiB free of 232 GiB". So this is a presentation beside grid, list and
+//! "46.2 GB free of 232 GB". So this is a presentation beside grid, list and
 //! columns rather than another reader: the third child of the window's mode stack,
 //! fed by [`cards`], which assembles plain data from the mount table and the
 //! filesystem capabilities the window already keeps.
@@ -57,7 +57,7 @@ pub struct Card {
     /// Bar fill. `None` draws no bar: a filesystem that reports no size gets a
     /// card rather than a bar stuck at zero.
     pub fraction: Option<f64>,
-    /// "46.2 GiB free of 232 GiB", or the mount point when there is no size to show.
+    /// "46.2 GB free of 232 GB", or the mount point when there is no size to show.
     pub usage: String,
     /// "Connected" / "Disconnected" / "Not connected" on a share, nothing elsewhere.
     pub state: Option<&'static str>,
@@ -68,8 +68,7 @@ pub struct Card {
     pub can_disconnect: bool,
 }
 
-/// The cards, in the order they are drawn: home, the desktop folder when there is
-/// one, the system drive, then the shares in the order the table lists them.
+/// Home and the fallback system card, followed by saved network shares.
 ///
 /// `records` is anything shaped like the mount table's contents, `state` answers
 /// what the kernel says about one id, and `hints` reads one path. The window
@@ -82,10 +81,6 @@ where
     H: FnMut(&Path) -> FsHints,
 {
     let mut cards = vec![local(paths::home(), "Home", "user-home", &mut hints)];
-    let desktop = paths::desktop_dir();
-    if desktop.is_dir() {
-        cards.push(local(desktop, "Desktop", "user-desktop", &mut hints));
-    }
     cards.push(local(
         PathBuf::from("/"),
         "System",
@@ -206,10 +201,6 @@ pub struct ComputerView {
     scroll: gtk::ScrolledWindow,
     network_only: bool,
     flow: gtk::FlowBox,
-    local_flow: gtk::FlowBox,
-    removable_flow: gtk::FlowBox,
-    local_heading: gtk::Label,
-    removable_heading: gtk::Label,
     count: Cell<usize>,
     hooks: Rc<Hooks>,
     base: RefCell<Vec<Card>>,
@@ -266,23 +257,6 @@ impl ComputerView {
                 }
             }
         });
-        let local_flow = gtk::FlowBox::new();
-        let removable_flow = gtk::FlowBox::new();
-        for group in [&local_flow, &removable_flow] {
-            group.set_selection_mode(gtk::SelectionMode::None);
-            group.set_max_children_per_line(4);
-            group.set_row_spacing(12);
-            group.set_column_spacing(12);
-            group.connect_child_activated({
-                let hooks = Rc::clone(&hooks);
-                move |_, child| {
-                    if let Some(id) = card_id(child) {
-                        hooks.open(id);
-                    }
-                }
-            });
-        }
-
         let page = gtk::Box::new(gtk::Orientation::Vertical, 18);
         page.set_margin_top(24);
         page.set_margin_start(24);
@@ -299,6 +273,11 @@ impl ComputerView {
         shortcuts.set_row_spacing(8);
         for (name, icon, location) in [
             ("Home", "user-home", Some(Location::file(paths::home()))),
+            (
+                "Desktop",
+                "user-desktop",
+                Some(Location::file(paths::desktop_dir())),
+            ),
             (
                 "Recent",
                 "document-open-recent",
@@ -339,6 +318,11 @@ impl ComputerView {
                     "Pictures",
                 ))),
             ),
+            (
+                "Network",
+                "network-workgroup",
+                Location::parse("network://").ok(),
+            ),
         ] {
             let Some(location) = location else {
                 continue;
@@ -351,8 +335,8 @@ impl ComputerView {
             let button = gtk::Button::new();
             button.add_css_class("ufm-shortcut");
             let box_ = gtk::Box::new(gtk::Orientation::Vertical, 6);
-            let image = gtk::Image::from_icon_name(icon);
-            image.set_pixel_size(48);
+            box_.set_valign(gtk::Align::Center);
+            let image = super::symbolic_image(icon, "folder-symbolic", 48);
             box_.append(&image);
             box_.append(&gtk::Label::new(Some(name)));
             button.set_child(Some(&box_));
@@ -364,23 +348,6 @@ impl ComputerView {
             });
             shortcuts.append(&button);
         }
-        let network = gtk::Button::new();
-        network.add_css_class("ufm-shortcut");
-        let network_body = gtk::Box::new(gtk::Orientation::Vertical, 6);
-        let network_icon = gtk::Image::from_icon_name("network-workgroup");
-        network_icon.set_pixel_size(48);
-        network_body.append(&network_icon);
-        network_body.append(&gtk::Label::new(Some("Network")));
-        network.set_child(Some(&network_body));
-        network.connect_clicked({
-            let hooks = Rc::clone(&hooks);
-            move |_| {
-                if let Some(callback) = hooks.on_shortcut.borrow().as_ref() {
-                    callback(Location::parse("network://").expect("network location"));
-                }
-            }
-        });
-        shortcuts.append(&network);
         page.append(&shortcuts);
         heading.set_visible(!network_only);
         shortcuts.set_visible(!network_only);
@@ -394,16 +361,6 @@ impl ComputerView {
         heading.set_xalign(0.0);
         page.append(&heading);
         page.append(&flow);
-        let local_heading = gtk::Label::new(Some("On This Computer"));
-        local_heading.add_css_class("heading");
-        local_heading.set_xalign(0.0);
-        page.append(&local_heading);
-        page.append(&local_flow);
-        let removable_heading = gtk::Label::new(Some("Removable"));
-        removable_heading.add_css_class("heading");
-        removable_heading.set_xalign(0.0);
-        page.append(&removable_heading);
-        page.append(&removable_flow);
         let scroll = gtk::ScrolledWindow::new();
         scroll.set_child(Some(&page));
         scroll.set_hexpand(true);
@@ -412,10 +369,6 @@ impl ComputerView {
             scroll,
             network_only,
             flow,
-            local_flow,
-            removable_flow,
-            local_heading,
-            removable_heading,
             count: Cell::new(0),
             hooks,
             base: RefCell::new(Vec::new()),
@@ -458,36 +411,27 @@ impl ComputerView {
 
     fn render(&self) {
         self.flow.remove_all();
-        self.local_flow.remove_all();
-        self.removable_flow.remove_all();
         let base = self.base.borrow();
         let devices = self.devices.borrow();
-        let shown = base.iter().filter(|card| {
-            if self.network_only {
-                matches!(card.id, CardId::Mount(_))
-            } else {
-                !matches!(card.id, CardId::Mount(_))
-                    && !matches!(&card.id, CardId::Local(path) if path == &paths::home())
-            }
+        let root_found = devices.iter().any(|card| {
+            matches!(&card.id, CardId::Device { mountpoint: Some(path), .. } if path == Path::new("/"))
         });
-        let base_count = shown.clone().count();
+        let shown = base
+            .iter()
+            .filter(|card| {
+                if self.network_only {
+                    matches!(card.id, CardId::Mount(_))
+                } else {
+                    matches!(&card.id, CardId::Local(path) if path == Path::new("/") && !root_found)
+                }
+            })
+            .chain(devices.iter().filter(|_| !self.network_only));
+        let mut count = 0;
         for card in shown {
             self.flow.append(&build(card, &self.hooks));
+            count += 1;
         }
-        let mut locals = 0;
-        let mut removable = 0;
-        for card in devices.iter().filter(|_| !self.network_only) {
-            if card.icon == "drive-removable-media" {
-                self.removable_flow.append(&build(card, &self.hooks));
-                removable += 1;
-            } else {
-                self.local_flow.append(&build(card, &self.hooks));
-                locals += 1;
-            }
-        }
-        self.local_heading.set_visible(locals > 0);
-        self.removable_heading.set_visible(removable > 0);
-        self.count.set(base_count + locals + removable);
+        self.count.set(count);
     }
 
     /// What happens when a card is activated. The window navigates.
@@ -533,14 +477,13 @@ fn build(card: &Card, hooks: &Rc<Hooks>) -> gtk::FlowBoxChild {
     let body = gtk::Box::new(gtk::Orientation::Horizontal, 10);
     body.add_css_class("ufm-computer");
     body.add_css_class("ufm-drive");
-    let icon = gtk::Image::from_icon_name(&card.icon);
+    let icon = super::symbolic_image(&card.icon, "drive-harddisk-symbolic", 32);
     icon.set_pixel_size(36);
     body.append(&icon);
 
     let lines = gtk::Box::new(gtk::Orientation::Vertical, 2);
     lines.set_hexpand(true);
     lines.append(&named(&card.label));
-    lines.append(&meta(&card.detail, gtk::pango::EllipsizeMode::Middle));
     if let Some(fraction) = card.fraction {
         let bar = gtk::LevelBar::new();
         bar.add_css_class("ufm-usage");
@@ -548,7 +491,8 @@ fn build(card: &Card, hooks: &Rc<Hooks>) -> gtk::FlowBoxChild {
         lines.append(&bar);
     }
     lines.append(&meta(&card.usage, gtk::pango::EllipsizeMode::End));
-    if let Some(state) = card.state {
+    lines.append(&meta(&card.detail, gtk::pango::EllipsizeMode::Middle));
+    if let Some(state) = card.state.filter(|state| *state != card.usage) {
         lines.append(&meta(state, gtk::pango::EllipsizeMode::None));
     }
     body.append(&lines);
@@ -574,8 +518,9 @@ fn build(card: &Card, hooks: &Rc<Hooks>) -> gtk::FlowBoxChild {
         actions.set_menu_model(Some(&menu));
         body.append(&actions);
     }
+    let can_mount = card.state == Some("Not mounted");
     if let CardId::Device { path, mountpoint } = &card.id
-        && !matches!(card.state, Some("Locked" | "Unsupported"))
+        && (can_mount || mountpoint.is_some())
         && mountpoint
             .as_ref()
             .is_none_or(|p| p.starts_with(paths::mount_root().join("devices")))
@@ -603,8 +548,7 @@ fn build(card: &Card, hooks: &Rc<Hooks>) -> gtk::FlowBoxChild {
     child.set_sensitive(
         card.can_open
             || matches!(card.id, CardId::Mount(_))
-            || (matches!(card.id, CardId::Device { .. })
-                && !matches!(card.state, Some("Locked" | "Unsupported"))),
+            || (matches!(card.id, CardId::Device { .. }) && can_mount),
     );
     // Same reason as the sidebar rows: the flow child is the thing a screen
     // reader lands on and activates, and a card whose name lives only on the
@@ -706,23 +650,6 @@ mod tests {
     }
 
     #[test]
-    fn a_desktop_folder_becomes_a_card_and_an_absent_one_does_not() {
-        let _guard = env();
-        let dir = std::env::temp_dir().join("ufm-computer-desktop");
-        let _ = std::fs::remove_dir_all(&dir);
-        set_env("UFLINUX_FILES_DESKTOP_DIR", &dir.display().to_string());
-        let without = cards(Vec::<&MountRecord>::new(), |_| MountState::Mounted, empty);
-        std::fs::create_dir_all(&dir).unwrap();
-        let with = cards(Vec::<&MountRecord>::new(), |_| MountState::Mounted, empty);
-        std::fs::remove_dir_all(&dir).unwrap();
-        set_env("UFLINUX_FILES_DESKTOP_DIR", "/nonexistent/ufm-test-desktop");
-        assert_eq!(labels(&without), ["Home", "System"]);
-        // Between Home and System, which is where the sidebar keeps it too.
-        assert_eq!(labels(&with), ["Home", "Desktop", "System"]);
-        assert_eq!(with[1].icon, "user-desktop");
-    }
-
-    #[test]
     fn a_connected_share_says_so_and_opens() {
         let _guard = env();
         set_env("UFLINUX_FILES_DESKTOP_DIR", "/nonexistent/ufm-test-desktop");
@@ -746,7 +673,7 @@ mod tests {
         assert!(card.can_open);
         assert!(card.can_disconnect);
         assert_eq!(card.icon, "network-workgroup");
-        assert_eq!(card.usage, "256 KiB free of 1.0 MiB");
+        assert_eq!(card.usage, "262 kB free of 1.0 MB");
         assert_eq!(card.fraction, Some(0.75));
     }
 
@@ -816,7 +743,7 @@ mod tests {
                 detail: "/".into(),
                 icon: "drive-harddisk".into(),
                 fraction: Some(0.5),
-                usage: "1 GiB free of 2 GiB".into(),
+                usage: "1.0 GB free of 2.0 GB".into(),
                 state: None,
                 can_open: true,
                 can_disconnect: false,

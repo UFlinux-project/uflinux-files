@@ -197,7 +197,7 @@ fn body(
 /// before any of them say anything else.
 fn header(entry: &Entry) -> gtk::Box {
     let row = gtk::Box::new(gtk::Orientation::Horizontal, 10);
-    let icon = gtk::Image::from_icon_name(entry.kind.icon_name());
+    let icon = super::symbolic_image(entry.kind.icon_name(), "text-x-generic-symbolic", 32);
     icon.set_widget_name("ufm-preview-icon");
     icon.set_pixel_size(32);
     icon.set_valign(gtk::Align::Start);

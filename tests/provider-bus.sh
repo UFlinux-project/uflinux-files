@@ -243,7 +243,7 @@ while [ "$i" -lt 100 ]; do
     sleep 0.1
 done
 expect "the provider noticed the delete" '"items":2' "$status"
-expect "Status now reports a renderer" '"renderer":true' "$status"
+expect "Status still reports no renderer" '"renderer":false' "$status"
 
 # Everything above reads replies. The client that attached before the first call has been
 # reading the other half the whole time, and this is the only place either signal is

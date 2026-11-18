@@ -26,7 +26,7 @@ use std::collections::BTreeSet;
 
 use tantivy::collector::{Count, TopDocs};
 use tantivy::query::{
-    AllQuery, BooleanQuery, BoostQuery, ConstScoreQuery, DisjunctionMaxQuery, Occur,
+    AllQuery, BooleanQuery, BoostQuery, ConstScoreQuery, DisjunctionMaxQuery, EmptyQuery, Occur,
     PhrasePrefixQuery, Query, TermQuery,
 };
 use tantivy::schema::{Facet, Field, IndexRecordOption, Value as _};
@@ -266,6 +266,10 @@ pub fn build_query(handle: &IndexHandle, request: &Request) -> Result<Box<dyn Qu
         let facet = facet_for(scope)
             .ok_or_else(|| Error::InvalidLocation(format!("`{scope}` is not an absolute path")))?;
         clauses.push((Occur::Must, filter(scope_query(*fields, &facet))));
+    }
+
+    if words.is_empty() && !request.text.trim().is_empty() {
+        return Ok(Box::new(EmptyQuery));
     }
 
     // Every filter is a `Must` carrying score 0: it narrows the set without
@@ -739,6 +743,18 @@ mod tests {
         // Eight records, one of them hidden. Without a positive clause the query
         // would be a bare exclusion, which matches nothing.
         assert_eq!(hits.total, 7, "an empty search bar is a folder listing");
+        let punctuation = search(
+            &handle,
+            &Request {
+                text: "!!!".into(),
+                ..Request::default()
+            },
+        )
+        .expect("search");
+        assert_eq!(
+            punctuation.total, 0,
+            "typed punctuation must not list the full index"
+        );
     }
 
     #[test]

@@ -674,7 +674,7 @@ pub fn folder_name(mut taken: impl FnMut(&str) -> bool) -> String {
 
 /// Split `report.pdf` into `("report", ".pdf")`. A leading dot belongs to the
 /// stem, so `.bashrc` grows its counter at the end rather than in the middle.
-fn split_name(name: &str) -> (&str, &str) {
+pub(super) fn split_name(name: &str) -> (&str, &str) {
     match name.rfind('.') {
         Some(at) if at > 0 => (&name[..at], &name[at..]),
         _ => (name, ""),
@@ -741,7 +741,7 @@ pub(crate) fn is_directory(file: &gio::File, brake: &Brake) -> bool {
 /// Two calls, and the second is allowed to fail: a copy that lost its timestamps
 /// is still the copy that was asked for, and reporting it as a failure would
 /// invite the user to try again and end up with two files.
-fn copy_file(
+pub(super) fn copy_file(
     from: &gio::File,
     to: &gio::File,
     flags: gio::FileCopyFlags,
@@ -765,7 +765,7 @@ fn copy_file(
 /// existing directory is walked into rather than complained about, and the files
 /// inside it are overwritten one at a time. Without that, replacing a folder would
 /// fail on its own name and leave the old contents mixed with the new.
-fn copy_tree(
+pub(super) fn copy_tree(
     from: &gio::File,
     to: &gio::File,
     merge: bool,
@@ -1408,7 +1408,30 @@ fn ask(
     select: Option<(i32, i32)>,
     on_ok: impl FnOnce(String) + 'static,
 ) {
-    let window = compose(title, hint, initial, ok_label, select, on_ok);
+    ask_checked(
+        parent,
+        title,
+        hint,
+        initial,
+        ok_label,
+        select,
+        |_| None,
+        on_ok,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn ask_checked(
+    parent: &gtk::ApplicationWindow,
+    title: &str,
+    hint: &str,
+    initial: &str,
+    ok_label: &str,
+    select: Option<(i32, i32)>,
+    validate: impl Fn(&str) -> Option<String> + 'static,
+    on_ok: impl FnOnce(String) + 'static,
+) {
+    let window = compose_checked(title, hint, initial, ok_label, select, validate, on_ok);
     if let Some(app) = parent.application() {
         app.add_window(&window);
     }
@@ -1419,12 +1442,25 @@ fn ask(
 
 /// Build a prompt without showing it, so the widget tests can look inside one
 /// without an application to attach it to.
+#[cfg(test)]
 fn compose(
     title: &str,
     hint: &str,
     initial: &str,
     ok_label: &str,
     select: Option<(i32, i32)>,
+    on_ok: impl FnOnce(String) + 'static,
+) -> gtk::Window {
+    compose_checked(title, hint, initial, ok_label, select, |_| None, on_ok)
+}
+
+fn compose_checked(
+    title: &str,
+    hint: &str,
+    initial: &str,
+    ok_label: &str,
+    select: Option<(i32, i32)>,
+    validate: impl Fn(&str) -> Option<String> + 'static,
     on_ok: impl FnOnce(String) + 'static,
 ) -> gtk::Window {
     let window = gtk::Window::builder()
@@ -1503,6 +1539,11 @@ fn compose(
             let text = entry.text().trim().to_string();
             if text.is_empty() {
                 status.set_label("A name is needed.");
+                status.set_visible(true);
+                return;
+            }
+            if let Some(message) = validate(&text) {
+                status.set_label(&message);
                 status.set_visible(true);
                 return;
             }

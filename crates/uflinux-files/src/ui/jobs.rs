@@ -58,6 +58,7 @@ pub enum Kind {
     Delete,
     /// Unpacking a container.
     Extract,
+    Compress,
     /// Putting the last operation back. Its own kind rather than a reuse of
     /// `Move`, because restoring from the trash moves rows that were not moved
     /// out in the first place and the strip's word has to match what the bar is
@@ -75,6 +76,7 @@ impl Kind {
             Self::Trash => "Moving to trash",
             Self::Delete => "Deleting",
             Self::Extract => "Extracting",
+            Self::Compress => "Compressing",
             Self::Undo => "Undoing",
         }
     }
@@ -83,7 +85,7 @@ impl Kind {
 /// What a job's `done` and `total` count. The worker knows which one it is before
 /// it writes anything — a paste of plain files has a size for every row already,
 /// a paste containing a folder does not — and the strip cannot guess it, because
-/// `7 of 9` and `7 MiB of 9 MiB` are the same two numbers read two ways.
+/// `7 of 9` and `7.0 MB of 9.0 MB` are the same two numbers read two ways.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Unit {
     /// Rows, files, members: things that are counted whole.
@@ -250,7 +252,7 @@ impl Job {
         format!("{} {}", self.gerund, self.detail)
     }
 
-    /// The bar's text: `4 of 9`, or `512 KiB of 1.0 MiB`. Nothing when the total
+    /// The bar's text: `4 of 9`, or `524 kB of 1.0 MB`. Nothing when the total
     /// is not knowable — a moving bar says that better than words would.
     fn tally(&self) -> Option<String> {
         let total = self.total?;
@@ -717,7 +719,7 @@ mod tests {
                 unit: Unit::Bytes,
             });
             let (tally, fraction) = jobs.reading();
-            assert_eq!(tally.as_deref(), Some("512 KiB of 1.0 MiB"));
+            assert_eq!(tally.as_deref(), Some("524 kB of 1.0 MB"));
             assert!((fraction - 0.5).abs() < 0.01);
         });
     }

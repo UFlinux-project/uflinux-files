@@ -613,9 +613,21 @@ impl Popup {
     /// popover's `parent` property.
     #[must_use]
     pub fn install(window: &gtk::ApplicationWindow) -> Rc<Self> {
-        let menu = gtk::PopoverMenu::from_model(None::<&gio::MenuModel>);
+        let menu =
+            gtk::PopoverMenu::from_model_full(&gio::Menu::new(), gtk::PopoverMenuFlags::NESTED);
+        menu.add_css_class("ufm-context-menu");
         menu.set_parent(window);
         menu.set_has_arrow(false);
+        let weak = menu.downgrade();
+        window.connect_close_request(move |_| {
+            if let Some(menu) = weak.upgrade()
+                && menu.parent().is_some()
+            {
+                menu.popdown();
+                menu.unparent();
+            }
+            glib::Propagation::Proceed
+        });
         Rc::new(Self { menu })
     }
 
@@ -657,20 +669,54 @@ impl Popup {
     ///
     /// Swapping the model while a popover is open leaves the old geometry behind,
     /// so it is closed first even when it does not look open.
+    #[cfg(test)]
     pub fn show(
         &self,
         window: &gtk::ApplicationWindow,
         rows: &[Command],
         spot: Option<(&gtk::Widget, f64, f64)>,
     ) {
+        self.show_model(window, &model(rows), spot);
+    }
+
+    pub fn show_model(
+        &self,
+        window: &gtk::ApplicationWindow,
+        model: &gio::Menu,
+        spot: Option<(&gtk::Widget, f64, f64)>,
+    ) {
         self.menu.popdown();
-        if rows.is_empty() {
+        if model.n_items() == 0 {
             return;
         }
-        if let Some(rect) = pointing_to(window, spot) {
-            self.menu.set_pointing_to(Some(&rect));
+        self.menu.set_menu_model(Some(model));
+        let rect = pointing_to(window, spot);
+        self.menu.set_pointing_to(rect.as_ref());
+        if let (Some(rect), Some(child)) = (rect, self.menu.child()) {
+            let (_, menu_width, _, _) = child.measure(gtk::Orientation::Horizontal, -1);
+            let (_, menu_height, _, _) = child.measure(gtk::Orientation::Vertical, menu_width);
+            // Account for the small inset around the menu's scrolled child.
+            let menu_width = menu_width + 16;
+            let menu_height = menu_height + 16;
+            let height = window.height();
+            let width = window.width();
+            let above = rect.y();
+            let below = height - rect.y();
+            let left = rect.x();
+            let right = width - rect.x();
+            let position = if above.max(below) < menu_height && left.max(right) >= menu_width {
+                if right >= left {
+                    gtk::PositionType::Right
+                } else {
+                    gtk::PositionType::Left
+                }
+            } else if below >= above {
+                gtk::PositionType::Bottom
+            } else {
+                gtk::PositionType::Top
+            };
+            self.menu.set_position(position);
         }
-        self.menu.set_menu_model(Some(&model(rows)));
         self.menu.popup();
     }
 
@@ -686,15 +732,7 @@ impl Popup {
         rows: &[MenuRow],
         spot: Option<(&gtk::Widget, f64, f64)>,
     ) {
-        self.menu.popdown();
-        if rows.is_empty() {
-            return;
-        }
-        if let Some(rect) = pointing_to(window, spot) {
-            self.menu.set_pointing_to(Some(&rect));
-        }
-        self.menu.set_menu_model(Some(&model_for(rows)));
-        self.menu.popup();
+        self.show_model(window, &model_for(rows), spot);
     }
 }
 

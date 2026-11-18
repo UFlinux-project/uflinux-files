@@ -364,7 +364,7 @@ fn build(name: &str, kind: &str, apps: &[gio::AppInfo], uri: &str) -> gtk::Windo
 /// archive is shown as the document it is rather than as a generic file.
 fn header(name: &str, kind: &str) -> gtk::Box {
     let row = gtk::Box::new(gtk::Orientation::Horizontal, 12);
-    let icon = gtk::Image::from_gicon(&gio::content_type_get_icon(kind));
+    let icon = gtk::Image::from_gicon(&gio::content_type_get_symbolic_icon(kind));
     icon.set_widget_name("ufm-open-with-icon");
     icon.set_pixel_size(48);
     icon.set_valign(gtk::Align::Start);
@@ -417,9 +417,16 @@ fn app_row(app: &gio::AppInfo, uri: &str, status: &gtk::Label) -> gtk::Button {
     // The icon the desktop file names, or a generic one: an entry built from a
     // keyfile has no `Icon=` line, and a row with no picture at all reads as
     // broken rather than as an entry that did not say.
-    let icon = app.icon().map_or_else(
-        || gtk::Image::from_icon_name("application-x-executable"),
-        |icon| gtk::Image::from_gicon(&icon),
+    let icon_name = app
+        .icon()
+        .and_downcast::<gio::ThemedIcon>()
+        .and_then(|icon| icon.names().first().cloned());
+    let icon = super::symbolic_image(
+        icon_name
+            .as_deref()
+            .unwrap_or("application-x-executable-symbolic"),
+        "application-x-executable-symbolic",
+        24,
     );
     icon.set_pixel_size(24);
     row.append(&icon);
