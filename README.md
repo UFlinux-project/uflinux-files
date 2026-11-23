@@ -1,6 +1,6 @@
 # UFLinux Files
 
-A file manager for [UFLinux](https://github.com/UFlinux-project/uflinux3): GTK4
+A file manager for [UFLinux](https://github.com/UFlinux-project/uflinux): GTK4
 without libadwaita, written in Rust, laid out like GNOME Nautilus and modelled
 on the `nautilus-my-computer` view for everything that is not a folder.
 
