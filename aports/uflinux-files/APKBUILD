@@ -3,7 +3,7 @@ pkgname=uflinux-files
 pkgver=0.1.0
 pkgrel=13
 pkgdesc="UFLinux file manager: GTK4 browsing, archives, mounts and search"
-url="${UFLINUX_PROJECT_URL:-https://github.com}"
+url="${UFLINUX_PROJECT_URL:-https://github.com/UFlinux-project/uflinux-files}"
 arch="x86 x86_64 aarch64 armv7 ppc64le s390x riscv64"
 license="GPL-3.0-only"
 # Image formats and archive codecs are required runtime capabilities.
@@ -152,5 +152,5 @@ mount_helper() {
 # Filled in by scripts/files-source.py --update; empty here so the recipe still
 # parses as shell before a bundle has been generated.
 sha512sums="
-8e4c3dfd0266323c6a83d322129610569d83cc19260f097696f87f4bc5d1b3127333aa111b92073a6f2b66bea5a34ad94bbd371bac3baf070f3b2927a04ededa  uflinux-files-0.1.0.tar
+0994a80cba739970ae47b133ab8902735bb9ae47ecb8d5dd264e8262f37ee5b03b32bbdbadbeff2db90290930e0df3b9852420f47aa3117895c7aaee1310fbda  uflinux-files-0.1.0.tar
 "
