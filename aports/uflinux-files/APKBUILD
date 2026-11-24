@@ -4,7 +4,7 @@ pkgver=0.1.0
 pkgrel=13
 pkgdesc="UFLinux file manager: GTK4 browsing, archives, mounts and search"
 url="${UFLINUX_PROJECT_URL:-https://github.com/UFlinux-project/uflinux-files}"
-arch="x86 x86_64 aarch64 armv7 ppc64le s390x riscv64"
+arch="x86_64 aarch64 ppc64le s390x riscv64"
 license="GPL-3.0-only"
 # Image formats and archive codecs are required runtime capabilities.
 # The loader metapackage tracks every Glycin loader supplied by Alpine.
